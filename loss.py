@@ -90,6 +90,7 @@ class SILoss:
         alpha_t, sigma_t, d_alpha_t, d_sigma_t = self.interpolant(time_input)  
         model_input = alpha_t * images + sigma_t * noises
         #print(f"model_input shape: {model_input.shape}")
+        # 
         if self.prediction == 'v':
             model_target = d_alpha_t * images + d_sigma_t * noises
         else:
