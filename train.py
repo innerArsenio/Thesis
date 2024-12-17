@@ -41,6 +41,7 @@ from Explicd.dataset.isic_dataset import SkinDataset
 from Explicd.model import ExpLICD_ViT_L, ExpLICD
 from Explicd.concept_dataset import explicid_isic_dict
 import Explicd.utils as utils
+from sklearn.metrics import f1_score
 logger = get_logger(__name__)
 
 CLIP_DEFAULT_MEAN = (0.48145466, 0.4578275, 0.40821073)
@@ -58,10 +59,10 @@ CONCEPT_LABEL_MAP = [
 
 DEBUG = False
 
-rotation_transform = transforms.RandomRotation(degrees=45)
-translation_transform = transforms.RandomAffine(degrees=5, translate=(0.2, 0.2))
-color_jitter_transform = transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1)
-blur_transform = transforms.GaussianBlur(kernel_size=(5, 9), sigma=(0.2, 5))
+rotation_transform = transforms.RandomRotation(degrees=15)
+translation_transform = transforms.RandomAffine(degrees=5, translate=(0.1, 0.1))
+color_jitter_transform = transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2)
+blur_transform = transforms.GaussianBlur(kernel_size=(3, 7), sigma=(0.2, 5))
 
 def validation(explicd, model, dataloader, exp_val_transforms):
     
@@ -116,7 +117,8 @@ def validation(explicd, model, dataloader, exp_val_transforms):
             model_input = alpha_t * x + sigma_t * noises
             _, _, _, _, y_predicted, _  = sit_model(model_input, time_input.flatten(), y, 
                                                                     concept_label=concept_label, 
-                                                                    image_embeddings=agg_visual_tokens)
+                                                                    image_embeddings=agg_visual_tokens,
+                                                                    cls_logits=cls_logits)
 
 
 
@@ -132,12 +134,14 @@ def validation(explicd, model, dataloader, exp_val_transforms):
         exp_BMAC = balanced_accuracy_score(gt_list, exp_pred_list)
         exp_correct = np.sum(gt_list == exp_pred_list)
         exp_acc = 100 * exp_correct / len(exp_pred_list)
+        exp_val_f1 = f1_score(gt_list, exp_pred_list, average='macro')
 
         sit_BMAC = balanced_accuracy_score(gt_list, sit_pred_list)
         sit_correct = np.sum(gt_list == sit_pred_list)
         sit_acc = 100 * sit_correct / len(sit_pred_list)
+        sit_val_f1 = f1_score(gt_list, sit_pred_list, average='macro')
 
-    return exp_BMAC, exp_acc, losses_cls/(i+1), losses_concepts/(i+1), sit_BMAC, sit_acc
+    return exp_BMAC, exp_acc, exp_val_f1, losses_cls/(i+1), losses_concepts/(i+1), sit_BMAC, sit_acc, sit_val_f1
 
 
 class DualRandomVerticalFlip:
@@ -393,7 +397,7 @@ def main(args):
     lesion_weight = torch.FloatTensor(conf.cls_weight).cuda()
     cls_criterion = nn.CrossEntropyLoss(weight=lesion_weight).cuda()
 
-    do_contr_loss = False
+    do_contr_loss = True
 
     latents_scale = torch.tensor(
         [0.18215, 0.18215, 0.18215, 0.18215]
@@ -539,6 +543,7 @@ def main(args):
         
     max_val_acc=0
     max_val_bmacc=0
+    max_val_f1=0
     for epoch in range(args.epochs):
         model.train()
         explicid.train()
@@ -587,9 +592,20 @@ def main(args):
                 contr_loss_mean = contr_loss.mean()
                 sit_cls_loss_mean = sit_cls_loss.mean()
                 expl_loss_cls_mean = expl_loss_cls.mean()
-                loss = loss_mean + proj_loss_mean * args.proj_coeff + explicid_loss_mean + cosine_loss_mean + 4*contr_loss_mean +sit_cls_loss_mean
+
+                total_loss_magnitude = loss_mean + proj_loss_mean * args.proj_coeff + explicid_loss_mean + cosine_loss_mean + contr_loss_mean +sit_cls_loss_mean
+                loss_weight = loss_mean / total_loss_magnitude
+                proj_weight = proj_loss_mean / total_loss_magnitude
+                explicid_weight = explicid_loss_mean / total_loss_magnitude
+                cosine_weight = cosine_loss_mean / total_loss_magnitude
+                contr_weight = contr_loss_mean / total_loss_magnitude
+                sit_cls_weight = sit_cls_loss_mean / total_loss_magnitude
+                expl_cls_weight = expl_loss_cls_mean / total_loss_magnitude
+                total_loss = (loss_weight*loss_mean) + (proj_weight*proj_loss_mean) + (explicid_weight*explicid_loss_mean) + (cosine_weight*cosine_loss_mean) + (contr_weight*contr_loss_mean) + (sit_cls_weight*sit_cls_loss_mean) + (expl_cls_weight*expl_loss_cls_mean)
+
+                # loss = loss_mean + proj_loss_mean * args.proj_coeff + explicid_loss_mean + cosine_loss_mean + 4*contr_loss_mean +sit_cls_loss_mean
                 ## optimization
-                accelerator.backward(loss)
+                accelerator.backward(total_loss)
                 if accelerator.sync_gradients:
                     params_to_clip = model.parameters()
                     grad_norm = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
@@ -631,12 +647,13 @@ def main(args):
                                 break
 
                     imgs_for_explicid=prepare__imgs_for_explicid(imgs_for_sampling, exp_val_transforms).to(device)
-                    _, _, agg_visual_tokens = explicid(imgs_for_explicid)
+                    cls_logits, _, agg_visual_tokens = explicid(imgs_for_explicid)
                     samples = euler_sampler(
                         model, 
                         xT, 
                         ys,
                         agg_visual_tokens,
+                        cls_logits,
                         num_steps=50, 
                         cfg_scale=4.0,
                         guidance_low=0.,
@@ -717,7 +734,8 @@ def main(args):
                 model_input = alpha_t * x + sigma_t * noises
                 _, _, _, _, y_predicted, _  = model(model_input, time_input.flatten(), y, 
                                                                         concept_label=concept_label, 
-                                                                        image_embeddings=agg_visual_tokens)
+                                                                        image_embeddings=agg_visual_tokens,
+                                                                        cls_logits=cls_logits)
                 _, sit_label_pred = torch.max(y_predicted, dim=1)
                 exp_pred_list = np.concatenate((exp_pred_list, label_pred.cpu().numpy().astype(np.uint8)), axis=0)
                 gt_list = np.concatenate((gt_list, labels.cpu().numpy().astype(np.uint8)), axis=0)
@@ -727,27 +745,32 @@ def main(args):
             exp_val_BMAC = balanced_accuracy_score(gt_list, exp_pred_list)
             exp_val_correct = np.sum(gt_list == exp_pred_list)
             exp_val_acc = 100 * exp_val_correct / len(exp_pred_list)
+            exp_val_f1 = f1_score(gt_list, exp_pred_list, average='macro')
 
             sit_val_BMAC = balanced_accuracy_score(gt_list, sit_pred_list)
             sit_val_correct = np.sum(gt_list == sit_pred_list)
             sit_val_acc = 100 * sit_val_correct / len(sit_pred_list)
-
-            if sit_val_BMAC>max_val_bmacc and sit_val_acc>max_val_acc:
+            sit_val_f1 = f1_score(gt_list, sit_pred_list, average='macro')
+            # or sit_val_f1>max_val_f1
+            # sit_val_BMAC>max_val_bmacc
+            # exp_val_BMAC>max_val_bmacc
+            if sit_val_BMAC>max_val_bmacc :
                 max_val_bmacc=sit_val_BMAC
-                max_val_acc=sit_val_acc
-                print('Val/Acc', sit_val_acc)
-                print('Val Balanced Acc', sit_val_BMAC)
+                #max_val_f1 = sit_val_f1
+                #max_val_acc=sit_val_acc
+                print('Val/Acc', f'{sit_val_f1:.3f}')
+                print('Val Balanced Acc', f'{sit_val_BMAC:.3f}')
                 explicid.eval()
                 explicid.zero_grad(set_to_none=True)
                 model.eval()
                 model.zero_grad(set_to_none=True)
                 optimizer.eval()
                 torch.cuda.empty_cache()
-                exp_test_BMAC, exp_test_acc, _, _ , sit_BMAC, sit_acc= validation(explicid, model, test_dataloader, exp_val_transforms)
-                print('Explicd Test/Acc', exp_test_acc)
-                print('Explicd Test Balanced Acc', exp_test_BMAC)
-                print('SiT Test/Acc', sit_acc)
-                print('SiT Test Balanced Acc', sit_BMAC)
+                exp_test_BMAC, exp_test_acc, exo_test_f1, _, _ , sit_BMAC, sit_acc, sit_f1 = validation(explicid, model, test_dataloader, exp_val_transforms)
+                print('Explicd Test f1', f'{exo_test_f1:.3f}')
+                print('Explicd Test Balanced Acc', f'{exp_test_BMAC:.3f}')
+                print('SiT Test f1', f'{sit_f1:.3f}')
+                print('SiT Test Balanced Acc', f'{sit_BMAC:.3f}')
 
 
 
@@ -784,7 +807,7 @@ def parse_args(input_args=None):
     # dataset
     parser.add_argument("--data-dir", type=str, default="../data/imagenet256")
     parser.add_argument("--resolution", type=int, choices=[256], default=256)
-    parser.add_argument("--batch-size", type=int, default=96)
+    parser.add_argument("--batch-size", type=int, default=16)
 
     # precision
     parser.add_argument("--allow-tf32", action="store_true")

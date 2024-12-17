@@ -232,6 +232,7 @@ class ExpLICD_ViT_L(nn.Module):
         self.concept_list = concept_list
         self.model_name = model_name
         self.config = config
+        self.dropout = nn.Dropout(p=0.5)  # Regularization
        
         if self.model_name in ['biomedclip', 'openclip']:
             if self.model_name == 'biomedclip':
@@ -264,7 +265,7 @@ class ExpLICD_ViT_L(nn.Module):
                 if config.dataset == 'isic2018':
                     prefix = f"this is a dermoscopic image, the {key} of the lesion is "
                 attr_concept_list = concept_list[key]
-                prefix_attr_concept_list = [prefix for concept in attr_concept_list]
+                prefix_attr_concept_list = [prefix + concept for concept in attr_concept_list]
                 tmp_concept_text = self.tokenizer(prefix_attr_concept_list).cuda()
                 #print(f"tmp_concept_text shape: {tmp_concept_text.shape}")
                 _, tmp_concept_feats, logit_scale = self.model(None, tmp_concept_text)
@@ -345,6 +346,7 @@ class ExpLICD_ViT_L(nn.Module):
         B=vit_l_output.shape[0]
 
         visual_tokens = self.visual_tokens.repeat(B, 1, 1)
+        #visual_tokens=self.dropout(visual_tokens)
 
         agg_visual_tokens, _ = self.cross_attn(visual_tokens, vit_l_output, vit_l_output)
         agg_visual_tokens_for_explicid = self.proj(self.norm(self.ffn(agg_visual_tokens)))
@@ -409,7 +411,7 @@ class ExpLICD_ViT_L_Soft_Prompt(nn.Module):
                 if config.dataset == 'isic2018':
                     prefix = f"this is a dermoscopic image, the {key} of the lesion is "
                 attr_concept_list = concept_list[key]
-                prefix_attr_concept_list = [prefix for concept in attr_concept_list]
+                prefix_attr_concept_list = [prefix + concept for concept in attr_concept_list]
                 tmp_concept_text = self.tokenizer(prefix_attr_concept_list).cuda()
                 #print(f"tmp_concept_text shape: {tmp_concept_text.shape}")
                 _, tmp_concept_feats, logit_scale = self.model(None, tmp_concept_text)

@@ -57,6 +57,7 @@ def euler_sampler(
         latents,
         y,
         imgs,
+        cls_logits,
         num_steps=20,
         heun=False,
         cfg_scale=1.0,
@@ -68,6 +69,7 @@ def euler_sampler(
     if cfg_scale > 1.0:
         y_null = torch.tensor([7] * y.size(0), device=y.device)
         #imgs_null= torch.zeros_like(imgs)
+        cls_logits_null = torch.zeros_like(cls_logits)
     _dtype = latents.dtype    
     t_steps = torch.linspace(1, 0, num_steps+1, dtype=torch.float64)
     x_next = latents.to(torch.float64)
@@ -81,8 +83,9 @@ def euler_sampler(
             if cfg_scale > 1.0 and t_cur <= guidance_high and t_cur >= guidance_low:
                 model_input = torch.cat([x_cur] * 2, dim=0)
                 y_cur = torch.cat([y, y_null], dim=0)
-                imgs_input = torch.cat([imgs]*2, dim=0)
+                imgs_tokens_input = torch.cat([imgs]*2, dim=0)
                 concept_label_input = torch.cat([concept_label]*2, dim=0)
+                cls_logits_input = torch.cat([cls_logits, cls_logits_null], dim=0)
             else:
                 model_input = x_cur
                 y_cur = y            
@@ -95,7 +98,8 @@ def euler_sampler(
             d_cur = model(
                 model_input.to(dtype=_dtype), time_input.to(dtype=_dtype), **kwargs, 
                 concept_label=concept_label_input, 
-                image_embeddings=imgs_input
+                image_embeddings=imgs_tokens_input,
+                cls_logits=cls_logits_input
                 )[0].to(torch.float64)
             if cfg_scale > 1. and t_cur <= guidance_high and t_cur >= guidance_low:
                 d_cur_cond, d_cur_uncond = d_cur.chunk(2)

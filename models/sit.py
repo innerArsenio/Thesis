@@ -250,7 +250,8 @@ class SiT(nn.Module):
             build_mlp(hidden_size, projector_dim, z_dim) for z_dim in z_dims
             ])
         self.final_layer = FinalLayer(decoder_hidden_size, patch_size, self.out_channels)
-        self.y_logits_embedder = nn.Linear(hidden_size, num_classes)
+        self.y_logits_embedder_in = nn.Linear(num_classes, hidden_size)
+        self.y_logits_embedder_out = nn.Linear(hidden_size, num_classes)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -286,7 +287,8 @@ class SiT(nn.Module):
 
         #nn.init.normal_(self.text_embedder.weight, std=0.02)
         nn.init.normal_(self.image_embedder.weight, std=0.02)
-        nn.init.normal_(self.y_logits_embedder.weight, std=0.02)
+        nn.init.normal_(self.y_logits_embedder_out.weight, std=0.02)
+        nn.init.normal_(self.y_logits_embedder_in.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -320,7 +322,7 @@ class SiT(nn.Module):
     
     def forward(self, x, t, y, 
                 concept_label, 
-                image_embeddings, return_logvar=False):
+                image_embeddings, cls_logits, return_logvar=False):
         """
         Forward pass of SiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -353,8 +355,13 @@ class SiT(nn.Module):
         #print(f"embedded_concepts shape: {embedded_concepts.shape}")
         #print(y)
         #c = t_embed + y                                # (N, D)
-        c = t_embed + image_embed[:,0,:] + image_embed[:,1,:] + image_embed[:,2,:] + image_embed[:,3,:] + image_embed[:,4,:] + image_embed[:,5,:] + image_embed[:,6,:]
-
+        y_input_logits_embedded = self.y_logits_embedder_in(cls_logits)
+        #print(f"cls_logits shape: {cls_logits.shape}") 
+        #c = t_embed + image_embed[:,0,:] + image_embed[:,1,:] + image_embed[:,2,:] + image_embed[:,3,:] + image_embed[:,4,:] + image_embed[:,5,:] + image_embed[:,6,:]
+        # print(f"t_embed shape: {t_embed.shape}")
+        # print(f"y_input_logits_embedded shape: {y_input_logits_embedded.shape}")
+        #c = t_embed + y_input_logits_embedded
+        c = t_embed + image_embed.sum(dim=1)
         # Concatenate latent image, text embeddings, and conditioning embeddings
         combined_embeddings=x
         combined_embeddings_try = torch.cat((x, image_embed), dim=1)
@@ -384,7 +391,7 @@ class SiT(nn.Module):
         #print("1 3 2 2")
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
 
-        y_predicted_logits = self.y_logits_embedder(combined_embeddings_try_2[:,-1:,:]) 
+        y_predicted_logits = self.y_logits_embedder_out(combined_embeddings_try_2[:,-1:,:]) 
         #print("1 3 3")
         return x,image_embed, minus_embedded_concepts_plus_noise, combined_embeddings_try_2[:,-8:-1,:], y_predicted_logits.squeeze(1), zs
 

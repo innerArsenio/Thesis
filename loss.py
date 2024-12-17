@@ -97,7 +97,8 @@ class SILoss:
 
         denoising_loss, proj_loss, explicid_loss, cosine_loss, sit_cls_loss = 0, 0, 0, 0, 0
         contr_loss= torch.tensor(0.0, device=images.device)
-        list_of_emb_concepts= []
+        list_of_produced_concepts= []
+        list_of_denoised_concepts= []
         for imgs_indx, explicid_imgs in enumerate(explicid_imgs_list):
             cls_logits, image_logits_dict, agg_visual_tokens = explicid(explicid_imgs)
             concept_label = torch.tensor([CONCEPT_LABEL_MAP[label] for label in labels])
@@ -115,22 +116,26 @@ class SILoss:
             explicid_loss += loss_cls + loss_concepts / idx
             model_output, image_embed, embedded_concepts, produced_concepts, y_predicted, zs_tilde  = model(model_input, time_input.flatten(), **model_kwargs, 
                                                                     concept_label=concept_label, 
-                                                                    image_embeddings=agg_visual_tokens)
-            list_of_emb_concepts.append(embedded_concepts)
+                                                                    image_embeddings=agg_visual_tokens,
+                                                                    cls_logits=cls_logits)
+            list_of_produced_concepts.append(agg_visual_tokens)
+            list_of_denoised_concepts.append(produced_concepts)
             #print(f"y_predicted shape: {y_predicted.shape}")
             sit_cls_loss = self.cls_criterion(y_predicted, labels)
 
             if imgs_indx==0:
                 denoising_loss = mean_flat((model_output - model_target) ** 2)
+
                 # projection loss
-                proj_loss = 0.
+                proj_loss_current = 0.
                 bsz = zs[0].shape[0]
                 for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
                     for j, (z_j, z_tilde_j) in enumerate(zip(z, z_tilde)):
                         z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1) 
                         z_j = torch.nn.functional.normalize(z_j, dim=-1) 
-                        proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
-                proj_loss /= (len(zs) * bsz)
+                        proj_loss_current += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
+                proj_loss_current /= (len(zs) * bsz)
+                proj_loss +=proj_loss_current
 
             #print(f"produced_concepts shape: {produced_concepts.shape}")
             cosine_sim = F.cosine_similarity(embedded_concepts, produced_concepts, dim=-1)
@@ -140,10 +145,16 @@ class SILoss:
 
             # # Mean squared error loss between the model's output vector and the label's embedding
             # mse_loss = mse_criterion(embedded_concepts, produced_concepts)*200
-        if len(list_of_emb_concepts)>1:
-            contr_loss+=contrastive_loss(list_of_emb_concepts[0], list_of_emb_concepts[1], positive=True)
-            contr_loss+=contrastive_loss(list_of_emb_concepts[0], list_of_emb_concepts[2], positive=True)
-            contr_loss+=contrastive_loss(list_of_emb_concepts[0], list_of_emb_concepts[3], positive=True)
-            contr_loss+=contrastive_loss(list_of_emb_concepts[0], list_of_emb_concepts[4], positive=True)
+        if len(list_of_denoised_concepts)>1:
+            #print(f"list_of_emb_concepts[0] shape: {list_of_emb_concepts[0].shape}")
+            contr_loss+=contrastive_loss(list_of_produced_concepts[0], list_of_produced_concepts[1], positive=True)
+            contr_loss+=contrastive_loss(list_of_produced_concepts[0], list_of_produced_concepts[2], positive=True)
+            contr_loss+=contrastive_loss(list_of_produced_concepts[0][:,0,:], list_of_produced_concepts[3][:,0,:], positive=False)
+            contr_loss+=contrastive_loss(list_of_produced_concepts[0][:,2,:], list_of_produced_concepts[4][:,2,:], positive=False)
+        
+            contr_loss+=contrastive_loss(list_of_denoised_concepts[0], list_of_denoised_concepts[1], positive=True)
+            contr_loss+=contrastive_loss(list_of_denoised_concepts[0], list_of_denoised_concepts[2], positive=True)
+            contr_loss+=contrastive_loss(list_of_denoised_concepts[0][:,0,:], list_of_denoised_concepts[3][:,0,:], positive=False)
+            contr_loss+=contrastive_loss(list_of_denoised_concepts[0][:,2,:], list_of_denoised_concepts[4][:,2,:], positive=False)
 
         return denoising_loss, proj_loss, explicid_loss, loss_cls, cosine_loss, sit_cls_loss, contr_loss

@@ -8,7 +8,7 @@ from dataset.isic_dataset import SkinDataset
 from model import ExpLICD, ExpLICD_Self
 from torchvision import transforms, models
 from sklearn.metrics import balanced_accuracy_score
-
+from sklearn.metrics import f1_score
 import copy
 from torch.utils.data import DataLoader
 from optparse import OptionParser
@@ -86,10 +86,11 @@ def train_net(model, config):
     scaler = torch.cuda.amp.GradScaler() if config.amp else None
     optimizer = schedulefree.AdamWScheduleFree(model.parameters(), lr=config.lr, warmup_steps=5000 , weight_decay=0.1)
 
-    BMAC, acc, _, _ = validation(model, valLoader, criterion)
-    print('BMAC: %.5f, Acc: %.5f'%(BMAC, acc))
+    BMAC, acc, f1, _, _ = validation(model, valLoader, criterion)
+    print('BMAC: %.5f, Acc: %.5f, f1: %.5f'%(BMAC, acc, f1))
 
     best_acc = 0
+    best_f1 = 0
     print_the_target = True
     for epoch in range(config.epochs):
         print('Starting epoch {}/{}'.format(epoch+1, config.epochs))
@@ -210,13 +211,13 @@ def train_net(model, config):
             torch.save(model.state_dict(), '%s%s/CP%d.pth'%(config.cp_path, config.unique_name, epoch+1))
 
         optimizer.eval()
-        val_BMAC, val_acc, val_loss_cls, val_loss_concept = validation(model, valLoader, criterion)
+        val_BMAC, val_acc, val_f1, val_loss_cls, val_loss_concept = validation(model, valLoader, criterion)
         writer.add_scalar('Val/BMAC', val_BMAC, epoch+1)
         writer.add_scalar('Val/Acc', val_acc, epoch+1)
         writer.add_scalar('Val/val_loss_cls', val_loss_cls, epoch+1)
         writer.add_scalar('Val/val_loss_concept', val_loss_concept, epoch+1)
         
-        test_BMAC, test_acc, test_loss_cls, test_loss_concept = validation(model, testLoader, criterion)
+        test_BMAC, test_acc, test_f1, test_loss_cls, test_loss_concept = validation(model, testLoader, criterion)
         # print('Test/Acc', test_acc)
         # print('Test Balanced Acc', test_BMAC)
         
@@ -231,10 +232,12 @@ def train_net(model, config):
 
         if val_BMAC >= best_acc:
             best_acc = val_BMAC
+            best_f1 = val_f1
             if not os.path.exists(config.cp_path):
                 os.makedirs(config.cp_path)
             torch.save(model.state_dict(), '%s%s/best.pth'%(config.cp_path, config.unique_name))
             print('Test/Acc', test_acc)
+            print('Test f1', test_f1)
             print('Test Balanced Acc', test_BMAC)
           
 
@@ -283,8 +286,9 @@ def validation(model, dataloader, criterion):
     BMAC = balanced_accuracy_score(gt_list, pred_list)
     correct = np.sum(gt_list == pred_list)
     acc = 100 * correct / len(pred_list)
+    f1 = f1_score(gt_list, pred_list, average='macro')
 
-    return BMAC, acc, losses_cls/(i+1), losses_concepts/(i+1)
+    return BMAC, acc, f1, losses_cls/(i+1), losses_concepts/(i+1)
 
 
 
