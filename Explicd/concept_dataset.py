@@ -9,6 +9,15 @@ explicid_isic_dict = {
 
 }
 
+explicid_isic_dict_mine = {
+    'asymmetry': ['none',   'none or partial', 'partial',  'complete'],
+    'border irregularity': ['regular', 'regular or slightly irregular', 'slightly irregular', 'slightly or highly irregular','highly irregular'],
+    'color variation': ['uniform', 'uniform or mild variation','mild variation', 'significant variation'],
+    'diameter': ['small (<6mm) or moderate (6–20mm)',  'moderate (6–20mm)',  'large (>20mm)'],
+    'texture': ['smooth', 'smooth or slightly rough','slightly rough', 'slightly rough or very rough',  'very rough'],
+    'vascular patterns': ['none', 'optional','present (e.g., telangiectasia)'],
+}
+# 24
 explicid_busi_dict = {
     'shape': ['round', 'oval', 'irregular'],
     'margin': ['circumscribed or indistinct', 'circumscribed or microlobulated', 'angular or spiculated'],
@@ -19,10 +28,29 @@ explicid_busi_dict = {
 
 }
 
+explicid_busi_soft_smooth_dict = {
+    'shape': ['round', 'oval', 'irregular'],
+    'margin': ['circumscribed', 'microlobulated', 'indistinct', 'spiculated'],
+    'echo pattern': ['anechoic', 'hypoechoic', 'hyperechoic', 'complex'],
+    'posterior features': ['enhancement', 'shadowing', 'none'],
+    'calcifications': ['present','none'],
+    'orientation': ['parallel', 'non-parallel']
+
+}
+
 explicid_idrid_dict = {
     'microaneurysms': ['none', 'few', 'moderate', 'many'],
     'hemorrhages': ['None', 'few', 'moderate', 'extensive'],
     'exudates': ['none', 'none or hard', 'hard or soft', 'hard or soft or mixed'],
     'neovascularization': ['none', 'present'],
     'macular edema': ['none', 'none or present in focal areas', 'present in focal areas','diffuse'],
+}
+
+explicid_idrid_edema_dict = {
+    'hard exudates': ['none','none or bright lipid deposits in the retina','bright lipid deposits in the retina'],
+    'retinal thickening': ['none', 'swelling near the macula'],
+    'microaneurysms': ['none', 'small bulges in blood vessels'],
+    'hemorrhages': ['none', 'none or retinal bleeding','retinal bleeding'],
+    'cotton wool spots': ['none', 'white patches due to nerve layer damage'],
+    'vascular abnormalities': ['none', 'none or enlarged or irregular blood vessels', 'enlarged or irregular blood vessels']
 }

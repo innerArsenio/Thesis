@@ -4,7 +4,7 @@ import os
 import numpy as np
 
 # Load the JSON data
-with open('/home/arsen.abzhanov/Thesis_local/REPA/ISIC_2018_REPA/validation/vae-sd/dataset.json', 'r') as file:
+with open('./BUSI_REPA/vae-sd/dataset.json', 'r') as file:
     data = json.load(file)
 # /home/arsen.abzhanov/Thesis_local/REPA/BUSI_REPA/vae-sd/dataset.json
 # /home/arsen.abzhanov/Thesis_local/REPA/ISIC_2018_REPA/train/vae-sd/dataset.json
@@ -18,18 +18,18 @@ numbers = [label[1] for label in labels]
 count = Counter(numbers)
 
 # Print the counts
-for number in range(7):
+for number in range(3):
     print(f"Number {number}: {count[number]}")
 
 
-def count_files_in_subfolders(directory):
-    for subdir, dirs, files in os.walk(directory):
-        print(f'{subdir}: {len(files)} files')
+# def count_files_in_subfolders(directory):
+#     for subdir, dirs, files in os.walk(directory):
+#         print(f'{subdir}: {len(files)} files')
 
         
 
-# Example usage
-count_files_in_subfolders('/home/arsen.abzhanov/Thesis_local/ISIC_2018/ISIC_2018_Validation_Folder_format')
+# # Example usage
+# count_files_in_subfolders('/home/arsen.abzhanov/Thesis_local/ISIC_2018/ISIC_2018_Validation_Folder_format')
 
 
 # CONCEPT_LABEL_MAP = [

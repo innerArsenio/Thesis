@@ -40,11 +40,12 @@ from optparse import OptionParser
 from torchvision import transforms
 from Explicd.dataset.isic_dataset import SkinDataset
 from Explicd.model import ExpLICD_ViT_L, ExpLICD, ExpLICD_ViT_L_Multiple_Prompts
-from Explicd.concept_dataset import explicid_isic_dict, explicid_busi_dict, explicid_idrid_dict
+from Explicd.concept_dataset import explicid_isic_dict, explicid_isic_dict_mine, explicid_idrid_dict, explicid_idrid_edema_dict, explicid_busi_dict, explicid_busi_soft_smooth_dict
 import Explicd.utils as utils
 from sklearn.metrics import f1_score
 import random
 import kornia
+import matplotlib.pyplot as plt
 
 logger = get_logger(__name__)
 
@@ -61,14 +62,22 @@ CONCEPT_LABEL_MAP_ISIC = [
             [6, 3, 1, 6, 1, 2, 0], # VASC
         ]
 
-CONCEPT_LABEL_MAP_BUSI = [
-    # Normal
-    [0, 0, 0, 0, 0, 0],  
-    # Benign
-    [1, 1, 1, 1, 1, 0], 
-    # Malignant
-    [2, 2, 2, 2, 2, 1],  
-        ]
+CONCEPT_LABEL_MAP_ISIC_MINE = [
+    # Actinic Keratoses
+    [2, 3, 2, 0, 3, 1],
+    # Basal Cell Carcinoma
+    [2, 3, 2, 1, 3, 2],
+    # Benign Keratosis-like Lesions
+    [2, 2, 2, 1, 2, 1],
+    # Dermatofibroma
+    [1, 1, 1, 0, 1, 0],
+    # Melanoma
+    [3, 4, 3, 2, 4, 2],
+    # Melanocytic Nevus
+    [1, 1, 1, 0, 1, 0],
+    # Vascular Lesions
+    [0, 0, 0, 0, 0, 2],
+]
 
 CONCEPT_LABEL_MAP_IDRID = [
     # No DR
@@ -83,23 +92,90 @@ CONCEPT_LABEL_MAP_IDRID = [
     [3, 3, 3, 1, 3], 
 ]
 
-LIST_OF_TASKS = ['ISIC', 'IDRID', 'BUSI']
+CONCEPT_LABEL_MAP_IDRID_EDEMA = [
+    # No Edema
+    [0, 0, 0, 0, 0, 0], 
+    # Mild Edema
+    [1, 1, 1, 1, 0, 1],
+    # Severe Edema
+    [2, 1, 1, 2, 1, 2], 
+]
 
-TASK='ISIC'
+
+CONCEPT_LABEL_MAP_BUSI = [
+    # Benign
+    [1, 1, 1, 1, 1, 0],
+    # Malignant
+    [2, 2, 2, 2, 2, 1],  
+    # Normal
+    [0, 0, 0, 0, 0, 0],  
+]
+
+# CONCEPT_LABEL_MAP_BUSI = [
+#     # Normal
+#     [0, 0, 0, 0, 0, 0], 
+#     # Benign
+#     [1, 1, 1, 1, 1, 0],
+#     # Malignant
+#     [2, 2, 2, 2, 2, 1]
+# ]
+
+CONCEPT_LABEL_MAP_BUSI_SOFT_SMOOTH = [
+    # Benign
+    [[0.2, 0.6, 0.2], [0.2, 0.6, 0.1, 0.1], [0.0, 0.8, 0.1, 0.1], [0.6, 0.1, 0.3], [0.1, 0.9] , [0.8, 0.2]],
+    # Malignant
+    [[0.0, 0.1, 0.9], [0.0, 0.1, 0.2, 0.7], [0.0, 1.0, 0.0, 0.0], [0.1, 0.8, 0.1], [0.8, 0.2], [0.2, 0.8]],  
+    # Normal
+    [[0.8, 0.2, 0.0], [1.0, 0.0, 0.0, 0.0], [0.2, 0.1, 0.7, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0], [1.0, 0.0]],  
+]
+
+
+CONCEPT_LABEL_MAP_DICT = {
+    'ISIC': CONCEPT_LABEL_MAP_ISIC,
+    'ISIC_MINE': CONCEPT_LABEL_MAP_ISIC_MINE,
+
+    'IDRID': CONCEPT_LABEL_MAP_IDRID,
+    'IDRID_EDEMA': CONCEPT_LABEL_MAP_IDRID_EDEMA,
+
+    'BUSI': CONCEPT_LABEL_MAP_BUSI,
+    'BUSI_SOFT': CONCEPT_LABEL_MAP_BUSI_SOFT_SMOOTH
+    
+}
+
+LIST_OF_TASKS = ['ISIC', 'ISIC_MINE','IDRID', 'IDRID_EDEMA', 'BUSI', 'BUSI_SOFT']
+
+TASK='BUSI'
 
 NUM_OF_CLASSES= {
     'ISIC': 7,
+    'ISIC_MINE':7,
+
     'IDRID': 5,
-    'BUSI': 3
+    'IDRID_EDEMA':3,
+
+    'BUSI': 3,
+    'BUSI_SOFT':3
 }
 
 CONCEPTS= {
     'ISIC': explicid_isic_dict,
+    'ISIC_MINE': explicid_isic_dict_mine,
+
     'IDRID': explicid_idrid_dict,
-    'BUSI': explicid_busi_dict
+    'IDRID_EDEMA': explicid_idrid_edema_dict,
+
+    'BUSI': explicid_busi_dict,
+    'BUSI_SOFT': explicid_busi_soft_smooth_dict
 }
+CONCEPT_HARDNESS_LIST_OPTIONS=["hard","soft_equal","soft_smarter"]
 
 DO_MUDDLE_CHECK=False
+ADD_GAUSSIAN_NOISE=False
+DO_LOGITS_SIMILARITY=False
+CONCEPT_HARDNESS="soft_equal"
+noise_levels = [0, 5, 10, 15, 20]
+
+
 
 def create_muddled_dataloader(dataset, batch_size, num_workers):
     """Creates a DataLoader with standard parameters"""
@@ -112,7 +188,7 @@ def create_muddled_dataloader(dataset, batch_size, num_workers):
         drop_last=False
     )
 
-CONCEPT_LABEL_MAP = CONCEPT_LABEL_MAP_IDRID
+CONCEPT_LABEL_MAP = CONCEPT_LABEL_MAP_DICT[TASK]
 
 DEBUG = False
 
@@ -152,6 +228,8 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0):
     exp_pred_list_refined = np.zeros((0), dtype=np.uint8)
     gt_list = np.zeros((0), dtype=np.uint8)
 
+    agg_visual_tokens_list=[]
+
     if explicd_only==0:
         sit_pred_list = np.zeros((0), dtype=np.uint8)
 
@@ -173,7 +251,8 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0):
             labels = y
 
             imgs_for_explicid=prepare__imgs_for_explicid(raw_image, exp_val_transforms).to("cuda")
-            cls_logits, cls_logits_criteria_only, _, agg_visual_tokens= explicd(imgs_for_explicid)
+            cls_logits, cls_logits_criteria_only, cls_logits_dict, _, agg_visual_tokens= explicd(imgs_for_explicid)
+            agg_visual_tokens_list.append(agg_visual_tokens)
             if explicd_only==0:
                 concept_label = torch.tensor([CONCEPT_LABEL_MAP[label] for label in labels])
                 concept_label = concept_label.long().cuda()
@@ -183,8 +262,11 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0):
                 noises = torch.randn_like(x)
                 alpha_t = 1 - time_input
                 sigma_t = time_input
+                d_alpha_t = -1
+                d_sigma_t =  1
                 model_input = alpha_t * x + sigma_t * noises
-                _, _, _, produced_concepts, y_predicted, _  = sit_model(model_input, time_input.flatten(), y, 
+                model_target = d_alpha_t * x + d_sigma_t * noises
+                _, _, _, produced_concepts, y_predicted, _, _  = sit_model(model_input, x, model_target,  time_input.flatten(), y, 
                                                                         concept_label=concept_label, 
                                                                         image_embeddings=agg_visual_tokens,
                                                                         cls_logits=cls_logits)
@@ -208,6 +290,17 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0):
         exp_acc = 100 * exp_correct / len(exp_pred_list)
         exp_val_f1 = f1_score(gt_list, exp_pred_list, average='macro')
 
+        expl_scores={
+            "BMAC":exp_BMAC,
+            "f1":exp_val_f1,
+            "Acc":exp_acc
+        }
+
+        tokens_and_gt={
+            #"tokens":torch.stack(agg_visual_tokens_list, dim=0),
+            "tokens":torch.cat(agg_visual_tokens_list, dim=0),
+            "gt":gt_list
+        }
 
         # exp_criteria_only_BMAC = balanced_accuracy_score(gt_list, exp_criteria_only_pred_list)
         # exp_criteria_only_correct = np.sum(gt_list == exp_criteria_only_pred_list)
@@ -220,18 +313,38 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0):
             sit_acc = 100 * sit_correct / len(sit_pred_list)
             sit_val_f1 = f1_score(gt_list, sit_pred_list, average='macro')
 
+            sit_scores={
+            "BMAC":sit_BMAC,
+            "f1":sit_val_f1,
+            "Acc":sit_acc
+            }
+
             exp_refined_BMAC = balanced_accuracy_score(gt_list, exp_pred_list_refined)
             exp_refined_correct = np.sum(gt_list == exp_pred_list_refined)
             exp_refined_acc = 100 * exp_refined_correct / len(exp_pred_list_refined)
             exp_refined_val_f1 = f1_score(gt_list, exp_pred_list_refined, average='macro')
-        else:
-            sit_BMAC = 0
-            sit_acc = 0
-            sit_val_f1 = 0
-            exp_refined_BMAC=0
-            exp_refined_val_f1 = 0
 
-    return exp_BMAC, exp_acc, exp_val_f1, losses_cls/(i+1), losses_concepts/(i+1), sit_BMAC, sit_acc, sit_val_f1, exp_refined_BMAC, exp_refined_val_f1
+            expl_refined_scores={
+            "BMAC":exp_refined_BMAC,
+            "f1":exp_refined_val_f1,
+            "Acc":exp_refined_acc
+            }
+        else:
+            sit_scores={
+            "BMAC":0,
+            "f1":0,
+            "Acc":0
+            }
+
+            expl_refined_scores={
+            "BMAC":0,
+            "f1":0,
+            "Acc":0
+            }
+
+
+
+    return expl_scores, sit_scores, expl_refined_scores, tokens_and_gt
 
 
 class DualRandomVerticalFlip:
@@ -261,6 +374,24 @@ class DualRandomHorizontalFlip:
         if torch.rand(1) < self.p:
             img1 = transforms.functional.hflip(img1)
             #img2 = transforms.functional.hflip(img2)
+        
+        return img1, img2
+    
+class DualGaussianNoise:
+    def __init__(self, p=0.5, mean=0, std=0):
+        self.p = p
+        self.mean=mean
+        self.std=std
+
+    def __call__(self, imgs):
+        # imgs is a tuple (image1, image2)
+        img1, img2 = imgs
+
+        # Apply the random vertical flip with the same probability to both images
+        if torch.rand(1) < self.p:
+            img1 = img1.float()
+            img1 = img1 + torch.normal(self.mean, self.std, size=img1.shape, device=img1.device)
+            img1 = torch.clamp(img1, 0, 255).to(torch.uint8)
         
         return img1, img2
 
@@ -553,6 +684,7 @@ def main(args):
     conf.data_path = "/home/arsen.abzhanov/Thesis_local/REPA/Explicd/dataset/"
     conf.batch_size = 128
     conf.flag = 2
+    conf.do_logits_similarity=DO_LOGITS_SIMILARITY
 
     explicid = ExpLICD_ViT_L(concept_list=concept_list, model_name='biomedclip', config=conf)
     #explicid = ExpLICD_ViT_L_Multiple_Prompts(concept_list=concept_list, model_name='biomedclip', config=conf)
@@ -586,11 +718,11 @@ def main(args):
 
     print("============",exp_val_transforms)
 
-    explicid_testset = SkinDataset(conf.data_path, mode='test', transforms=exp_val_transforms, flag=conf.flag, debug=DEBUG, config=conf, return_concept_label=True)
-    explicid_testLoader = DataLoader(explicid_testset, batch_size=conf.batch_size, shuffle=False, num_workers=2, drop_last=False)
+    # explicid_testset = SkinDataset(conf.data_path, mode='test', transforms=exp_val_transforms, flag=conf.flag, debug=DEBUG, config=conf, return_concept_label=True)
+    # explicid_testLoader = DataLoader(explicid_testset, batch_size=conf.batch_size, shuffle=False, num_workers=2, drop_last=False)
     
-    lesion_weight = torch.FloatTensor(conf.cls_weight).cuda()
-    cls_criterion = nn.CrossEntropyLoss(weight=lesion_weight).cuda()
+    # lesion_weight = torch.FloatTensor(conf.cls_weight).cuda()
+    # cls_criterion = nn.CrossEntropyLoss(weight=lesion_weight).cuda()
 
     do_contr_loss = False
 
@@ -609,7 +741,10 @@ def main(args):
         accelerator=accelerator,
         latents_scale=latents_scale,
         latents_bias=latents_bias,
-        weighting=args.weighting
+        weighting=args.weighting,
+        task=TASK,
+        do_logits_similarity=DO_LOGITS_SIMILARITY,
+        concept_hardness=CONCEPT_HARDNESS
     )
     if args.explicd_only==0:
         if accelerator.is_main_process:
@@ -647,15 +782,20 @@ def main(args):
     #         {'params': model.parameters(), 'lr': 0.0002},
     #         {'params': explicid.get_backbone_params(), 'lr': 0.0001 * 0.1},
     #         {'params': explicid.get_bridge_params(), 'lr': 0.0001},
-    #     ])
+    #     ])    
     dual_transform = transforms.Compose([
     DualRandomVerticalFlip(),  # Ensure both images get flipped or not
     DualRandomHorizontalFlip(),
+    DualGaussianNoise(p=0.5, mean=0, std=25) if ADD_GAUSSIAN_NOISE else DualGaussianNoise(p=0.0)
     #DualRandomGammaContrast(),
     #CustomCLAHE(),
     # #DualRandomRotate90(),
     # #DualRandomRotate270(),
 ])
+    dual_val_transform = transforms.Compose([
+        #DualRandomGaussianNoise(p=1),
+    ])
+
     # Setup data:
     # train_dataset = CustomDataset(args.data_dir, transform= dual_transform, mode='train')
     # #train_muddled_dataset = CustomDataset(args.data_dir, transform= None, mode='muddled_train')
@@ -666,37 +806,47 @@ def main(args):
     # val_busi_dataset = CustomDataset(args.data_dir, mode='busi_val')
     # test_busi_dataset = CustomDataset(args.data_dir,transform= None, mode='busi_test')
 
-    if TASK=='ISIC':
+    if TASK=='ISIC' or TASK=='ISIC_MINE':
         if DO_MUDDLE_CHECK:
             train_dataset = CustomDataset(args.data_dir, transform= dual_transform, mode='test')
+            val_dataset = CustomDataset(args.data_dir, transform= dual_val_transform, mode='val')
             test_dataset = CustomDataset(args.data_dir,transform= None, mode='train')
-            train_muddled_0_025_dataset = CustomDataset(args.data_dir, transform= None, mode='muddled_0_025')
+            #train_muddled_0_025_dataset = CustomDataset(args.data_dir, transform= None, mode='muddled_0_025')
             train_muddled_0_050_dataset = CustomDataset(args.data_dir, transform= None, mode='muddled_0_050')
-            train_muddled_0_075_dataset = CustomDataset(args.data_dir, transform= None, mode='muddled_0_075')
+            #train_muddled_0_075_dataset = CustomDataset(args.data_dir, transform= None, mode='muddled_0_075')
             train_muddled_0_1_dataset = CustomDataset(args.data_dir, transform= None, mode='muddled_0_1')
+            train_muddled_0_15_dataset = CustomDataset(args.data_dir, transform= None, mode='muddled_0_15')
+            train_muddled_0_2_dataset = CustomDataset(args.data_dir, transform= None, mode='muddled_0_2')
 
             muddled_datasets = {
-                '0_025': train_muddled_0_025_dataset,
+                #'0_025': train_muddled_0_025_dataset,
                 '0_050': train_muddled_0_050_dataset,
-                '0_075': train_muddled_0_075_dataset,
-                '0_1': train_muddled_0_1_dataset
+                #'0_075': train_muddled_0_075_dataset,
+                '0_1': train_muddled_0_1_dataset,
+                '0_15': train_muddled_0_15_dataset,
+                '0_2': train_muddled_0_2_dataset
             }
 
             train_muddled_dataloaders = {
-                k: create_muddled_dataloader(v, local_batch_size, args.num_workers)
+                k: create_muddled_dataloader(v, int(args.batch_size // accelerator.num_processes), args.num_workers)
                 for k, v in muddled_datasets.items()
             }
+
         else:
             train_dataset = CustomDataset(args.data_dir, transform= dual_transform, mode='train')
+            val_dataset = CustomDataset(args.data_dir, transform= dual_val_transform, mode='val')
             test_dataset = CustomDataset(args.data_dir,transform= None, mode='test')
-        val_dataset = CustomDataset(args.data_dir, mode='val')
     elif TASK=='IDRID':
         train_dataset = CustomDataset(args.data_dir, transform= dual_transform, mode='idrid_train')
         val_dataset = CustomDataset(args.data_dir, mode='idrid_val')
         test_dataset = CustomDataset(args.data_dir,transform= None, mode='idrid_test')
+    elif TASK=='IDRID_EDEMA':
+        train_dataset = CustomDataset(args.data_dir, transform= dual_transform, mode='idrid_edema_train')
+        val_dataset = CustomDataset(args.data_dir, transform= dual_val_transform, mode='idrid_edema_val')
+        test_dataset = CustomDataset(args.data_dir,transform= None, mode='idrid_edema_test')
     elif TASK=='BUSI':
         train_dataset = CustomDataset(args.data_dir, transform= dual_transform, mode='busi_train')
-        val_dataset = CustomDataset(args.data_dir, mode='busi_val')
+        val_dataset = CustomDataset(args.data_dir, transform= dual_val_transform, mode='busi_val')
         test_dataset = CustomDataset(args.data_dir,transform= None, mode='busi_test')
 
     local_batch_size = int(args.batch_size // accelerator.num_processes)
@@ -787,7 +937,7 @@ def main(args):
 
     # Labels to condition the model with (feel free to change):
     sample_batch_size = 64 // accelerator.num_processes
-    _, gt_xs, _ = next(iter(val_dataloader))
+    (_, gt_xs), _ = next(iter(val_dataloader))
     gt_xs = gt_xs[:sample_batch_size]
     gt_xs = sample_posterior(
         gt_xs.to(device), latents_scale=latents_scale, latents_bias=latents_bias
@@ -813,10 +963,16 @@ def main(args):
     max_sit_val_acc=0
     max_sit_val_bmacc=0
     max_sit_val_f1=0
+
+    curve_of_f1 = []
+    curve_of_BMAC = []
     if args.explicd_only==1:
         print("explicd only")
-        exp_test_BMAC, _, exo_test_f1, _, _ , _, _, _ , exp_refined_BMAC_test, exp_refined_f1_test= validation(explicid, None, test_dataloader, exp_val_transforms, explicd_only=1)
-        print('BMAC: %.5f, f1: %.5f'%(exp_test_BMAC, exo_test_f1))
+        optimizer.eval()
+        optimizer.zero_grad(set_to_none=True)
+        expl_scores, _, _, tokens_and_gt = validation(explicid, None, test_dataloader, exp_val_transforms, explicd_only=1)
+        print('BMAC: %.5f, f1: %.5f'%(expl_scores["BMAC"], expl_scores["f1"]))
+        optimizer.train()
     else:
         print("whole pipeline")
     
@@ -863,28 +1019,31 @@ def main(args):
                         list_of_images.append(color_jitter_transform(imgs_for_explicid))
                         list_of_images.append(blur_transform(imgs_for_explicid))
 
-                    loss, proj_loss, explicid_loss, expl_loss_cls, cosine_loss, sit_cls_loss, contr_loss, loss_cls_criteria_only, loss_cls_refined = loss_fn(model, x, model_kwargs, zs=zs, 
+                    loss, proj_loss, explicid_loss, expl_loss_cls, logits_similarity_loss, cosine_loss, sit_cls_loss, contr_loss, loss_cls_criteria_only, loss_cls_refined, sparsity_loss = loss_fn(model, x, model_kwargs, zs=zs, 
                                                                         labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch,  explicd_only=0)
                     loss_mean = loss.mean()
                     #loss_mean = torch.tensor(0.0, device=device)
                     proj_loss_mean = proj_loss.mean()* args.proj_coeff
                     #proj_loss_mean = torch.tensor(0.0, device=device)
                     explicid_loss_mean = explicid_loss.mean() *2
+                    logits_similarity_loss_mean= torch.tensor(0.0, device=device)
+                    #logits_similarity_loss_mean = logits_similarity_loss.mean()
                     #explicid_loss_mean = torch.tensor(0.0, device=device)
                     #cosine_loss_mean = cosine_loss.mean()
                     cosine_loss_mean= torch.tensor(0.0, device=device)
                     contr_loss_mean = contr_loss.mean()
-                    #sit_cls_loss_mean = sit_cls_loss.mean()
-                    sit_cls_loss_mean =torch.tensor(0.0, device=device)
+                    sit_cls_loss_mean = sit_cls_loss.mean()
+                    #sit_cls_loss_mean =torch.tensor(0.0, device=device)
                     #loss_cls_criteria_only_mean = loss_cls_criteria_only.mean()
                     loss_cls_criteria_only_mean=torch.tensor(0.0, device=device)
                     expl_loss_cls_mean = expl_loss_cls.mean()
                     #loss_cls_refined_mean = loss_cls_refined.mean()
                     loss_cls_refined_mean = torch.tensor(0.0, device=device)
-                    total_loss_magnitude = loss_mean + proj_loss_mean  + explicid_loss_mean + cosine_loss_mean + contr_loss_mean +sit_cls_loss_mean+loss_cls_criteria_only_mean+loss_cls_refined_mean
+                    total_loss_magnitude = loss_mean + proj_loss_mean  + explicid_loss_mean + cosine_loss_mean + contr_loss_mean +sit_cls_loss_mean+loss_cls_criteria_only_mean+loss_cls_refined_mean+logits_similarity_loss_mean
                     loss_weight = loss_mean / total_loss_magnitude
                     proj_weight = proj_loss_mean / total_loss_magnitude
                     explicid_weight = explicid_loss_mean / total_loss_magnitude
+                    lgs_sim_weight = logits_similarity_loss_mean / total_loss_magnitude
                     cosine_weight = cosine_loss_mean / total_loss_magnitude
                     contr_weight = contr_loss_mean / total_loss_magnitude
                     sit_cls_weight = sit_cls_loss_mean / total_loss_magnitude
@@ -893,7 +1052,7 @@ def main(args):
                     #expl_cls_weight = expl_loss_cls_mean / total_loss_magnitude
                     total_loss = ((loss_weight*loss_mean) + (proj_weight*proj_loss_mean) + (explicid_weight*explicid_loss_mean) + (cosine_weight*cosine_loss_mean) + 
                                   (contr_weight*contr_loss_mean) + (sit_cls_weight*sit_cls_loss_mean) + (loss_cls_criteria_only_mean_weight*loss_cls_criteria_only_mean)+
-                                  (loss_cls_refined_mean_weight*loss_cls_refined_mean)) 
+                                  (loss_cls_refined_mean_weight*loss_cls_refined_mean) + (lgs_sim_weight*logits_similarity_loss_mean)) 
                     #+ (expl_cls_weight*expl_loss_cls_mean)
 
                     # loss = loss_mean + proj_loss_mean * args.proj_coeff + explicid_loss_mean + cosine_loss_mean + 4*contr_loss_mean +sit_cls_loss_mean
@@ -918,11 +1077,13 @@ def main(args):
                         list_of_images.append(color_jitter_transform(imgs_for_explicid))
                         list_of_images.append(blur_transform(imgs_for_explicid))
 
-                    _, _, explicid_loss, expl_loss_cls, _, _, contr_loss, _ = loss_fn(None, x, model_kwargs, zs=zs, 
+                    _, _, explicid_loss, expl_loss_cls, logits_similarity_loss, _, _, contr_loss, _ = loss_fn(None, x, model_kwargs, zs=zs, 
                                                                         labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch, explicd_only=1)
                     explicid_loss_mean = explicid_loss.mean()
+                    logits_similarity_loss_mean= torch.tensor(0.0, device=device)
+                    #logits_similarity_loss_mean = logits_similarity_loss.mean()
                     #expl_loss_cls_mean = expl_loss_cls.mean()
-                    accelerator.backward(explicid_loss_mean)
+                    accelerator.backward(explicid_loss_mean+logits_similarity_loss_mean)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
             
@@ -959,7 +1120,7 @@ def main(args):
                                 break
 
                     imgs_for_explicid=prepare__imgs_for_explicid(imgs_for_sampling, exp_val_transforms).to(device)
-                    cls_logits, _, _, agg_visual_tokens = explicid(imgs_for_explicid)
+                    cls_logits, _, cls_logits_dict, _, agg_visual_tokens = explicid(imgs_for_explicid)
                     samples = euler_sampler(
                         model, 
                         xT, 
@@ -988,9 +1149,10 @@ def main(args):
                     "proj_loss": accelerator.gather(proj_loss_mean).mean().detach().item(),
                     "grad_norm": accelerator.gather(grad_norm).mean().detach().item(),
                     "expl_loss": accelerator.gather(explicid_loss_mean).mean().detach().item(),
+                    #"lgs_sim_loss": accelerator.gather(logits_similarity_loss_mean).mean().detach().item(),
                     #"cos_loss": accelerator.gather(cosine_loss_mean).mean().detach().item(),
                     #"contr_loss": accelerator.gather(contr_loss_mean).mean().detach().item(),
-                    #"sit_cls_loss": accelerator.gather(sit_cls_loss_mean).mean().detach().item(),
+                    "sit_cls_loss": accelerator.gather(sit_cls_loss_mean).mean().detach().item(),
                     #"loss_cls_criteria_only": accelerator.gather(loss_cls_criteria_only_mean).mean().detach().item(),
                     "loss_cls_refined": accelerator.gather(loss_cls_refined_mean).mean().detach().item(),
                     #"expl_cls_loss": accelerator.gather(expl_loss_cls_mean).mean().detach().item(),
@@ -998,6 +1160,7 @@ def main(args):
             else:
                 logs = {
                     "expl_loss": accelerator.gather(explicid_loss_mean).mean().detach().item(),
+                    #"logits_similarity_loss": accelerator.gather(logits_similarity_loss_mean).mean().detach().item(),
                 }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
@@ -1017,7 +1180,7 @@ def main(args):
         gt_list = np.zeros((0), dtype=np.uint8)
 
         with torch.no_grad():
-            for _, (raw_image, x, y) in enumerate(val_dataloader):
+            for _, ((raw_image, x), y) in enumerate(val_dataloader):
                 
                 raw_image = raw_image.to(device)
                 y = y.to(device)
@@ -1033,7 +1196,7 @@ def main(args):
                 torch.cuda.empty_cache()
 
                 imgs_for_explicid=prepare__imgs_for_explicid(raw_image, exp_val_transforms).to(device)
-                cls_logits, cls_logits_criteria_only,  _, agg_visual_tokens = explicid(imgs_for_explicid)
+                cls_logits, cls_logits_criteria_only, cls_logits_dict, _, agg_visual_tokens = explicid(imgs_for_explicid)
                 _, label_pred = torch.max(cls_logits, dim=1)
                 #_, label_criteria_only_pred = torch.max(cls_logits_criteria_only, dim=1)
 
@@ -1055,12 +1218,16 @@ def main(args):
                 alpha_t = 1 - time_input
                 sigma_t = time_input
 
+                d_alpha_t = -1
+                d_sigma_t =  1
+
                 exp_pred_list = np.concatenate((exp_pred_list, label_pred.cpu().numpy().astype(np.uint8)), axis=0)
                 #exp_criteria_only_pred_list = np.concatenate((exp_criteria_only_pred_list, label_criteria_only_pred.cpu().numpy().astype(np.uint8)), axis=0)
                 gt_list = np.concatenate((gt_list, labels.cpu().numpy().astype(np.uint8)), axis=0)
                 if args.explicd_only==0:
                     model_input = alpha_t * x + sigma_t * noises
-                    _, _, _, produced_concepts, y_predicted, _  = model(model_input, time_input.flatten(), y, 
+                    model_target = d_alpha_t * x + d_sigma_t * noises
+                    _, _, _, produced_concepts, y_predicted, _, _  = model(model_input, x, model_target, time_input.flatten(), y, 
                                                                             concept_label=concept_label, 
                                                                             image_embeddings=agg_visual_tokens,
                                                                             cls_logits=cls_logits)
@@ -1102,8 +1269,8 @@ def main(args):
                         max_exp_val_f1=exp_val_f1
                         print('Explicd Val f1', f'{exp_val_f1:.3f}')
                         print('Explicd Val Balanced Acc', f'{exp_val_BMAC:.3f}')
-                    checkpoint_path = f"/l/users/arsen.abzhanov/REPA/checkpoints/without_sit/explicd_1_{global_step:07d}.pt"
-                    torch.save(explicid.state_dict(), checkpoint_path)
+                    # checkpoint_path = f"/l/users/arsen.abzhanov/REPA/checkpoints/without_sit/explicd_1_{global_step:07d}.pt"
+                    # torch.save(explicid.state_dict(), checkpoint_path)
                     # else:
                     #     max_exp_criteria_only_val_f1=exp_criteria_only_val_f1
                     #     print('Explicd criteria only Val f1', f'{exp_criteria_only_val_f1:.3f}')
@@ -1111,14 +1278,26 @@ def main(args):
                     explicid.eval()
                     explicid.zero_grad(set_to_none=True)
                     optimizer.eval()
-                    exp_test_BMAC, exp_test_acc, exo_test_f1, _, _ , _, _, _, exp_refined_BMAC_test, exp_refined_f1_test = validation(explicid, None, test_dataloader, exp_val_transforms, explicd_only=1)
-                    print('Explicd Test f1', f'{exo_test_f1:.3f}')
-                    print('Explicd Test Acc', f'{exp_test_acc:.3f}')
-                    print('Explicd Test Balanced Acc', f'{exp_test_BMAC:.3f}')
-                    # if epoch>7:
-                    #     exp_muddled_BMAC, _, exp_muddled_f1, _, _ , _, _, _, _, _ = validation(explicid, None, train_muddled_dataloader, exp_val_transforms, explicd_only=1)
-                    #     print('Explicd Muddled f1', f'{exp_muddled_f1:.3f}')
-                    #     print('Explicd Muddled Balanced Acc', f'{exp_muddled_BMAC:.3f}')
+                    expl_scores, _, _, tokens_and_gt= validation(explicid, None, test_dataloader, exp_val_transforms, explicd_only=1)
+                    print('Explicd Test f1', f'{expl_scores["f1"]:.3f}')
+                    print('Explicd Test Acc', f'{expl_scores["Acc"]:.3f}')
+                    print('Explicd Test Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
+                    if epoch>7 and DO_MUDDLE_CHECK:
+                        curve_of_f1.clear()
+                        curve_of_BMAC.clear()
+                        curve_of_f1.append(expl_scores["f1"])
+                        curve_of_BMAC.append(expl_scores["BMAC"])
+                        # ['0_025','0_050','0_075','0_1']
+                        for muddle_severity_level in ['0_050','0_1','0_15','0_2']:
+                            expl_scores, _, _, tokens_and_gt = validation(explicid, None, train_muddled_dataloaders[muddle_severity_level], exp_val_transforms, explicd_only=1)
+                            print('Muddle_Severity_Level ', muddle_severity_level)
+                            print('Explicd Muddled f1', f'{expl_scores["f1"]:.3f}')
+                            print('Explicd Muddled Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
+                            curve_of_f1.append(expl_scores["f1"])
+                            curve_of_BMAC.append(expl_scores["BMAC"])
+                        print('Curve of f1', curve_of_f1)
+                        print('Curve of BMAC', curve_of_BMAC)
+
             else:
                 # or exp_criteria_only_val_f1>max_exp_criteria_only_val_f1
 
@@ -1135,8 +1314,8 @@ def main(args):
                     max_exp_val_f1= exp_val_f1
                     print('Explicd Val f1', f'{exp_val_f1:.3f}')
                     print('Explicd Val Balanced Acc', f'{exp_val_BMAC:.3f}')
-                    checkpoint_path = f"/l/users/arsen.abzhanov/REPA/checkpoints/with_sit/explicd_0_{global_step:07d}.pt"
-                    torch.save(explicid.state_dict(), checkpoint_path)
+                    # checkpoint_path = f"/l/users/arsen.abzhanov/REPA/checkpoints/with_sit/explicd_0_{global_step:07d}.pt"
+                    # torch.save(explicid.state_dict(), checkpoint_path)
                     # else:
                     #     print("new best Explicd refined model")
                     #     max_exp_refined_val_f1=exp_refined_val_f1
@@ -1156,18 +1335,29 @@ def main(args):
                     model.eval()
                     model.zero_grad(set_to_none=True)
                     optimizer.eval()
-                    exp_test_BMAC, exp_test_acc, exo_test_f1, _, _ , sit_BMAC, _, sit_f1, exp_refined_BMAC_test, exp_refined_f1_test = validation(explicid, model, test_dataloader, exp_val_transforms, explicd_only=0)
-                    print('Explicd Test f1', f'{exo_test_f1:.3f}')
-                    print('Explicd Test Acc', f'{exp_test_acc:.3f}')
-                    print('Explicd Test Balanced Acc', f'{exp_test_BMAC:.3f}')
+                    expl_scores, sit_scores, expl_refined_scores, tokens_and_gt = validation(explicid, model, test_dataloader, exp_val_transforms, explicd_only=0)
+                    print('Explicd Test f1', f'{expl_scores["f1"]:.3f}')
+                    print('Explicd Test Acc', f'{expl_scores["Acc"]:.3f}')
+                    print('Explicd Test Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
                     # print('SiT Test f1', f'{sit_f1:.3f}')
                     # print('SiT Test Balanced Acc', f'{sit_BMAC:.3f}')
                     # print('Explicd refined Test f1', f'{exp_refined_f1_test:.3f}')
                     # print('Explicd refined Test Balanced Acc', f'{exp_refined_BMAC_test:.3f}')
-                    # if epoch>7:
-                    #     exp_muddled_BMAC, _, exp_muddled_f1, _, _ , _, _, _, _, _ = validation(explicid, model, train_muddled_dataloader, exp_val_transforms, explicd_only=0)
-                    #     print('Explicd Muddled f1', f'{exp_muddled_f1:.3f}')
-                    #     print('Explicd Muddled Balanced Acc', f'{exp_muddled_BMAC:.3f}')
+                    if epoch>7 and DO_MUDDLE_CHECK:
+                        curve_of_f1.clear()
+                        curve_of_BMAC.clear()
+                        curve_of_f1.append(expl_scores["f1"])
+                        curve_of_BMAC.append(expl_scores["BMAC"])
+                        # ['0_025','0_050','0_075','0_1']
+                        for muddle_severity_level in ['0_050','0_1','0_15','0_2']:
+                            expl_scores, sit_scores, expl_refined_scores, tokens_and_gt = validation(explicid, model, train_muddled_dataloaders[muddle_severity_level], exp_val_transforms, explicd_only=0)
+                            print('Muddle_Severity_Level ', muddle_severity_level)
+                            print('Explicd Muddled f1', f'{expl_scores["f1"]:.3f}')
+                            print('Explicd Muddled Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
+                            curve_of_f1.append(expl_scores["f1"])
+                            curve_of_BMAC.append(expl_scores["BMAC"])
+                        print('Curve of f1', curve_of_f1)
+                        print('Curve of BMAC', curve_of_BMAC)
 
 
 
@@ -1191,7 +1381,7 @@ def parse_args(input_args=None):
     parser.add_argument("--exp-name", type=str, required=True)
     parser.add_argument("--logging-dir", type=str, default="logs")
     parser.add_argument("--report-to", type=str, default="wandb")
-    parser.add_argument("--sampling-steps", type=int, default=1500)
+    parser.add_argument("--sampling-steps", type=int, default=5000)
     parser.add_argument("--resume-step", type=int, default=0)
 
     # model

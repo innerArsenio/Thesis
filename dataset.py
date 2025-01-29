@@ -14,7 +14,7 @@ except ImportError:
 from sklearn.model_selection import train_test_split
 import random
 
-LIST_OF_TASKS = ['ISIC', 'IDRID', 'BUSI']
+LIST_OF_TASKS = ['ISIC', 'IDRID', 'BUSI', 'BUSI_SOFT']
 TASK='ISIC'
 
 def set_seed(seed):
@@ -35,7 +35,7 @@ class CustomDataset(Dataset):
         self.transforms = transform
 
         self.seed = 42
-        set_seed(self.seed)
+        #set_seed(self.seed)
 
         # if self.mode=="test":
         #     self.images_dir = "/home/arsen.abzhanov/Thesis_local/REPA/ISIC_2018_REPA/test/images"
@@ -68,7 +68,7 @@ class CustomDataset(Dataset):
         #     self.images_dir = "/home/arsen.abzhanov/Thesis_local/REPA/IDRID_REPA/test/images"
         #     self.features_dir = "/home/arsen.abzhanov/Thesis_local/REPA/IDRID_REPA/test/vae-sd"
 
-        BASE_DIR = "/home/arsen.abzhanov/Thesis_local/REPA"
+        BASE_DIR = "."
 
         MODE_TO_PATHS = {
             "test": {
@@ -99,6 +99,14 @@ class CustomDataset(Dataset):
                 "images": f"{BASE_DIR}/ISIC_2018_muddled_0_1_REPA/images",
                 "features": f"{BASE_DIR}/ISIC_2018_muddled_0_1_REPA/vae-sd"
             },
+            "muddled_0_15": {
+                "images": f"{BASE_DIR}/ISIC_2018_muddled_0_15_REPA/images",
+                "features": f"{BASE_DIR}/ISIC_2018_muddled_0_15_REPA/vae-sd"
+            },
+            "muddled_0_2": {
+                "images": f"{BASE_DIR}/ISIC_2018_muddled_0_2_REPA/images",
+                "features": f"{BASE_DIR}/ISIC_2018_muddled_0_2_REPA/vae-sd"
+            },
             "busi": {
                 "images": f"{BASE_DIR}/BUSI_REPA/images",
                 "features": f"{BASE_DIR}/BUSI_REPA/vae-sd"
@@ -114,6 +122,18 @@ class CustomDataset(Dataset):
             "idrid_test": {
                 "images": f"{BASE_DIR}/IDRID_REPA/test/images",
                 "features": f"{BASE_DIR}/IDRID_REPA/test/vae-sd"
+            },
+            "idrid_edema_train": {
+                "images": f"{BASE_DIR}/IDRID_Edema_REPA/train/images",
+                "features": f"{BASE_DIR}/IDRID_Edema_REPA/train/vae-sd"
+            },
+            "idrid_edema_val": {
+                "images": f"{BASE_DIR}/IDRID_Edema_REPA/train/images",
+                "features": f"{BASE_DIR}/IDRID_Edema_REPA/train/vae-sd"
+            },
+            "idrid_edema_test": {
+                "images": f"{BASE_DIR}/IDRID_Edema_REPA/test/images",
+                "features": f"{BASE_DIR}/IDRID_Edema_REPA/test/vae-sd"
             }
         }
 
@@ -151,7 +171,7 @@ class CustomDataset(Dataset):
         labels = np.array(labels)
         self.labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
 
-        if self.mode.startswith("busi_") or self.mode.startswith("idrid_") and self.mode!="idrid_test":
+        if self.mode.startswith("busi_") or self.mode.startswith("idrid_") and self.mode!="idrid_test" and self.mode!='idrid_edema_test':
             # Get unique classes
             unique_classes = np.unique(self.labels)
 
@@ -183,11 +203,11 @@ class CustomDataset(Dataset):
             if self.mode.startswith("busi_"):
                 test_indices = np.array(test_indices)
 
-            if self.mode=="busi_train" or self.mode=="idrid_train":
+            if self.mode=="busi_train" or self.mode=="idrid_train" or self.mode=="idrid_edema_train":
                 self.image_fnames = [self.image_fnames[i] for i in train_indices]
                 self.feature_fnames = [self.feature_fnames[i] for i in train_indices]
                 self.labels = self.labels[train_indices]
-            elif self.mode == "busi_val" or self.mode=="idrid_val":
+            elif self.mode == "busi_val" or self.mode=="idrid_val" or self.mode=="idrid_edema_val":
                 self.image_fnames = [self.image_fnames[i] for i in val_indices]
                 self.feature_fnames = [self.feature_fnames[i] for i in val_indices]
                 self.labels = self.labels[val_indices]
@@ -209,7 +229,7 @@ class CustomDataset(Dataset):
         return len(self.feature_fnames)
 
     def __getitem__(self, idx):
-        set_seed(self.seed)
+        #set_seed(self.seed)
         image_fname = self.image_fnames[idx]
         feature_fname = self.feature_fnames[idx]
         image_ext = self._file_ext(image_fname)

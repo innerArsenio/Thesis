@@ -11,14 +11,12 @@ import torch.nn as nn
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from torch.nn import functional as F
 
 NUM_OF_CRITERIA = {
     'ISIC': 7,
     'ISIC_MINE': 6,
-
     'IDRID': 5,
-    'IDRID_EDEMA': 6,
-
     'BUSI': 6,
     'BUSI_SOFT': 6
 }
@@ -117,70 +115,206 @@ class LabelEmbedder(nn.Module):
         #print(embeddings)
         return embeddings
 
+# class PatchGating(nn.Module):
+#     def __init__(self, hidden_size):
+#         super().__init__()
+#         self.linear = nn.Linear(hidden_size, 1)  # predicts gate per patch
+
+#     def forward(self, patches):
+#         # patches: shape B,T,D
+#         # produce gates in [0,1] range
+#         gates = torch.sigmoid(self.linear(patches))  # B,T,1
+#         return gates  # soft gates
+    
+def calculate_sparsity_loss(gates):
+    # Encourage sparsity by penalizing the sum of gate values
+    sparsity_loss = torch.mean(gates)
+    return sparsity_loss
+
+
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, hidden_size, num_heads, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout)
+        self.linear1 = nn.Linear(hidden_size, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, hidden_size)
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = F.relu
+
+    def forward(self, src):
+        src2 = self.self_attn(src, src, src)[0]
+        #src = src + self.dropout1(src2)
+        src = src + src2
+        src = self.norm1(src)
+        #src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src2 = self.linear2(self.activation(self.linear1(src)))
+        #src = src + self.dropout2(src2)
+        src = src + src2
+        src = self.norm2(src)
+        return src
+
+class PatchGating(nn.Module):
+    def __init__(self, hidden_size, num_heads, num_layers=2):
+        super().__init__()
+        self.encoder_layers = nn.ModuleList([
+            TransformerEncoderLayer(hidden_size, num_heads) for _ in range(num_layers)
+        ])
+        self.linear = nn.Linear(hidden_size, 1)  # predicts gate per patch
+
+    def forward(self, patches, T):
+        # patches: shape B,T,D
+        patches = patches.permute(1, 0, 2)  # T,B,D for transformer
+        for layer in self.encoder_layers:
+            patches = layer(patches)
+        patches = patches.permute(1, 0, 2)  # B,T,D
+        gates = torch.sigmoid(self.linear(patches[:,:T,:]))  # B,T,1
+        return gates  # soft gates
 
 #################################################################################
 #                                 Core SiT Model                                #
 #################################################################################
 
-class SiTBlock(nn.Module):
+# class SiTBlock(nn.Module):
+#     """
+#     A SiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+#     """
+#     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, task=None, **block_kwargs):
+#         super().__init__()
+#         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+#         self.attn = Attention(
+#             hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=block_kwargs["qk_norm"]
+#             )
+#         self.task = task
+#         self.num_vis_tokens = NUM_OF_CRITERIA[self.task]
+        
+#         if "fused_attn" in block_kwargs.keys():
+#             self.attn.fused_attn = block_kwargs["fused_attn"]
+#         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+#         mlp_hidden_dim = int(hidden_size * mlp_ratio)
+#         approx_gelu = lambda: nn.GELU(approximate="tanh")
+#         self.mlp = Mlp(
+#             in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0
+#             )
+#         self.adaLN_modulation = nn.Sequential(
+#             nn.SiLU(),
+#             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+#         )
+#         self.patch_gating = PatchGating(hidden_size)  # Add patch gating module
+
+
+#     def forward(self, x, c):
+#         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+#             self.adaLN_modulation(c).chunk(6, dim=-1)
+#         )
+
+#         T = x.shape[1] - self.num_vis_tokens -1
+#         latent_tokens = x[:, :T, :]
+#         visual_tokens_crit = x[:, T:T+self.num_vis_tokens, :]
+#         y_tokens = x[:, -1:, :]
+#         gates = self.patch_gating(latent_tokens)  # B,T,1
+#         gated_latent_tokens = latent_tokens * gates  # B,T,D
+#         # Perform self-attention on the gated latent tokens and visual tokens
+#         x = torch.cat([gated_latent_tokens, visual_tokens_crit, y_tokens], dim=1)
+#         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+
+#         latent_tokens = x[:, :T, :]
+#         visual_tokens_crit = x[:, T:T+self.num_vis_tokens, :]
+#         y_tokens = x[:, -1:, :]
+
+#         # Apply MLPs to each modality separately
+#         latent_tokens = latent_tokens + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(latent_tokens), shift_mlp, scale_mlp))
+#         visual_tokens_crit = visual_tokens_crit + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(visual_tokens_crit), shift_mlp, scale_mlp))
+#         y_tokens = y_tokens + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(y_tokens), shift_mlp, scale_mlp))
+
+#         # Concatenate the processed modalities back together
+#         combined_embeddings =  torch.cat([gated_latent_tokens, visual_tokens_crit, y_tokens], dim=1)
+#         return combined_embeddings
+    
+
+class SiTBlock_selection(nn.Module):
     """
     A SiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, task=None, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(
+        # self.attn = Attention(
+        #     hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=block_kwargs["qk_norm"]
+        #     )
+        self.attn_high = Attention(
             hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=block_kwargs["qk_norm"]
             )
+        # self.attn_low = Attention(
+        #     hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=block_kwargs["qk_norm"]
+        #     )
         self.task = task
         self.num_vis_tokens = NUM_OF_CRITERIA[self.task]
         
         if "fused_attn" in block_kwargs.keys():
-            self.attn.fused_attn = block_kwargs["fused_attn"]
+            #self.attn.fused_attn = block_kwargs["fused_attn"]
+            self.attn_high.fused_attn = block_kwargs["fused_attn"]
+            #self.attn_low.fused_attn = block_kwargs["fused_attn"]
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(
+        self.mlp_high = Mlp(
             in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0
             )
+        # self.mlp_low = Mlp(
+        #     in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0
+        #     )
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
-
+        #self.patch_gating = PatchGating(hidden_size)  # Add patch gating module
+        
 
     def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )
-
-        # x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        # x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        # combined_embeddings=x
-
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        # Split the tensor back into the original modalities
-        #print(f"x shape: {x.shape}")
-        T = x.shape[1] - self.num_vis_tokens
+        
+        T = x.shape[1] - self.num_vis_tokens -1
         latent_tokens = x[:, :T, :]
-        #print(f"latent_tokens shape: {latent_tokens.shape}")
+        #print(f"latent_tokens shape {latent_tokens.shape}")
         visual_tokens_crit = x[:, T:T+self.num_vis_tokens, :]
-        #print(f"visual_tokens shape: {visual_tokens.shape}")
-        #concept_tokens = x[:, -8:-1, :]
-        #print(f"concept_tokens shape: {concept_tokens.shape}")
-        #y_tokens = x[:, -1:, :]
-        #latent_tokens = latent_tokens + gate_msa.unsqueeze(1) * modulate(self.norm1(x), shift_msa, scale_msa)
+        y_tokens = x[:, -1:, :]
+
+        #low_value_mask = ~self.high_value_mask
+
+        high_value_tokens=latent_tokens
+        #high_value_tokens = latent_tokens * high_value_mask  # B,T,D
+        #low_value_tokens = latent_tokens * low_value_mask  # B,T,D
+
+        # Perform self-attention on high value tokens concatenated with visual tokens
+        high_value_combined = torch.cat([high_value_tokens, visual_tokens_crit, y_tokens], dim=1)
+        high_value_combined = high_value_combined + gate_msa.unsqueeze(1) * self.attn_high(modulate(self.norm1(high_value_combined), shift_msa, scale_msa))
+
+        high_value_tokens = high_value_combined[:, :T, :]
+        visual_tokens_crit = high_value_combined[:, T:T+self.num_vis_tokens, :]
+        y_tokens = high_value_combined[:, -1:, :]
+
+        # Perform self-attention on low value tokens separately
+        #low_value_tokens = low_value_tokens + gate_msa.unsqueeze(1) * self.attn_low(modulate(self.norm1(low_value_tokens), shift_msa, scale_msa))
 
         # Apply MLPs to each modality separately
-        latent_tokens = latent_tokens + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(latent_tokens), shift_mlp, scale_mlp))
-        visual_tokens_crit = visual_tokens_crit + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(visual_tokens_crit), shift_mlp, scale_mlp))
-        #concept_tokens = concept_tokens + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(concept_tokens), shift_mlp, scale_mlp))
-        #y_tokens = y_tokens + gate_mlp.unsqueeze(1) * self.mlp_y(modulate(self.norm2(y_tokens), shift_mlp, scale_mlp))
+        high_value_tokens = high_value_tokens + gate_mlp.unsqueeze(1) * self.mlp_high(modulate(self.norm2(high_value_tokens), shift_mlp, scale_mlp))
+        visual_tokens_crit = visual_tokens_crit + gate_mlp.unsqueeze(1) * self.mlp_high(modulate(self.norm2(visual_tokens_crit), shift_mlp, scale_mlp))
+        y_tokens = y_tokens + gate_mlp.unsqueeze(1) * self.mlp_high(modulate(self.norm2(y_tokens), shift_mlp, scale_mlp))
+        #low_value_tokens = low_value_tokens + gate_mlp.unsqueeze(1) * self.mlp_low(modulate(self.norm2(low_value_tokens), shift_mlp, scale_mlp))
+
+        # Combine the processed high and low value tokens back into the original latent structure
+        #combined_latent_tokens = high_value_tokens + low_value_tokens
+        #print(f"combined_latent_tokens shape {combined_latent_tokens.shape}")
+        #high_value_tokens = high_value_tokens * high_value_mask
 
         # Concatenate the processed modalities back together
-        #combined_embeddings = torch.cat([latent_tokens, visual_tokens, concept_tokens, y_tokens], dim=1)
-        #combined_embeddings = torch.cat([latent_tokens, visual_tokens, y_tokens], dim=1)
-        combined_embeddings = torch.cat([latent_tokens, visual_tokens_crit], dim=1)
+        combined_embeddings = torch.cat([high_value_tokens, visual_tokens_crit, y_tokens], dim=1)
         return combined_embeddings
 
 
@@ -264,8 +398,12 @@ class SiT(nn.Module):
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
+        # self.blocks = nn.ModuleList([
+        #     SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, task=self.task, **block_kwargs) for _ in range(depth)
+        # ])
+
         self.blocks = nn.ModuleList([
-            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, task=self.task, **block_kwargs) for _ in range(depth)
+            SiTBlock_selection(hidden_size, num_heads, mlp_ratio=mlp_ratio, task=self.task, **block_kwargs) for _ in range(depth)
         ])
         self.projectors = nn.ModuleList([
             build_mlp(hidden_size, projector_dim, z_dim) for z_dim in z_dims
@@ -273,6 +411,7 @@ class SiT(nn.Module):
         self.final_layer = FinalLayer(decoder_hidden_size, patch_size, self.out_channels)
         self.y_logits_embedder_in = nn.Linear(num_classes, hidden_size)
         self.y_logits_embedder_out = nn.Linear(hidden_size, num_classes)
+        self.patch_gating = PatchGating(hidden_size,4)  # Add patch gating module
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -341,9 +480,9 @@ class SiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
     
-    def forward(self, x, x_pure, x_target,t, y, 
+    def forward(self, x, x_pure, x_target, t, y, 
                 concept_label, 
-                image_embeddings, cls_logits, return_logvar=False,  con_on_explicd_pred=True):
+                image_embeddings, cls_logits, return_logvar=False, con_on_explicd_pred=True):
         """
         Forward pass of SiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -351,14 +490,22 @@ class SiT(nn.Module):
         y: (N,) tensor of class labels
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        x_pure = self.x_embedder(x_pure) + self.pos_embed
+        x_target = self.x_embedder(x_target) + self.pos_embed
+
         N, T, D = x.shape
         #print(f"input shape of x: N {N}, T {T}, D {D}")
         #print("1 3 1")
         # timestep and class embedding
         t_embed = self.t_embedder(t)                   # (N, D)
         image_embed = image_embeddings
+        # print(y)
+        # print(" ")
+        # print(torch.max(cls_logits, dim=1)[1])
+        y_pred_by_explid=self.y_embedder(torch.max(cls_logits, dim=1)[1], self.training)
+
         y = self.y_embedder(y, self.training)    # (N, D)
-        #y_noise = torch.rand_like(y)  # Generate Gaussian noise with the same shape as y
+        y_noise = torch.rand_like(y)  # Generate Gaussian noise with the same shape as y
 
         # con1= self.c1_embedder(concept_label[:,0], self.training)
         # con2= self.c2_embedder(concept_label[:,1], self.training)
@@ -371,21 +518,41 @@ class SiT(nn.Module):
         # noise = torch.randn_like(embedded_concepts)  # Generate Gaussian noise with the same shape as embedded_concepts
         # minus_embedded_concepts_plus_noise = embedded_concepts
 
-        #concept_noise = torch.randn_like(image_embed)  # Generate Gaussian noise with the same shape as embedded_concepts
+        concept_noise = torch.randn_like(image_embed)  # Generate Gaussian noise with the same shape as embedded_concepts
         minus_embedded_concepts_plus_noise = image_embed
         #print(f"embedded_concepts shape: {embedded_concepts.shape}")
         #print(y)
-        c = t_embed + y                                # (N, D)
+        #c = t_embed + y                                # (N, D)
+        #c = t_embed + F.normalize(image_embed.mean(dim=1), dim=-1)                                # (N, D)
         #y_input_logits_embedded = self.y_logits_embedder_in(cls_logits)
         #print(f"cls_logits shape: {cls_logits.shape}") 
         #c = t_embed + image_embed[:,0,:] + image_embed[:,1,:] + image_embed[:,2,:] + image_embed[:,3,:] + image_embed[:,4,:] + image_embed[:,5,:] + image_embed[:,6,:]
         # print(f"t_embed shape: {t_embed.shape}")
         # print(f"y_input_logits_embedded shape: {y_input_logits_embedded.shape}")
-        #c = t_embed + y_input_logits_embedded
+        if con_on_explicd_pred:
+            c = t_embed + y_pred_by_explid
+        else:
+            c = t_embed + y
         #c = t_embed
         # Concatenate latent image, text embeddings, and conditioning embeddings
         #combined_embeddings=x
-        combined_embeddings_try = torch.cat((x, image_embed), dim=1)
+        gates = self.patch_gating(torch.cat((x_pure, image_embed), dim=1), T)  # B,T,1
+        # Calculate sparsity loss
+        #sparsity_loss=0
+        sparsity_loss = calculate_sparsity_loss(gates)
+
+        # high_value_mask = gates > 0.5
+        # low_value_mask = ~high_value_mask
+
+        # high_value_tokens = x *high_value_mask  # B,T,D
+
+        x= x*gates
+        combined_embeddings_try = torch.cat((x, image_embed, y_noise.unsqueeze(1)), dim=1)
+
+        #combined_embeddings_try = torch.cat((high_value_tokens, image_embed, y_noise.unsqueeze(1)), dim=1)
+
+        #combined_embeddings_try = torch.cat((x, image_embed, y_noise.unsqueeze(1)), dim=1)
+
         #combined_embeddings_try_2 = torch.cat((x, image_embed, concept_noise, y_noise.unsqueeze(1)), dim=1)
         #combined_embeddings_try_3 = torch.cat((x, image_embed, y_noise.unsqueeze(1)), dim=1)
         #combined_embeddings = torch.cat([x, text_embed.unsqueeze(1).expand(-1, T, -1)], dim=1)
@@ -406,6 +573,10 @@ class SiT(nn.Module):
                 #zs = [projector(combined_embeddings[:, :T].reshape(-1, D)).reshape(N, T, -1) for projector in self.projectors]
         #print("1 3 2 1")
         x = combined_embeddings_try[:,:T,:]
+
+        # high_value_tokens = x *high_value_mask  # B,T,D
+        # low_value_tokens = x_target * low_value_mask  # B,T,D
+        # x= low_value_tokens+high_value_tokens
         # x = combined_embeddings[:, :T]
         # text_embed = combined_embeddings[:, T:2*T]
         # image_embed = combined_embeddings[:, 2*T:]
@@ -415,7 +586,7 @@ class SiT(nn.Module):
 
         y_predicted_logits = self.y_logits_embedder_out(combined_embeddings_try[:,-1:,:]) 
         #print("1 3 3")
-        return x,image_embed, minus_embedded_concepts_plus_noise, combined_embeddings_try[:,T:T+self.num_vis_tokens,:], y_predicted_logits.squeeze(1), torch.tensor(0.0, device=x.device), zs
+        return x,image_embed, minus_embedded_concepts_plus_noise, combined_embeddings_try[:,T:T+self.num_vis_tokens,:], y_predicted_logits.squeeze(1), sparsity_loss, zs
 
 
 #################################################################################
