@@ -21,7 +21,10 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from models.sit import SiT_models
 from models.sit_not_yet_messed_up import SiT_models as SiT_models_not_yet_messed_up
 from models.sit_improved_maybe import SiT_models as SiT_models_improved_maybe
-from loss import SILoss
+from models.sit_with_additional_tokens import SiT_models as SiT_models_with_additional_tokens
+from models.sit_with_additional_tokens import SiT_Patch_and_Unpatchifier as Patch_and_Unpatchifier
+from models.sit_wild import SiT_models as SiT_models_wild
+from loss_with_attn import SILoss
 from utils import load_encoders
 
 from dataset import CustomDataset
@@ -40,13 +43,19 @@ import timm
 from optparse import OptionParser
 from torchvision import transforms
 from Explicd.dataset.isic_dataset import SkinDataset
-from Explicd.model import ExpLICD_ViT_L, ExpLICD, ExpLICD_ViT_L_Multiple_Prompts
+from Explicd.model import ExpLICD_ViT_L, ExpLICD, ExpLICD_ViT_L_Multiple_Prompts, ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens, PatchSelectorCNNConscise
 from Explicd.concept_dataset import explicid_isic_dict, explicid_isic_dict_mine, explicid_idrid_dict, explicid_idrid_edema_dict, explicid_busi_dict, explicid_busi_soft_smooth_dict
 import Explicd.utils as utils
 from sklearn.metrics import f1_score
 import random
 import kornia
 import matplotlib.pyplot as plt
+import torchvision.utils as vutils
+from PIL import Image
+
+imgs_save_dir = "Batch_images"
+os.makedirs(imgs_save_dir, exist_ok=True)
+
 
 logger = get_logger(__name__)
 
@@ -112,15 +121,6 @@ CONCEPT_LABEL_MAP_BUSI = [
     [0, 0, 0, 0, 0, 0],  
 ]
 
-# CONCEPT_LABEL_MAP_BUSI = [
-#     # Normal
-#     [0, 0, 0, 0, 0, 0], 
-#     # Benign
-#     [1, 1, 1, 1, 1, 0],
-#     # Malignant
-#     [2, 2, 2, 2, 2, 1]
-# ]
-
 CONCEPT_LABEL_MAP_BUSI_SOFT_SMOOTH = [
     # Benign
     [[0.2, 0.6, 0.2], [0.2, 0.6, 0.1, 0.1], [0.0, 0.8, 0.1, 0.1], [0.6, 0.1, 0.3], [0.1, 0.9] , [0.8, 0.2]],
@@ -174,14 +174,13 @@ DO_MUDDLE_CHECK=False
 ADD_GAUSSIAN_NOISE=False
 DO_LOGITS_SIMILARITY=False
 CONCEPT_HARDNESS="soft_equal"
-
-SAVING_BASED_ON_SCORE=False
-SAVING_BASED_ON_STEP=True
-SAVING_TOKENS_AND_GT=False
-
+DO_CONTR_LOSS = False
 noise_levels = [0, 5, 10, 15, 20]
 
+SAVING_BASED_ON_STEP=True
+SAVING_BASED_ON_SCORE=False
 
+do_val_check=True
 
 def create_muddled_dataloader(dataset, batch_size, num_workers):
     """Creates a DataLoader with standard parameters"""
@@ -210,12 +209,22 @@ def set_seed_mine(seed):
 
 
 rotation_transform = transforms.RandomRotation(degrees=15)
-translation_transform = transforms.RandomAffine(degrees=5, translate=(0.1, 0.1))
+translation_transform = transforms.RandomAffine(degrees=3, translate=(0.05, 0.05))
 color_jitter_transform = transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2)
 blur_transform = transforms.GaussianBlur(kernel_size=(3, 7), sigma=(0.2, 5))
 
+
+img_transform_function_dict = {
+    "raw": None,
+    "blurred": blur_transform,
+    "rotated": rotation_transform,
+    "translated":translation_transform,
+    "color_jittered":color_jitter_transform
+}
+
+#TRANSFORM_FUNCTIONS=["raw", "blurred", "rotated", "translated", "color_jittered"]
+TRANSFORM_FUNCTIONS=["raw"]
 def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0):
-    
     net = explicd
     if explicd_only==0:
         sit_model = model
@@ -225,69 +234,25 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0):
     if explicd_only==0:
         sit_model.eval()
         sit_model.zero_grad(set_to_none=True)
-    
-    losses_cls = 0
-    losses_concepts = 0
 
     exp_pred_list = np.zeros((0), dtype=np.uint8)
-    exp_criteria_only_pred_list= np.zeros((0), dtype=np.uint8)
-    exp_pred_list_refined = np.zeros((0), dtype=np.uint8)
     gt_list = np.zeros((0), dtype=np.uint8)
 
     agg_visual_tokens_list=[]
 
-    if explicd_only==0:
-        sit_pred_list = np.zeros((0), dtype=np.uint8)
-
     with torch.no_grad():
-        for i, (raw_image, x, y) in enumerate(dataloader):
-            if explicd_only==0:
-                x = x.squeeze(dim=1).to("cuda")
-                x = sample_posterior(x, 
-                                    latents_scale=torch.tensor(
-                                            [0.18215, 0.18215, 0.18215, 0.18215]
-                                            ).view(1, 4, 1, 1).to("cuda"), 
-                                    latents_bias=torch.tensor(
-                                            [0., 0., 0., 0.]
-                                            ).view(1, 4, 1, 1).to("cuda"))
-                #print(f"x.shape {x.shape}")
+        for _, (raw_image, _, y) in enumerate(dataloader):
             raw_image = raw_image.to("cuda")
             y = y.to("cuda")
-            z = None
             labels = y
 
             imgs_for_explicid=prepare__imgs_for_explicid(raw_image, exp_val_transforms).to("cuda")
-            cls_logits, cls_logits_criteria_only, cls_logits_dict, _, agg_visual_tokens= explicd(imgs_for_explicid)
-            agg_visual_tokens_list.append(agg_visual_tokens)
-            if explicd_only==0:
-                concept_label = torch.tensor([CONCEPT_LABEL_MAP[label] for label in labels])
-                concept_label = concept_label.long().cuda()
-
-                time_input = torch.rand((x.shape[0], 1, 1, 1))
-                time_input = time_input.to(device="cuda", dtype=x.dtype)
-                noises = torch.randn_like(x)
-                alpha_t = 1 - time_input
-                sigma_t = time_input
-                d_alpha_t = -1
-                d_sigma_t =  1
-                model_input = alpha_t * x + sigma_t * noises
-                model_target = d_alpha_t * x + d_sigma_t * noises
-                _, _, _, produced_concepts, y_predicted, _, _  = sit_model(model_input, x, model_target,  time_input.flatten(), y, 
-                                                                        concept_label=concept_label, 
-                                                                        image_embeddings=agg_visual_tokens,
-                                                                        cls_logits=cls_logits)
-
-                cls_logits_refined = explicd(None, produced_concepts)
-                _, exp_label_pred_refined = torch.max(cls_logits_refined, dim=1)
-                exp_pred_list_refined = np.concatenate((exp_pred_list_refined, exp_label_pred_refined.cpu().numpy().astype(np.uint8)), axis=0)
-                _, sit_label_pred = torch.max(y_predicted, dim=1)
-                sit_pred_list = np.concatenate((sit_pred_list, sit_label_pred.cpu().numpy().astype(np.uint8)), axis=0)
-
+            cls_logits, _, _, _, agg_visual_tokens, _, _, _, _, _, agg_critical_visual_tokens, agg_trivial_visual_tokens, _, _, _= explicd(imgs_for_explicid)
+            longer_visual_tokens = torch.cat([agg_critical_visual_tokens, agg_trivial_visual_tokens], dim=1)
+            agg_visual_tokens_list.append(longer_visual_tokens)
 
             _, exp_label_pred = torch.max(cls_logits, dim=1)
-            #_, exp_criteria_only_label_pred = torch.max(cls_logits_criteria_only, dim=1)
             exp_pred_list = np.concatenate((exp_pred_list, exp_label_pred.cpu().numpy().astype(np.uint8)), axis=0)
-            #exp_criteria_only_pred_list = np.concatenate((exp_criteria_only_pred_list, exp_criteria_only_label_pred.cpu().numpy().astype(np.uint8)), axis=0)
             gt_list = np.concatenate((gt_list, labels.cpu().numpy().astype(np.uint8)), axis=0)
         
 
@@ -308,49 +273,7 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0):
             "gt":gt_list
         }
 
-        # exp_criteria_only_BMAC = balanced_accuracy_score(gt_list, exp_criteria_only_pred_list)
-        # exp_criteria_only_correct = np.sum(gt_list == exp_criteria_only_pred_list)
-        # exp_criteria_only_acc = 100 * exp_criteria_only_correct / len(exp_criteria_only_pred_list)
-        # exp_criteria_only_val_f1 = f1_score(gt_list, exp_criteria_only_pred_list, average='macro')
-
-        if explicd_only==0:
-            sit_BMAC = balanced_accuracy_score(gt_list, sit_pred_list)
-            sit_correct = np.sum(gt_list == sit_pred_list)
-            sit_acc = 100 * sit_correct / len(sit_pred_list)
-            sit_val_f1 = f1_score(gt_list, sit_pred_list, average='macro')
-
-            sit_scores={
-            "BMAC":sit_BMAC,
-            "f1":sit_val_f1,
-            "Acc":sit_acc
-            }
-
-            exp_refined_BMAC = balanced_accuracy_score(gt_list, exp_pred_list_refined)
-            exp_refined_correct = np.sum(gt_list == exp_pred_list_refined)
-            exp_refined_acc = 100 * exp_refined_correct / len(exp_pred_list_refined)
-            exp_refined_val_f1 = f1_score(gt_list, exp_pred_list_refined, average='macro')
-
-            expl_refined_scores={
-            "BMAC":exp_refined_BMAC,
-            "f1":exp_refined_val_f1,
-            "Acc":exp_refined_acc
-            }
-        else:
-            sit_scores={
-            "BMAC":0,
-            "f1":0,
-            "Acc":0
-            }
-
-            expl_refined_scores={
-            "BMAC":0,
-            "f1":0,
-            "Acc":0
-            }
-
-
-
-    return expl_scores, sit_scores, expl_refined_scores, tokens_and_gt
+    return expl_scores, tokens_and_gt
 
 
 class DualRandomVerticalFlip:
@@ -401,119 +324,6 @@ class DualGaussianNoise:
         
         return img1, img2
 
-class DualRandomGammaContrast:
-    def __init__(self, p=0.5, gamma_range=(0.5, 1.5)):
-        self.gamma_range = gamma_range
-        self.p = p
-
-    def __call__(self, imgs):
-        # imgs is a tuple (image1, image2)
-        img1, img2 = imgs
-
-        # Apply the random vertical flip with the same probability to both images
-        if torch.rand(1) < self.p:
-            # Apply the random gamma contrast with the same value to both images
-            gamma = torch.FloatTensor(1).uniform_(*self.gamma_range).item()
-            img1 = transforms.functional.adjust_gamma(img1, gamma)
-            #img2 = transforms.functional.adjust_gamma(img2, gamma)
-        
-        return img1, img2
-
-class CustomCLAHE:
-    def __init__(self, p=0.5, clip_limit=4.0, grid_size=(8, 8)):
-        self.p = p
-        self.clip_limit = clip_limit
-        self.grid_size = grid_size
-
-    def _clip_histogram(self, hist, clip_limit):
-        excess = torch.sum(torch.clamp(hist - clip_limit, min=0))
-        num_excess_pixels = torch.sum(hist > clip_limit)
-        if num_excess_pixels > 0:
-            redistrib_amt = excess / hist.shape[0]
-            hist = torch.clamp(hist, max=clip_limit)
-            hist += redistrib_amt
-        return hist
-
-    def _apply_clahe(self, img):
-        if not isinstance(img, torch.Tensor):
-            img = torch.tensor(img)
-        
-        # Ensure image is float and normalized
-        img = img.float() / 255.0 if img.max() > 1 else img.float()
-        
-        height, width = img.shape[-2:]
-        tile_h, tile_w = self.grid_size
-        
-        # Calculate tile sizes
-        h_step = height // tile_h
-        w_step = width // tile_w
-        
-        result = torch.zeros_like(img)
-        
-        for i in range(tile_h):
-            for j in range(tile_w):
-                # Extract tile
-                h_start = i * h_step
-                h_end = (i + 1) * h_step
-                w_start = j * w_step
-                w_end = (j + 1) * w_step
-                
-                tile = img[..., h_start:h_end, w_start:w_end]
-                
-                # Compute and clip histogram
-                hist = torch.histogram(tile, bins=256, range=(0, 1))[0]
-                hist = self._clip_histogram(hist, self.clip_limit)
-                
-                # Create cumulative distribution
-                cdf = torch.cumsum(hist, 0)
-                cdf_normalized = (cdf - cdf.min()) / (cdf.max() - cdf.min())
-                
-                # Apply equalization
-                lookup_table = cdf_normalized * 255
-                result[..., h_start:h_end, w_start:w_end] = lookup_table[
-                    (tile * 255).long()
-                ].float() / 255.0
-        
-        return result
-
-    def __call__(self, imgs):
-        img1, img2 = imgs
-        
-        if torch.rand(1) < self.p:
-            img1 = self._apply_clahe(img1)
-            #img2 = self._apply_clahe(img2)
-        
-        return img1, img2
-
-class DualRandomRotate90:
-    def __init__(self, p=0.5):
-        self.p = p
-
-    def __call__(self, imgs):
-        # imgs is a tuple (image1, image2)
-        img1, img2 = imgs
-
-        # Apply the random vertical flip with the same probability to both images
-        if torch.rand(1) < self.p:
-            img1 = transforms.functional.rotate(img1, 90)
-            #img2 = transforms.functional.rotate(img2, 90)
-        
-        return img1, img2
-    
-class DualRandomRotate270:
-    def __init__(self, p=0.5):
-        self.p = p
-
-    def __call__(self, imgs):
-        # imgs is a tuple (image1, image2)
-        img1, img2 = imgs
-
-        # Apply the random vertical flip with the same probability to both images
-        if torch.rand(1) < self.p:
-            img1 = transforms.functional.rotate(img1, 270)
-            #img2 = transforms.functional.rotate(img2, 270)
-        
-        return img1, img2
 
 def preprocess_raw_image(x, enc_type):
     if 'clip' in enc_type:
@@ -637,11 +447,6 @@ def main(args):
     device = accelerator.device
     if torch.backends.mps.is_available():
         accelerator.native_amp = False    
-    # if args.seed is not None:
-    #     #set_seed(args.seed + accelerator.process_index)
-    #     print("seed ", args.seed)
-    #     #set_seed(args.seed)
-    #     set_seed_mine(args.seed)
     
     # Create model:
     assert args.resolution % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -655,14 +460,6 @@ def main(args):
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
 
     if args.explicd_only==0:
-        # model = SiT_models[args.model](
-        #     input_size=latent_size,
-        #     num_classes=args.num_classes,
-        #     use_cfg = (args.cfg_prob > 0),
-        #     z_dims = z_dims,
-        #     encoder_depth=args.encoder_depth,
-        #     **block_kwargs
-        # )
 
         # model = SiT_models_improved_maybe[args.model](
         #     input_size=latent_size,
@@ -674,7 +471,7 @@ def main(args):
         #     **block_kwargs
         # )
 
-        model = SiT_models_not_yet_messed_up[args.model](
+        model = SiT_models_with_additional_tokens[args.model](
             input_size=latent_size,
             num_classes=NUM_OF_CLASSES[TASK],
             use_cfg = (args.cfg_prob > 0),
@@ -684,23 +481,16 @@ def main(args):
             **block_kwargs
         )
 
+        
+
         model = model.to(device)
         ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
         vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-mse").to(device)
         requires_grad(ema, False)
 
     concept_list = CONCEPTS[TASK]
-    # conf={'epochs': 70, 'batch_size': 32, 'warmup_epoch': 5, 'optimizer': 'adamw', 'lr': 0.0001, 
-    #       'load': False, 'cp_path': './checkpoint/isic2018/', 'log_path': './log/isic2018/', 
-    #       'model': 'explicd', 'linear_probe': None, 'dataset': 'isic2018', 
-    #       'data_path': '/home/arsen.abzhanov/Downloads/BioMedia/Thesis/Explicd/ISIC_2018/', 
-    #       'unique_name': 'test', 'flag': 2, 'gpu': '0', 'amp': None, 
-    #       'cls_weight': [0.134, 0.084, 0.039, 0.389, 0.039, 0.0065, 0.305], 'num_class': 7,}
-    
     conf = argparse.Namespace()
     conf.num_class = NUM_OF_CLASSES[TASK]
-    #conf.cls_weight = [ 0.134, 0.084, 0.039, 0.389, 0.039, 0.0065, 0.305] ISIC
-    # conf.cls_weight = [ 0.157, 0.327, 0.516] BUSI
     conf.cls_weight = [ 0.076, 0.506, 0.074, 0.137, 0.207]
     conf.dataset = TASK
     conf.data_path = "/home/arsen.abzhanov/Thesis_local/REPA/Explicd/dataset/"
@@ -708,45 +498,41 @@ def main(args):
     conf.flag = 2
     conf.do_logits_similarity=DO_LOGITS_SIMILARITY
 
-    explicid = ExpLICD_ViT_L(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
-    #explicid = ExpLICD_ViT_L_Multiple_Prompts(concept_list=concept_list, model_name='biomedclip', config=conf)
-    # explicid = ExpLICD(concept_list=concept_list, model_name='biomedclip', config=conf)
-    # vit = timm.create_model('vit_base_patch16_224.orig_in21k', pretrained=True, num_classes=conf.num_class)
-    # vit.head = nn.Identity()
-    # explicid.model.visual.trunk.load_state_dict(vit.state_dict())
-    #explicid.load_state_dict(torch.load("/home/arsen.abzhanov/Thesis/REPA/Explicd/model/weights/best.pth"))
-    #explicid = explicid.to(device)
-    #print("loaded explicid all right")
+    explicid = ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
+    explicid.load_state_dict(torch.load("checkoints_fr_val_score_based/ISIC/Explicd_only/Explicd_additional_tokens_for_sit_starter_better.pt")["explicid"])
+    explicid.cnn = PatchSelectorCNNConscise()
+    explicid.load_state_dict(torch.load("checkoints_fr_val_score_based/ISIC/Explicd_only/Explicd_additional_tokens_for_sit_starter_refined_further_maybe.pt")["explicid"])
+
+    patchifyer_model = Patch_and_Unpatchifier(input_size=latent_size,
+            num_classes=NUM_OF_CLASSES[TASK],
+            use_cfg = (args.cfg_prob > 0),
+            z_dims = z_dims,
+            encoder_depth=args.encoder_depth,
+            task = TASK,
+            **block_kwargs)
+    patchifyer_model = patchifyer_model.to(device)
+    patchifyer_model.load_state_dict(torch.load("checkpoints_fr/ISIC/SiT/patchifyer_model.pt")["patchifyer_model"])
 
     explicid_train_transforms = copy.deepcopy(conf.preprocess)
-    #print(train_transforms)
     explicid_train_transforms.transforms.pop(0)
     explicid_train_transforms.transforms.pop(1)
-    #print(train_transforms)
     if explicid.model_name != 'clip':
         explicid_train_transforms.transforms.pop(0)
-    #explicid_train_transforms.transforms.insert(0, transforms.RandomVerticalFlip())
-    #xplicid_train_transforms.transforms.insert(0, transforms.RandomHorizontalFlip())
     explicid_train_transforms.transforms.insert(0, transforms.CenterCrop(size=(224, 224)))
     explicid_train_transforms.transforms.insert(0, transforms.Resize(size=(224,224), interpolation=utils.get_interpolation_mode('bicubic'), max_size=None, antialias=True))    
     explicid_train_transforms.transforms.insert(0, transforms.ToPILImage())
 
-    #print("============",explicid_train_transforms)
+    print("explicid_train_transforms ============",explicid_train_transforms)
 
     exp_val_transforms = copy.deepcopy(conf.preprocess)
-    print("============",exp_val_transforms)
+    #print("============",exp_val_transforms)
     exp_val_transforms.transforms.pop(2)
-    exp_val_transforms.transforms.insert(0, transforms.ToPILImage())  
+    exp_val_transforms.transforms.insert(0, transforms.ToPILImage())
+    exp_val_transforms.transforms.pop(1)
+    exp_val_transforms.transforms.insert(1, transforms.Resize(size=(224,224), interpolation=utils.get_interpolation_mode('bicubic'), max_size=None, antialias=True))
 
-    print("============",exp_val_transforms)
-
-    # explicid_testset = SkinDataset(conf.data_path, mode='test', transforms=exp_val_transforms, flag=conf.flag, debug=DEBUG, config=conf, return_concept_label=True)
-    # explicid_testLoader = DataLoader(explicid_testset, batch_size=conf.batch_size, shuffle=False, num_workers=2, drop_last=False)
+    print("exp_val_transforms ============",exp_val_transforms)
     
-    # lesion_weight = torch.FloatTensor(conf.cls_weight).cuda()
-    # cls_criterion = nn.CrossEntropyLoss(weight=lesion_weight).cuda()
-
-    do_contr_loss = False
 
     latents_scale = torch.tensor(
         [0.18215, 0.18215, 0.18215, 0.18215]
@@ -777,56 +563,20 @@ def main(args):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    # optimizer = torch.optim.AdamW(
-    #     model.parameters(),
-    #     lr=args.learning_rate,
-    #     betas=(args.adam_beta1, args.adam_beta2),
-    #     weight_decay=args.adam_weight_decay,
-    #     eps=args.adam_epsilon,
-    # )
     if args.explicd_only==0:
-        optimizer = schedulefree.AdamWScheduleFree(list(explicid.parameters()) + list(model.parameters()), lr=args.learning_rate, warmup_steps=5000 , weight_decay=0.1)
-        # optimizer = optim.AdamW([
-        #     {'params': list(explicid.parameters()) + list(model.parameters()), 'lr': 0.0002}
-        # ])
+        optimizer = schedulefree.AdamWScheduleFree(list(explicid.parameters()) + list(model.parameters()) + list(patchifyer_model.parameters()), lr=args.learning_rate, warmup_steps=5000 , weight_decay=0.1)
     else:
-        optimizer = schedulefree.AdamWScheduleFree(list(explicid.parameters()), lr=args.learning_rate, warmup_steps=5000 , weight_decay=0.1)
-        # optimizer = optim.AdamW([
-        #     {'params': explicid.parameters(), 'lr': 0.0002}
-        # ]) 
-        # optimizer = optim.AdamW([
-        #     {'params': model.parameters(), 'lr': 0.0002},
-        #     {'params': explicid.get_backbone_params(), 'lr': 0.0001 * 0.1},
-        #     {'params': explicid.get_bridge_params(), 'lr': 0.0001},
-        # ])
+        optimizer = schedulefree.AdamWScheduleFree(list(explicid.parameters()) + list(patchifyer_model.parameters()), lr=args.learning_rate, warmup_steps=5000 , weight_decay=0.1)
 
-    # optimizer = optim.AdamW([
-    #         {'params': model.parameters(), 'lr': 0.0002},
-    #         {'params': explicid.get_backbone_params(), 'lr': 0.0001 * 0.1},
-    #         {'params': explicid.get_bridge_params(), 'lr': 0.0001},
-    #     ])    
     dual_transform = transforms.Compose([
     DualRandomVerticalFlip(),  # Ensure both images get flipped or not
     DualRandomHorizontalFlip(),
     DualGaussianNoise(p=0.5, mean=0, std=25) if ADD_GAUSSIAN_NOISE else DualGaussianNoise(p=0.0)
-    #DualRandomGammaContrast(),
-    #CustomCLAHE(),
-    # #DualRandomRotate90(),
-    # #DualRandomRotate270(),
 ])
     dual_val_transform = transforms.Compose([
         #DualRandomGaussianNoise(p=1),
     ])
 
-    # Setup data:
-    # train_dataset = CustomDataset(args.data_dir, transform= dual_transform, mode='train')
-    # #train_muddled_dataset = CustomDataset(args.data_dir, transform= None, mode='muddled_train')
-    # val_dataset = CustomDataset(args.data_dir, mode='val')
-    # test_dataset = CustomDataset(args.data_dir,transform= None, mode='test')
-
-    # train_busi_dataset = CustomDataset(args.data_dir, transform= dual_transform, mode='busi_train')
-    # val_busi_dataset = CustomDataset(args.data_dir, mode='busi_val')
-    # test_busi_dataset = CustomDataset(args.data_dir,transform= None, mode='busi_test')
 
     if TASK=='ISIC' or TASK=='ISIC_MINE':
         if DO_MUDDLE_CHECK:
@@ -909,6 +659,7 @@ def main(args):
 
     explicid.train()
     optimizer.train()
+    patchifyer_model.eval()
 
     # resume:
     global_step = 0
@@ -919,13 +670,7 @@ def main(args):
             checkpoint_resume_locations=f"{checkpoint_dir_step_based}/SiT/{ckpt_name}"
         else:
             checkpoint_resume_locations=f"{checkpoint_dir_step_based}/Explicd_only/{ckpt_name}"
-        #checkpoint_resume_locations=f"/l/users/arsen.abzhanov/REPA/checkpoints/{ckpt_name}"
-        #print(f'{os.path.join(args.output_dir, args.exp_name)}/checkpoints/{ckpt_name}')
         print(f'loading checkpointed from {checkpoint_resume_locations}')
-        # ckpt = torch.load(
-        #     f'{os.path.join(args.output_dir, args.exp_name)}/checkpoints/{ckpt_name}',
-        #     map_location='cpu',
-        #     )
         ckpt = torch.load(
             f'{checkpoint_resume_locations}',
             map_location='cpu',
@@ -939,15 +684,16 @@ def main(args):
 
         optimizer.load_state_dict(ckpt['opt'])
         # To reduce the learning rate, modify the learning rate in the parameter group:
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = param_group['lr'] * 0.01  # Reduce the learning rate by a factor of 0.1
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = param_group['lr'] * 0.01  # Reduce the learning rate by a factor of 0.1
         global_step = ckpt['steps']
 
     if args.explicd_only==0:
             model = accelerator.prepare(model)
         
-    optimizer, train_dataloader, val_dataloader, test_dataloader, explicid = accelerator.prepare(
-       optimizer, train_dataloader, val_dataloader, test_dataloader, explicid
+
+    optimizer, train_dataloader, val_dataloader, test_dataloader, explicid, patchifyer_model = accelerator.prepare(
+       optimizer, train_dataloader, val_dataloader, test_dataloader, explicid, patchifyer_model
     )
 
     if accelerator.is_main_process:
@@ -980,34 +726,29 @@ def main(args):
     # Create sampling noise:
     n = ys.size(0)
     xT = torch.randn((n, 4, latent_size, latent_size), device=device)
-        
-    max_exp_val_acc=0
-    max_exp_val_bmacc=0
-    max_exp_val_f1=0
-    
-
-    max_exp_criteria_only_val_acc=0
-    max_exp_criteria_only_val_bmacc=0
-    max_exp_criteria_only_val_f1=0
-
-    max_exp_refined_bmac = 0
-    max_exp_refined_val_f1=0
-
-    max_sit_val_acc=0
-    max_sit_val_bmacc=0
-    max_sit_val_f1=0
-
+    max_exp_val_f1=0  
     curve_of_f1 = []
     curve_of_BMAC = []
     if args.explicd_only==1:
         print("explicd only")
         optimizer.eval()
         optimizer.zero_grad(set_to_none=True)
-        expl_scores, _, _, _ = validation(explicid, None, test_dataloader, exp_val_transforms, explicd_only=1)
+        explicid.eval()
+        expl_scores, _= validation(explicid, None, test_dataloader, exp_val_transforms, explicd_only=1)
         print('BMAC: %.5f, f1: %.5f'%(expl_scores["BMAC"], expl_scores["f1"]))
         optimizer.train()
+        explicid.train()
     else:
         print("whole pipeline")
+        optimizer.eval()
+        optimizer.zero_grad(set_to_none=True)
+        explicid.eval()
+        model.eval()
+        expl_scores, _= validation(explicid, model, test_dataloader, exp_val_transforms, explicd_only=1)
+        print('BMAC: %.5f, f1: %.5f'%(expl_scores["BMAC"], expl_scores["f1"]))
+        optimizer.train()
+        explicid.train()
+        model.train()
     
     
     for epoch in range(args.epochs):
@@ -1018,78 +759,143 @@ def main(args):
         # with torch.no_grad():
         #     # Selected elements to be stored
         #     imgs_for_sampling = []
-
+        #     imgs_normalized_for_vae = []
         #     # Iterate over the dataset and labels
         #     for img, _ , lab in test_dataset:
-        #         if lab in ys:
-        #             imgs_for_sampling.append(img)
-        #             if len(imgs_for_sampling) == sample_batch_size:
-        #                 break
-
+        #         img_normalized_for_vae =  img.to(torch.float32) / 127.5 - 1
+        #         imgs_for_sampling.append(img)
+        #         imgs_normalized_for_vae.append(img_normalized_for_vae)
+        #         if len(imgs_for_sampling) == sample_batch_size:
+        #             break
+        #     latent=vae.encode(torch.stack(imgs_normalized_for_vae, dim=0).to(device))["latent_dist"].mean
+        #     #latents_patchified=patchifyer_model(latent)
         #     imgs_for_explicid=prepare__imgs_for_explicid(imgs_for_sampling, exp_val_transforms).to(device)
-        #     cls_logits, _, _, _, agg_visual_tokens = explicid(imgs_for_explicid)
-        #     samples_pure = euler_sampler(
+        #     cls_logits, _, _, _, agg_visual_tokens, _, _, attn_criticial_weights, attn_trivial_weights, vit_l_output, agg_critical_visual_tokens, agg_trivial_visual_tokens, _, critical_mask, trivial_mask  = explicid(imgs_for_explicid)
+        #     longer_visual_tokens = torch.cat([agg_critical_visual_tokens, agg_trivial_visual_tokens], dim=1)
+        #     samples = euler_sampler(
         #         model, 
         #         xT, 
         #         ys,
         #         agg_visual_tokens,
         #         cls_logits,
         #         num_steps=50, 
-        #         cfg_scale=4.0,
+        #         cfg_scale=0.0,
         #         guidance_low=0.,
         #         guidance_high=1.,
         #         path_type=args.path_type,
         #         heun=False,
+        #         attn_critical_weights=attn_criticial_weights, 
+        #         attn_trivial_weights=attn_trivial_weights,
+        #         longer_visual_tokens = longer_visual_tokens,
+        #         vit_l_output=vit_l_output,
+        #         critical_mask=critical_mask, 
+        #         trivial_mask=trivial_mask,
+        #         patchifyer_model=patchifyer_model
         #     ).to(torch.float32)
-        #     samples_pure = vae.decode((samples_pure -  latents_bias) / latents_scale).sample
-        #     samples_pure = (samples_pure + 1) / 2.
+        #     recon_samples = vae.decode(samples)["sample"]
+        #     recon_samples = (recon_samples + 1) / 2.
 
-        #     gt_samples = vae.decode((gt_xs - latents_bias) / latents_scale).sample
+        #     gt_samples = vae.decode(latent)["sample"]
         #     gt_samples = (gt_samples + 1) / 2.
             
-        #     out_samples_pure = accelerator.gather(samples_pure.to(torch.float32))
+        #     # gt_from_patchifier = vae.decode(latents_patchified)["sample"]
+        #     # gt_from_patchifier = (gt_from_patchifier + 1) / 2.
+
+        #     out_samples_pure = accelerator.gather(recon_samples.to(torch.float32))
         #     gt_samples = accelerator.gather(gt_samples.to(torch.float32))
-
-        #     for i in range(7):
-        #         agg_visual_tokens_tampered=agg_visual_tokens
-        #         agg_visual_tokens_tampered[:,i,:]=0
-        #         samples_tampered = euler_sampler(
-        #             model, 
-        #             xT, 
-        #             ys,
-        #             agg_visual_tokens_tampered,
-        #             cls_logits,
-        #             num_steps=50, 
-        #             cfg_scale=4.0,
-        #             guidance_low=0.,
-        #             guidance_high=1.,
-        #             path_type=args.path_type,
-        #             heun=False,
-        #         ).to(torch.float32)
-        #         samples_tampered = vae.decode((samples_tampered -  latents_bias) / latents_scale).sample
-        #         samples_tampered = (samples_tampered + 1) / 2.
+        #     gt_from_patchifier = accelerator.gather(gt_from_patchifier.to(torch.float32))
+        #     ################################################################################ Option Tampering with tokens
+        #     # samples_tampered_list=[]
+        #     # for i in range(8):
+        #     #     if i==0:
+        #     #         longer_visual_tokens_tampered=longer_visual_tokens
+        #     #     else:
+        #     #         longer_visual_tokens_tampered=longer_visual_tokens[:,i-1,:]=0
+        #     #     samples_tampered = euler_sampler(
+        #     #         model, 
+        #     #         xT, 
+        #     #         ys,
+        #     #         agg_visual_tokens,
+        #     #         cls_logits,
+        #     #         num_steps=50, 
+        #     #         cfg_scale=4.0,
+        #     #         guidance_low=0.,
+        #     #         guidance_high=1.,
+        #     #         path_type=args.path_type,
+        #     #         heun=False,
+        #     #         attn_critical_weights=attn_criticial_weights, 
+        #     #         attn_trivial_weights=attn_trivial_weights,
+        #     #         longer_visual_tokens = longer_visual_tokens_tampered,
+        #     #         vit_l_output=vit_l_output,
+        #     #         critical_mask=critical_mask, 
+        #     #         trivial_mask=trivial_mask,
+        #     #         patchifyer_model=patchifyer_model
+        #     #     ).to(torch.float32)
+        #     #     samples_tampered = vae.decode((samples_tampered -  latents_bias) / latents_scale).sample
+        #     #     samples_tampered = (samples_tampered + 1) / 2.
                 
-        #         out_samples_tampered = accelerator.gather(samples_tampered.to(torch.float32))
+        #     #     out_samples_tampered = accelerator.gather(samples_tampered.to(torch.float32))
+        #     #     samples_tampered_list.append(out_samples_tampered)
 
-        #         accelerator.log({f"samples_tampered {i} zeroed out": wandb.Image(array2grid(out_samples_tampered)),
-        #                     "gt_samples": wandb.Image(array2grid(gt_samples))})
-
+        #     # accelerator.log({f"samples_untouched": wandb.Image(array2grid(samples_tampered_list[0])),
+        #     #             "gt_samples": wandb.Image(array2grid(gt_samples)),
+        #     #             f"samples first zeroed out": wandb.Image(array2grid(samples_tampered_list[1])),
+        #     #             f"samples second zeroed out": wandb.Image(array2grid(samples_tampered_list[2])),
+        #     #             f"samples third zeroed out": wandb.Image(array2grid(samples_tampered_list[3])),
+        #     #             f"samples fourth zeroed out": wandb.Image(array2grid(samples_tampered_list[4])),
+        #     #             f"samples fifth zeroed out": wandb.Image(array2grid(samples_tampered_list[5])),
+        #     #             f"samples sixth zeroed out": wandb.Image(array2grid(samples_tampered_list[6])),
+        #     #             f"samples seventh zeroed out": wandb.Image(array2grid(samples_tampered_list[7]))
+        #     #             })
+        #     # logging.info("Generating EMA samples done.")
+        #     # return
+        #     ################################################################################
         
         # accelerator.log({"samples_pure": wandb.Image(array2grid(out_samples_pure)),
-        #                     "gt_samples": wandb.Image(array2grid(gt_samples))})
+        #                     "gt_samples": wandb.Image(array2grid(gt_samples)),
+        #                     #"gt_from_patchifier": wandb.Image(array2grid(gt_from_patchifier))
+        #                     })
         
         # logging.info("Generating EMA samples done.")
-        # break
+        # return
         ##############################################################################################################
         if args.explicd_only==0:
             model.train()
         explicid.train()
         optimizer.train()
+        #imgs_normalized_for_vae = []
+        #     
         for (raw_image, x), y in train_dataloader:
             raw_image = raw_image.to(device)
             x = x.squeeze(dim=1).to(device)
             y = y.to(device)
             z = None
+            with torch.no_grad():
+                imgs_normalized_for_vae =  raw_image.to(torch.float32) / 127.5 - 1
+                #imgs_normalized_for_vae.append(img_normalized_for_vae)
+                latent=vae.encode(imgs_normalized_for_vae.to(device))["latent_dist"].mean
+            # # Convert each tensor to a PIL image and save it
+            # for i in range(blurred_raw_images.shape[0]):
+            #     blurred_image_tensor = blurred_raw_images[i]  # Shape (3, 256, 256)
+            #     rotated_image_tensor = rotated_raw_images[i]
+            #     translated_image_tensor = translated_raw_images[i]
+            #     color_jittered_image_tensor = color_jittered_raw_images[i]
+            #     raw_image_tensor = raw_image[i]
+                
+            #     # Convert the tensor to a PIL image (needs to be in the form [H, W, C])
+            #     blurred_image_pil = Image.fromarray(blurred_image_tensor.cpu().permute(1, 2, 0).numpy())  # Convert from (C, H, W) to (H, W, C)
+            #     rotated_image_pil = Image.fromarray(rotated_image_tensor.cpu().permute(1, 2, 0).numpy())
+            #     translated_image_pil = Image.fromarray(translated_image_tensor.cpu().permute(1, 2, 0).numpy())
+            #     color_jittered_image_pil = Image.fromarray(color_jittered_image_tensor.cpu().permute(1, 2, 0).numpy())
+            #     raw_image_tensor_pil = Image.fromarray(raw_image_tensor.cpu().permute(1, 2, 0).numpy())
+                
+            #     # Save the image
+            #     blurred_image_pil.save(os.path.join(imgs_save_dir, f"blurred_image_{i}.png"))
+            #     rotated_image_pil.save(os.path.join(imgs_save_dir, f"rotated_image_{i}.png"))
+            #     translated_image_pil.save(os.path.join(imgs_save_dir, f"translated_image_{i}.png"))
+            #     color_jittered_image_pil.save(os.path.join(imgs_save_dir, f"color_jittered_image_{i}.png"))
+            #     raw_image_tensor_pil.save(os.path.join(imgs_save_dir, f"raw_image_{i}.png"))
+
             if args.legacy:
                 # In our early experiments, we accidentally apply label dropping twice: 
                 # once in train.py and once in sit.py. 
@@ -1110,53 +916,42 @@ def main(args):
                         zs.append(z)
                 #exp_test_BMAC, exp_test_acc, _, _ , sit_BMAC, sit_acc= validation(explicid, model, test_dataloader, exp_val_transforms)
             if args.explicd_only==0:
-                with accelerator.accumulate(model, explicid):
+                with accelerator.accumulate(model, explicid, patchifyer_model):
                     imgs_for_explicid=prepare__imgs_for_explicid(raw_image, explicid_train_transforms).to(device)
                     model_kwargs = dict(y=labels)
                     list_of_images=[imgs_for_explicid]
-                    if do_contr_loss:
+                    if DO_CONTR_LOSS:
                         list_of_images.append(rotation_transform(imgs_for_explicid))
                         list_of_images.append(translation_transform(imgs_for_explicid))
                         list_of_images.append(color_jitter_transform(imgs_for_explicid))
                         list_of_images.append(blur_transform(imgs_for_explicid))
 
-                    loss, proj_loss, explicid_loss, expl_loss_cls, logits_similarity_loss, cosine_loss, sit_cls_loss, contr_loss, loss_cls_criteria_only, loss_cls_refined, sparsity_loss, _, _ = loss_fn(model, x, model_kwargs, zs=zs, 
-                                                                        labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch,  explicd_only=0)
+                    processing_loss, loss, proj_loss, explicid_loss, _, logits_similarity_loss, _, _, _, _, _, _, attn_explicd_loss, attn_map_loss_sit_total, _, cnn_loss_cls= loss_fn(model, latent, latent, model_kwargs, zs=zs, 
+                                                                        labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch,  explicd_only=0, do_sit=True, do_pretraining_the_patchifyer=False, patchifyer_model=patchifyer_model)
+                    processing_loss_mean = processing_loss.mean()
                     loss_mean = loss.mean()
-                    #loss_mean = torch.tensor(0.0, device=device)
                     proj_loss_mean = proj_loss.mean()* args.proj_coeff
-                    #proj_loss_mean = torch.tensor(0.0, device=device)
                     explicid_loss_mean = explicid_loss.mean() *2
-                    logits_similarity_loss_mean= torch.tensor(0.0, device=device)
-                    #logits_similarity_loss_mean = logits_similarity_loss.mean()
-                    #explicid_loss_mean = torch.tensor(0.0, device=device)
-                    #cosine_loss_mean = cosine_loss.mean()
-                    cosine_loss_mean= torch.tensor(0.0, device=device)
-                    contr_loss_mean = contr_loss.mean()
-                    sit_cls_loss_mean = sit_cls_loss.mean()
-                    #sit_cls_loss_mean =torch.tensor(0.0, device=device)
-                    #loss_cls_criteria_only_mean = loss_cls_criteria_only.mean()
-                    loss_cls_criteria_only_mean=torch.tensor(0.0, device=device)
-                    expl_loss_cls_mean = expl_loss_cls.mean()
-                    #loss_cls_refined_mean = loss_cls_refined.mean()
-                    loss_cls_refined_mean = torch.tensor(0.0, device=device)
-                    total_loss_magnitude = loss_mean + proj_loss_mean  + explicid_loss_mean + cosine_loss_mean + contr_loss_mean +sit_cls_loss_mean+loss_cls_criteria_only_mean+loss_cls_refined_mean+logits_similarity_loss_mean
+                    logits_similarity_loss_mean= logits_similarity_loss.mean()
+                    attn_explicd_loss_mean = attn_explicd_loss.mean()
+                    attn_map_loss_sit_total_mean = attn_map_loss_sit_total.mean()
+                    cnn_loss_cls_mean = cnn_loss_cls.mean()
+
+                    total_loss_magnitude = processing_loss_mean+loss_mean + proj_loss_mean  + explicid_loss_mean + logits_similarity_loss_mean+attn_explicd_loss_mean+attn_map_loss_sit_total_mean+cnn_loss_cls_mean
+
+                    processing_weight = processing_loss_mean/total_loss_magnitude
                     loss_weight = loss_mean / total_loss_magnitude
                     proj_weight = proj_loss_mean / total_loss_magnitude
                     explicid_weight = explicid_loss_mean / total_loss_magnitude
                     lgs_sim_weight = logits_similarity_loss_mean / total_loss_magnitude
-                    cosine_weight = cosine_loss_mean / total_loss_magnitude
-                    contr_weight = contr_loss_mean / total_loss_magnitude
-                    sit_cls_weight = sit_cls_loss_mean / total_loss_magnitude
-                    loss_cls_criteria_only_mean_weight = loss_cls_criteria_only_mean / total_loss_magnitude
-                    loss_cls_refined_mean_weight = loss_cls_refined_mean / total_loss_magnitude
-                    #expl_cls_weight = expl_loss_cls_mean / total_loss_magnitude
-                    total_loss = ((loss_weight*loss_mean) + (proj_weight*proj_loss_mean) + (explicid_weight*explicid_loss_mean) + (cosine_weight*cosine_loss_mean) + 
-                                  (contr_weight*contr_loss_mean) + (sit_cls_weight*sit_cls_loss_mean) + (loss_cls_criteria_only_mean_weight*loss_cls_criteria_only_mean)+
-                                  (loss_cls_refined_mean_weight*loss_cls_refined_mean) + (lgs_sim_weight*logits_similarity_loss_mean)) 
-                    #+ (expl_cls_weight*expl_loss_cls_mean)
+                    attn_explicd_weight = attn_explicd_loss_mean/total_loss_magnitude
+                    attn_sit_weight= attn_map_loss_sit_total_mean/total_loss_magnitude
+                    cnn_loss_weight = cnn_loss_cls_mean/total_loss_magnitude
 
-                    # loss = loss_mean + proj_loss_mean * args.proj_coeff + explicid_loss_mean + cosine_loss_mean + 4*contr_loss_mean +sit_cls_loss_mean
+                    total_loss = ((processing_weight*processing_loss_mean)+(loss_weight*loss_mean) + (proj_weight*proj_loss_mean) + (explicid_weight*explicid_loss_mean)
+                                + (lgs_sim_weight*logits_similarity_loss_mean) + (attn_explicd_weight*logits_similarity_loss_mean) + (attn_sit_weight*attn_map_loss_sit_total_mean)
+                                + (cnn_loss_weight*cnn_loss_cls_mean)) 
+
                     ## optimization
                     accelerator.backward(total_loss)
                     if accelerator.sync_gradients:
@@ -1168,23 +963,24 @@ def main(args):
                     if accelerator.sync_gradients:
                         update_ema(ema, model) # change ema function
             else:
-                with accelerator.accumulate(explicid):
+                with accelerator.accumulate(explicid, patchifyer_model):
                     imgs_for_explicid=prepare__imgs_for_explicid(raw_image, explicid_train_transforms).to(device)
                     model_kwargs = dict(y=labels)
                     list_of_images=[imgs_for_explicid]
-                    if do_contr_loss:
+                    if DO_CONTR_LOSS:
                         list_of_images.append(rotation_transform(imgs_for_explicid))
                         list_of_images.append(translation_transform(imgs_for_explicid))
                         list_of_images.append(color_jitter_transform(imgs_for_explicid))
                         list_of_images.append(blur_transform(imgs_for_explicid))
 
-                    _, _, explicid_loss, expl_loss_cls, logits_similarity_loss, _, _, contr_loss, _, _, attn_loss = loss_fn(None, x, model_kwargs, zs=zs, 
+                    _, _, _, explicid_loss, _, logits_similarity_loss, _, _, _, _, attn_explicd_loss, _, _, cnn_loss_cls = loss_fn(None, x, model_kwargs, zs=zs, 
                                                                         labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch, explicd_only=1)
+
                     explicid_loss_mean = explicid_loss.mean()
-                    logits_similarity_loss_mean= torch.tensor(0.0, device=device)
-                    #logits_similarity_loss_mean = logits_similarity_loss.mean()
-                    #expl_loss_cls_mean = expl_loss_cls.mean()
-                    accelerator.backward(explicid_loss_mean+logits_similarity_loss_mean)
+                    logits_similarity_loss_mean= logits_similarity_loss.mean()
+                    attn_explicd_loss_mean = attn_explicd_loss.mean()
+                    cnn_loss_cls_mean = cnn_loss_cls.mean()
+                    accelerator.backward(explicid_loss_mean+logits_similarity_loss_mean+attn_explicd_loss_mean+cnn_loss_cls_mean)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
             
@@ -1193,7 +989,7 @@ def main(args):
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1                
-            if global_step % args.checkpointing_steps == 0 and global_step > 0:
+            if global_step % args.checkpointing_steps == 0 and global_step > 0 and SAVING_BASED_ON_STEP:
                 if accelerator.is_main_process:
                     if args.explicd_only==0:
                         checkpoint = {
@@ -1204,42 +1000,52 @@ def main(args):
                             "args": args,
                             "steps": global_step,
                         }
-                        checkpoint_path = f"{checkpoint_dir_step_based}/SiT/{global_step:07d}.pt"
-                        if SAVING_BASED_ON_STEP:
-                            torch.save(checkpoint, checkpoint_path)
-                            logger.info(f"Saved checkpoint to {checkpoint_path}")
+                        checkpoint_path = f"{checkpoint_dir_step_based}/SiT/hilimsya.pt"
+                        torch.save(checkpoint, checkpoint_path)
+                        logger.info(f"Saved checkpoint to {checkpoint_path}")
 
             if (global_step == 1 or (global_step % args.sampling_steps == 0 and global_step > 0)) and args.explicd_only==0:
                 from samplers import euler_sampler
                 with torch.no_grad():
                     # Selected elements to be stored
                     imgs_for_sampling = []
-
+                    imgs_normalized_for_vae = []
                     # Iterate over the dataset and labels
                     for img, _ , lab in test_dataset:
-                        if lab in ys:
-                            imgs_for_sampling.append(img)
-                            if len(imgs_for_sampling) == sample_batch_size:
-                                break
+                        img_normalized_for_vae =  img.to(torch.float32) / 127.5 - 1
+                        imgs_for_sampling.append(img)
+                        imgs_normalized_for_vae.append(img_normalized_for_vae)
+                        if len(imgs_for_sampling) == sample_batch_size:
+                            break
 
+                    latent_sampling=vae.encode(torch.stack(imgs_normalized_for_vae, dim=0).to(device))["latent_dist"].mean
                     imgs_for_explicid=prepare__imgs_for_explicid(imgs_for_sampling, exp_val_transforms).to(device)
-                    cls_logits, _, _, _, agg_visual_tokens = explicid(imgs_for_explicid)
+                    cls_logits, _, _, _, agg_visual_tokens, _, _, attn_criticial_weights, attn_trivial_weights, vit_l_output, agg_critical_visual_tokens, agg_trivial_visual_tokens, _, critical_mask, trivial_mask  = explicid(imgs_for_explicid)
+                    longer_visual_tokens = torch.cat([agg_critical_visual_tokens, agg_trivial_visual_tokens], dim=1)
                     samples = euler_sampler(
-                        model, 
-                        xT, 
-                        ys,
-                        agg_visual_tokens,
-                        cls_logits,
-                        num_steps=50, 
-                        cfg_scale=4.0,
-                        guidance_low=0.,
-                        guidance_high=1.,
-                        path_type=args.path_type,
-                        heun=False,
-                    ).to(torch.float32)
-                    samples = vae.decode((samples -  latents_bias) / latents_scale).sample
-                    gt_samples = vae.decode((gt_xs - latents_bias) / latents_scale).sample
+                            model, 
+                            latent_sampling, 
+                            ys,
+                            agg_visual_tokens,
+                            cls_logits,
+                            num_steps=50, 
+                            cfg_scale=0.0,
+                            guidance_low=0.,
+                            guidance_high=1.,
+                            path_type=args.path_type,
+                            heun=False,
+                            attn_critical_weights=attn_criticial_weights, 
+                            attn_trivial_weights=attn_trivial_weights,
+                            longer_visual_tokens = longer_visual_tokens,
+                            vit_l_output=vit_l_output,
+                            critical_mask=critical_mask, 
+                            trivial_mask=trivial_mask,
+                            patchifyer_model=patchifyer_model
+                        ).to(torch.float32)
+                    samples = vae.decode(samples)["sample"]
                     samples = (samples + 1) / 2.
+
+                    gt_samples = vae.decode(latent)["sample"]
                     gt_samples = (gt_samples + 1) / 2.
                 out_samples = accelerator.gather(samples.to(torch.float32))
                 gt_samples = accelerator.gather(gt_samples.to(torch.float32))
@@ -1248,22 +1054,23 @@ def main(args):
                 logging.info("Generating EMA samples done.")
             if args.explicd_only==0:
                 logs = {
+                    "proc_loss": accelerator.gather(processing_loss_mean).mean().detach().item(),
                     "loss": accelerator.gather(loss_mean).mean().detach().item(), 
                     "proj_loss": accelerator.gather(proj_loss_mean).mean().detach().item(),
                     "grad_norm": accelerator.gather(grad_norm).mean().detach().item(),
                     "expl_loss": accelerator.gather(explicid_loss_mean).mean().detach().item(),
-                    #"lgs_sim_loss": accelerator.gather(logits_similarity_loss_mean).mean().detach().item(),
-                    #"cos_loss": accelerator.gather(cosine_loss_mean).mean().detach().item(),
-                    #"contr_loss": accelerator.gather(contr_loss_mean).mean().detach().item(),
-                    "sit_cls_loss": accelerator.gather(sit_cls_loss_mean).mean().detach().item(),
-                    #"loss_cls_criteria_only": accelerator.gather(loss_cls_criteria_only_mean).mean().detach().item(),
-                    "loss_cls_refined": accelerator.gather(loss_cls_refined_mean).mean().detach().item(),
-                    #"expl_cls_loss": accelerator.gather(expl_loss_cls_mean).mean().detach().item(),
+                    "lgs_sim": accelerator.gather(logits_similarity_loss_mean).mean().detach().item(),
+                    "attn_exp": accelerator.gather(attn_explicd_loss_mean).mean().detach().item(),
+                    "attn_sit": accelerator.gather(attn_map_loss_sit_total_mean).mean().detach().item(),
+                    "cnn_cls": accelerator.gather(cnn_loss_cls_mean).mean().detach().item(),
                 }
+
             else:
                 logs = {
                     "expl_loss": accelerator.gather(explicid_loss_mean).mean().detach().item(),
-                    #"logits_similarity_loss": accelerator.gather(logits_similarity_loss_mean).mean().detach().item(),
+                    "attn_exp": accelerator.gather(attn_explicd_loss_mean).mean().detach().item(),
+                    "cnn_cls": accelerator.gather(cnn_loss_cls_mean).mean().detach().item(),
+                    "lgs_sim": accelerator.gather(logits_similarity_loss_mean).mean().detach().item(),
                 }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
@@ -1277,9 +1084,6 @@ def main(args):
         if args.explicd_only==0:
             model.eval()
         exp_pred_list = np.zeros((0), dtype=np.uint8)
-        exp_criteria_only_pred_list = np.zeros((0), dtype=np.uint8)
-        exp_pred_list_refined = np.zeros((0), dtype=np.uint8)
-        sit_pred_list = np.zeros((0), dtype=np.uint8)
         gt_list = np.zeros((0), dtype=np.uint8)
         with torch.no_grad():
             for _, ((raw_image, x), y) in enumerate(val_dataloader):
@@ -1298,47 +1102,12 @@ def main(args):
                 torch.cuda.empty_cache()
 
                 imgs_for_explicid=prepare__imgs_for_explicid(raw_image, exp_val_transforms).to(device)
-                cls_logits, cls_logits_criteria_only, cls_logits_dict, _, agg_visual_tokens = explicid(imgs_for_explicid)
+                cls_logits, _, _, _, agg_visual_tokens, _, _, _, _, _, _, _, _, _, _ = explicid(imgs_for_explicid)
                 _, label_pred = torch.max(cls_logits, dim=1)
-                #_, label_criteria_only_pred = torch.max(cls_logits_criteria_only, dim=1)
-
-                x = x.squeeze(dim=1).to("cuda")
-                x = sample_posterior(x, 
-                                    latents_scale=torch.tensor(
-                                            [0.18215, 0.18215, 0.18215, 0.18215]
-                                            ).view(1, 4, 1, 1).to("cuda"), 
-                                    latents_bias=torch.tensor(
-                                            [0., 0., 0., 0.]
-                                            ).view(1, 4, 1, 1).to("cuda"))
-
-                concept_label = torch.tensor([CONCEPT_LABEL_MAP[label] for label in labels])
-                concept_label = concept_label.long().cuda()
-
-                time_input = torch.rand((x.shape[0], 1, 1, 1))
-                time_input = time_input.to(device="cuda", dtype=x.dtype)
-                noises = torch.randn_like(x)
-                alpha_t = 1 - time_input
-                sigma_t = time_input
-
-                d_alpha_t = -1
-                d_sigma_t =  1
 
                 exp_pred_list = np.concatenate((exp_pred_list, label_pred.cpu().numpy().astype(np.uint8)), axis=0)
-                #exp_criteria_only_pred_list = np.concatenate((exp_criteria_only_pred_list, label_criteria_only_pred.cpu().numpy().astype(np.uint8)), axis=0)
                 gt_list = np.concatenate((gt_list, labels.cpu().numpy().astype(np.uint8)), axis=0)
-                if args.explicd_only==0:
-                    model_input = alpha_t * x + sigma_t * noises
-                    model_target = d_alpha_t * x + d_sigma_t * noises
-                    _, _, _, produced_concepts, y_predicted, _, _  = model(model_input, x, model_target, time_input.flatten(), y, 
-                                                                            concept_label=concept_label, 
-                                                                            image_embeddings=agg_visual_tokens,
-                                                                            cls_logits=cls_logits)
-                    _, sit_label_pred = torch.max(y_predicted, dim=1)
-                    sit_pred_list = np.concatenate((sit_pred_list, sit_label_pred.cpu().numpy().astype(np.uint8)), axis=0)
 
-                    cls_logits_refined = explicid(None, produced_concepts)
-                    _, exp_label_pred_refined = torch.max(cls_logits_refined, dim=1)
-                    exp_pred_list_refined = np.concatenate((exp_pred_list_refined, exp_label_pred_refined.cpu().numpy().astype(np.uint8)), axis=0)
 
             
             exp_val_BMAC = balanced_accuracy_score(gt_list, exp_pred_list)
@@ -1346,63 +1115,37 @@ def main(args):
             exp_val_acc = 100 * exp_val_correct / len(exp_pred_list)
             exp_val_f1 = f1_score(gt_list, exp_pred_list, average='macro')
 
-            # exp_criteria_only_val_BMAC = balanced_accuracy_score(gt_list, exp_criteria_only_pred_list)
-            # exp_criteria_only_val_correct = np.sum(gt_list == exp_criteria_only_pred_list)
-            # exp_criteria_only_val_acc = 100 * exp_val_correct / len(exp_criteria_only_pred_list)
-            # exp_criteria_only_val_f1 = f1_score(gt_list, exp_criteria_only_pred_list, average='macro')
-
-            if args.explicd_only==0:
-                sit_val_BMAC = balanced_accuracy_score(gt_list, sit_pred_list)
-                sit_val_correct = np.sum(gt_list == sit_pred_list)
-                sit_val_acc = 100 * sit_val_correct / len(sit_pred_list)
-                sit_val_f1 = f1_score(gt_list, sit_pred_list, average='macro')
-
-                exp_refined_BMAC = balanced_accuracy_score(gt_list, exp_pred_list_refined)
-                exp_refined_correct = np.sum(gt_list == exp_pred_list_refined)
-                exp_refined_acc = 100 * exp_refined_correct / len(exp_pred_list_refined)
-                exp_refined_val_f1 = f1_score(gt_list, exp_pred_list_refined, average='macro')
-            # or sit_val_f1>max_val_f1
-            # sit_val_BMAC>max_val_bmacc
-            # exp_val_BMAC>max_val_bmacc
             if args.explicd_only==1:
-                #  or exp_criteria_only_val_f1>max_exp_criteria_only_val_f1
                 if exp_val_f1>max_exp_val_f1:
-                    if exp_val_f1>max_exp_val_f1:
-                        max_exp_val_f1=exp_val_f1
-                        print('Explicd Val f1', f'{exp_val_f1:.3f}')
-                        print('Explicd Val Balanced Acc', f'{exp_val_BMAC:.3f}')
+                    max_exp_val_f1=exp_val_f1
+                    print('Explicd Val f1', f'{exp_val_f1:.3f}')
+                    print('Explicd Val Balanced Acc', f'{exp_val_BMAC:.3f}')
+                    if SAVING_BASED_ON_SCORE:
                         checkpoint_val = {
                                 "explicid": explicid.state_dict(),
                         }
                         if DO_MUDDLE_CHECK:
-                            checkpoint_path = f"{checkpoint_dir_val_score_based}/Explicd_only/Muddled/Explicd_{global_step:07d}.pt"
+                            checkpoint_path = f"{checkpoint_dir_val_score_based}/Explicd_only/Muddled/Explicd_hilimsya_muddled.pt"
                         else:
-                            checkpoint_path = f"{checkpoint_dir_val_score_based}/Explicd_only/Explicd_{global_step:07d}.pt"
-                        if SAVING_BASED_ON_SCORE:
+                            checkpoint_path = f"{checkpoint_dir_val_score_based}/Explicd_only/Explicd_hilimsya.pt"
+                        if args.resume_step == 0:
                             torch.save(checkpoint_val, checkpoint_path)
-                    # else:
-                    #     max_exp_criteria_only_val_f1=exp_criteria_only_val_f1
-                    #     print('Explicd criteria only Val f1', f'{exp_criteria_only_val_f1:.3f}')
-                    #     print('Explicd criteria onlyVal Balanced Acc', f'{exp_criteria_only_val_BMAC:.3f}')
                     explicid.eval()
                     explicid.zero_grad(set_to_none=True)
                     optimizer.eval()
-                    expl_scores, _, _, tokens_and_gt= validation(explicid, None, test_dataloader, exp_val_transforms, explicd_only=1)
+                    expl_scores, tokens_and_gt= validation(explicid, None, test_dataloader, exp_val_transforms, explicd_only=1)
                     print('Explicd Test f1', f'{expl_scores["f1"]:.3f}')
                     print('Explicd Test Acc', f'{expl_scores["Acc"]:.3f}')
                     print('Explicd Test Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
-                    if epoch>7 and DO_MUDDLE_CHECK:
-                        if SAVING_TOKENS_AND_GT:       
-                            torch.save(tokens_and_gt,"tokens_and_ground_truths/explicd_tokens_and_gts_0")
+                    if epoch>7 and DO_MUDDLE_CHECK: 
+                        torch.save(tokens_and_gt,"tokens_and_ground_truths/explicd_tokens_and_gts_0")
                         curve_of_f1.clear()
                         curve_of_BMAC.clear()
                         curve_of_f1.append(expl_scores["f1"])
                         curve_of_BMAC.append(expl_scores["BMAC"])
-                        # ['0_025','0_050','0_075','0_1']
                         for muddle_severity_level in ['0_050','0_1','0_15','0_2']:
                             expl_scores, _, _, tokens_and_gt = validation(explicid, None, train_muddled_dataloaders[muddle_severity_level], exp_val_transforms, explicd_only=1)
-                            if SAVING_TOKENS_AND_GT: 
-                                torch.save(tokens_and_gt,f"tokens_and_ground_truths/explicd_tokens_and_gts_{muddle_severity_level}")
+                            torch.save(tokens_and_gt,f"tokens_and_ground_truths/explicd_tokens_and_gts_{muddle_severity_level}")
                             print('Muddle_Severity_Level ', muddle_severity_level)
                             print('Explicd Muddled f1', f'{expl_scores["f1"]:.3f}')
                             print('Explicd Muddled Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
@@ -1412,48 +1155,25 @@ def main(args):
                         print('Curve of BMAC', curve_of_BMAC)
 
             else:
-                # or exp_criteria_only_val_f1>max_exp_criteria_only_val_f1
-
-                # sit_val_f1>max_sit_val_f1 or (exp_val_f1>max_exp_val_f1) or (exp_refined_val_f1>max_exp_refined_val_f1)
                 if exp_val_f1>max_exp_val_f1:
-                    # if sit_val_f1>max_sit_val_f1:
-                    #     max_sit_val_f1 = sit_val_f1
-                    #     print("new best SiT model")
-                    #     #max_sit_val_bmacc=sit_val_BMAC
-                    #     print('SiT Val f1', f'{sit_val_f1:.3f}')
-                    #     print('SiT Val Balanced Acc', f'{sit_val_BMAC:.3f}')
-                    # elif exp_val_f1>max_exp_val_f1:
                     print("new best Explicd model")
                     max_exp_val_f1= exp_val_f1
                     print('Explicd Val f1', f'{exp_val_f1:.3f}')
                     print('Explicd Val Balanced Acc', f'{exp_val_BMAC:.3f}')
-
-                    checkpoint_val = {
-                                "explicid": explicid.state_dict(),
+                    checkpoint = {
+                            "sit": model.state_dict(),
+                            "explicid": explicid.state_dict(),
+                            "ema": ema.state_dict(),
+                            "opt": optimizer.state_dict(),
+                            "args": args,
+                            "steps": global_step,
                         }
                     if DO_MUDDLE_CHECK:
-                        checkpoint_path = f"{checkpoint_dir_val_score_based}/SiT/Muddled/Explicd_{global_step:07d}.pt"
+                        checkpoint_path = f"{checkpoint_dir_val_score_based}/SiT/Muddled/SiT_with_explicd_hilimsya_muddled.pt"
                     else:
-                        checkpoint_path = f"{checkpoint_dir_val_score_based}/SiT/Explicd_{global_step:07d}.pt"
-                    if SAVING_BASED_ON_SCORE:
+                        checkpoint_path = f"{checkpoint_dir_val_score_based}/SiT/SiT_with_explicd_hilimsya.pt"
+                    if args.resume_step == 0 and SAVING_BASED_ON_SCORE:
                         torch.save(checkpoint_val, checkpoint_path)
-                    # checkpoint_path = f"/l/users/arsen.abzhanov/REPA/checkpoints/with_sit/explicd_0_{global_step:07d}.pt"
-                    # torch.save(explicid.state_dict(), checkpoint_path)
-                    # else:
-                    #     print("new best Explicd refined model")
-                    #     max_exp_refined_val_f1=exp_refined_val_f1
-                    #     print('Explicd refined Val f1', f'{exp_refined_val_f1:.3f}')
-                    #     print('Explicd refined Val Balanced Acc', f'{exp_refined_BMAC:.3f}')
-                    # elif exp_criteria_only_val_f1>max_exp_criteria_only_val_f1:
-                    #     max_exp_criteria_only_val_f1=exp_criteria_only_val_f1
-                    #     print("new best Explicd criteria only model")
-                    #     print('Explicd criteria only Val f1', f'{exp_criteria_only_val_f1:.3f}')
-                    #     print('Explicd criteria only Val Balanced Acc', f'{exp_criteria_only_val_BMAC:.3f}')
-                        #max_exp_val_bmacc=exp_val_BMAC
-                        #max_val_f1 = sit_val_f1
-                        #max_val_acc=sit_val_acc
-
-                    explicid.eval()
                     explicid.zero_grad(set_to_none=True)
                     model.eval()
                     model.zero_grad(set_to_none=True)
@@ -1462,13 +1182,8 @@ def main(args):
                     print('Explicd Test f1', f'{expl_scores["f1"]:.3f}')
                     print('Explicd Test Acc', f'{expl_scores["Acc"]:.3f}')
                     print('Explicd Test Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
-                    # print('SiT Test f1', f'{sit_f1:.3f}')
-                    # print('SiT Test Balanced Acc', f'{sit_BMAC:.3f}')
-                    # print('Explicd refined Test f1', f'{exp_refined_f1_test:.3f}')
-                    # print('Explicd refined Test Balanced Acc', f'{exp_refined_BMAC_test:.3f}')
-                    if epoch>7 and DO_MUDDLE_CHECK:
-                        if SAVING_TOKENS_AND_GT: 
-                            torch.save(tokens_and_gt,"tokens_and_ground_truths/sit_tokens_and_gts_0")
+                    if epoch>7 and DO_MUDDLE_CHECK:  
+                        torch.save(tokens_and_gt,"tokens_and_ground_truths/sit_tokens_and_gts_0")
                         curve_of_f1.clear()
                         curve_of_BMAC.clear()
                         curve_of_f1.append(expl_scores["f1"])
@@ -1476,8 +1191,7 @@ def main(args):
                         # ['0_025','0_050','0_075','0_1']
                         for muddle_severity_level in ['0_050','0_1','0_15','0_2']:
                             expl_scores, sit_scores, expl_refined_scores, tokens_and_gt = validation(explicid, model, train_muddled_dataloaders[muddle_severity_level], exp_val_transforms, explicd_only=0)
-                            if SAVING_TOKENS_AND_GT: 
-                                torch.save(tokens_and_gt,f"tokens_and_ground_truths/sit_tokens_and_gts_{muddle_severity_level}")
+                            torch.save(tokens_and_gt,f"tokens_and_ground_truths/sit_tokens_and_gts_{muddle_severity_level}")
                             print('Muddle_Severity_Level ', muddle_severity_level)
                             print('Explicd Muddled f1', f'{expl_scores["f1"]:.3f}')
                             print('Explicd Muddled Balanced Acc', f'{expl_scores["BMAC"]:.3f}')

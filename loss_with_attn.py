@@ -157,7 +157,7 @@ class SILoss:
             latents_scale=None, 
             latents_bias=None,
             task = None,
-            do_logits_similarity=False,
+            do_logits_similarity=True,
             concept_hardness="soft_equal"
             ):
         self.prediction = prediction
@@ -193,10 +193,11 @@ class SILoss:
 
         return alpha_t, sigma_t, d_alpha_t, d_sigma_t
 
-    def __call__(self, model, images, model_kwargs=None, zs=None, labels=None, explicid=None, explicid_imgs_list= None, epoch=None,  explicd_only=0):
+    def __call__(self, model, images, latent_raw_image, model_kwargs=None, zs=None, labels=None, explicid=None, explicid_imgs_list= None, epoch=None,  explicd_only=0, do_sit=False, do_pretraining_the_patchifyer=False, patchifyer_model=None):
         if model_kwargs == None:
             model_kwargs = {}
         # sample timesteps
+        images = latent_raw_image
         if self.weighting == "uniform":
             time_input = torch.rand((images.shape[0], 1, 1, 1))
         elif self.weighting == "lognormal":
@@ -208,46 +209,38 @@ class SILoss:
             elif self.path_type == "cosine":
                 time_input = 2 / np.pi * torch.atan(sigma)    
         time_input = time_input.to(device=images.device, dtype=images.dtype)
-        noises = torch.randn_like(images)
-        alpha_t, sigma_t, d_alpha_t, d_sigma_t = self.interpolant(time_input)  
-        model_input = alpha_t * images + sigma_t * noises
-        model_input_pure=images
-        #print(f"model_input shape: {model_input.shape}")
+        model_input = images
         if self.prediction == 'v':
-            model_target = d_alpha_t * images + d_sigma_t * noises
+            model_target = images
         else:
             raise NotImplementedError() # TODO: add x or eps prediction
 
-        denoising_loss, proj_loss, explicid_loss, cosine_loss, sit_cls_loss, logits_similarity_loss = 0, 0, 0, 0, 0, 0
+        denoising_loss, proj_loss, explicid_loss, cosine_loss, sit_cls_loss, logits_similarity_loss, attn_map_loss_sit_total = [torch.tensor(0.0, device=images.device)]*7
         contr_loss= torch.tensor(0.0, device=images.device)
-        # list_of_produced_concepts= []
-        # list_of_denoised_concepts= []
-        doing_attn_map_loss=True
-        doing_additional_tokens=True
+        attn_explicd_loss=torch.tensor(0.0, device=images.device)
+        loss_cls_criteria_only = torch.tensor(0.0, device=images.device)
+        loss_cls_refined = torch.tensor(0.0, device=images.device)
+        sit_cls_loss = torch.tensor(0.0, device=images.device)
+        sigmas_for_losses = {}
         for imgs_indx, explicid_imgs in enumerate(explicid_imgs_list):
-            if doing_attn_map_loss:
-                cls_logits, cls_logits_criteria_only, cls_logits_dict, image_logits_dict, agg_visual_tokens, agg_trivial_tokens, attn_explicd_loss, attn_critical_weights, attn_trivial_weights  = explicid(explicid_imgs)
-                if explicd_only==0 and doing_additional_tokens:
-                    agg_visual_tokens = torch.cat((agg_visual_tokens, agg_trivial_tokens), dim=1)
-                else:
-                    attn_sit_loss=torch.tensor(0.0, device=images.device)
-            else:
-                cls_logits, cls_logits_criteria_only, cls_logits_dict, image_logits_dict, agg_visual_tokens = explicid(explicid_imgs)
-                attn_explicd_loss=torch.tensor(0.0, device=images.device)
-                attn_sit_loss=torch.tensor(0.0, device=images.device)
-                attn_critical_weights=None
-                attn_trivial_weights=None
-            # print(f"self.concept_label_map[label] ", self.concept_label_map[0])
-            # print(f"self.concept_label_map[label] ", self.concept_label_map[1])
-            # print(f"self.concept_label_map[label] ", self.concept_label_map[2])
-            #print(torch.tensor([self.concept_label_map[label] for label in labels]))
+            if do_pretraining_the_patchifyer:
+                model_output = model(model_input)
+                processing_loss = mean_flat((model_output - model_target) ** 2)
+                return processing_loss, [torch.tensor(0.0, device=images.device)]*15
+            with torch.no_grad():
+                explicid_imgs_latents=patchifyer_model.patchify_the_latent(latent_raw_image)
+            cls_logits, _, _, image_logits_dict, agg_visual_tokens, agg_trivial_tokens, attn_explicd_loss, attn_critical_weights, attn_trivial_weights, vit_l_output, agg_critical_visual_tokens, agg_trivial_visual_tokens, cnn_logits, critical_mask, trivial_mask  = explicid(explicid_imgs, explicid_imgs_latents=explicid_imgs_latents)
+            if explicd_only==0:
+                agg_visual_tokens = torch.cat((agg_visual_tokens, agg_trivial_tokens), dim=1)
+                longer_visual_tokens = torch.cat((agg_critical_visual_tokens, agg_trivial_visual_tokens), dim=1)
+                vit_l_output_input = vit_l_output
+
+
             if self.concept_hardness!="soft_smarter":
-                #print(labels)
                 concept_label = torch.tensor([self.concept_label_map[label] for label in labels])
                 concept_label = concept_label.long().cuda()
             else:
                 concept_label = [self.concept_label_map[label] for label in labels]
-                #print(f"concept_label ", concept_label)
                 concept_label_busi_soft_smooth_dict = {
                     'shape': torch.tensor([inner_list[0] for inner_list in concept_label]).cuda(),
                     'margin': torch.tensor([inner_list[1] for inner_list in concept_label]).cuda(),
@@ -257,18 +250,12 @@ class SILoss:
                     'orientation': torch.tensor([inner_list[5] for inner_list in concept_label]).cuda()
 
                 }
-                #print(concept_label_busi_soft_smooth_dict)
 
             loss_cls = self.cls_criterion(cls_logits, labels)
-            loss_cls_criteria_only = torch.tensor(0.0, device=images.device)
+            cnn_loss_cls = self.cls_criterion(cnn_logits, labels)
+            cnn_logits_similarity_loss = F.kl_div(F.softmax(cls_logits, dim=1).log(), F.softmax(cnn_logits, dim=1), reduction='batchmean')
             if self.do_logits_similarity:
-                logits_similarity_loss = calculate_logits_similarity_loss(cls_logits, cls_logits_dict, labels)
-            # if epoch>1500:
-            #     loss_cls_criteria_only = self.cls_criterion(cls_logits_criteria_only, labels)
-            # else:
-            #     loss_cls_criteria_only = torch.tensor(0.0, device=images.device)
-            #print(f"cls logist shape: {cls_logits.shape}")
-            #print(f"labels shape: {labels.shape}")
+                logits_similarity_loss = cnn_logits_similarity_loss
             loss_concepts = 0
             idx = 0
             if self.concept_hardness=="hard":
@@ -289,47 +276,35 @@ class SILoss:
             elif self.concept_hardness=="soft_smarter":
                 for key in explicid.concept_token_dict.keys():
                     predicted_probs = F.log_softmax(image_logits_dict[key], dim=1)  # Log probabilities for KL Divergence
-                    #print(f"predicted_probs shape", predicted_probs.shape)
-                    #print(f"concept_label_busi_soft_smooth_dict[key] shape", concept_label_busi_soft_smooth_dict[key].shape)
-                    #print(concept_label_busi_soft_smooth_dict[key])
                     loss_concepts += F.kl_div(predicted_probs,  concept_label_busi_soft_smooth_dict[key], reduction='batchmean')  # Reduction is batchmean for proper scaling
                     idx += 1
 
-            if epoch>7:
-                #explicid_loss += loss_cls
-                #explicid_loss=torch.tensor(0.0, device=images.device)
+            if epoch>=0:
                 explicid_loss += loss_cls + loss_concepts / idx
             elif epoch>10 and self.do_logits_similarity:
                 explicid_loss += loss_cls + logits_similarity_loss+ loss_concepts / idx 
             else:
                 explicid_loss += loss_concepts
-                #explicid_loss=torch.tensor(0.0, device=images.device)
-
-            if  explicd_only==0:
-                model_output, image_embed, embedded_concepts, produced_concepts, y_predicted, sparsity_loss, zs_tilde, attn_sit_loss  = model(model_input, model_input_pure, model_target,time_input.flatten(), **model_kwargs, 
-                                                                        concept_label=concept_label, 
+            
+            if explicd_only==0 and do_sit:
+                model_output, model_input_pure_processed, zs_tilde, attn_map_loss_sit_total, sigmas_for_losses  = model(model_input, images, None,time_input.flatten(), **model_kwargs, 
+                                                                        concept_label=None, 
                                                                         image_embeddings=agg_visual_tokens,
-                                                                        cls_logits=cls_logits,
+                                                                        cls_logits=None,
                                                                         attn_critical_weights=attn_critical_weights, 
                                                                         attn_trivial_weights=attn_trivial_weights,
-                                                                        con_on_explicd_pred=True)
-                # list_of_produced_concepts.append(agg_visual_tokens)
-                # list_of_denoised_concepts.append(produced_concepts)
-                #print(f"y_predicted shape: {y_predicted.shape}")
-                sit_cls_loss = self.cls_criterion(y_predicted, labels)
-                if epoch<30:
-                    attn_sit_loss = torch.tensor(0.0, device=images.device)
-                cls_logits_refined = explicid(None, produced_concepts)
-                loss_cls_refined = self.cls_criterion(cls_logits_refined, labels)
-
+                                                                        con_on_explicd_pred=True,
+                                                                        vit_l_output=vit_l_output_input,
+                                                                        longer_visual_tokens=longer_visual_tokens,
+                                                                        critical_mask = critical_mask, 
+                                                                        trivial_mask = trivial_mask,
+                                                                        patchifyer_model=patchifyer_model)
+                
                 if imgs_indx==0:
-                    if torch.any(torch.isnan(model_output)) or torch.any(torch.isinf(model_output)):
-                        print("NaN or Inf detected in model output")
-
-                    denoising_loss = mean_flat((model_output - model_target) ** 2)
-
-                    # projection loss
-                    proj_loss_current = 0.
+                    #processing_loss = mean_flat((model_input_pure_processed - model_target) ** 2)
+                    processing_loss  = torch.tensor(0.0, device=images.device)
+                    denoising_loss = mean_flat((model_output - model_target) ** 2)/critical_mask.sum(dim=(-2,-1))
+                    proj_loss_current = torch.tensor(0.0, device=images.device)
                     bsz = zs[0].shape[0]
                     for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
                         for j, (z_j, z_tilde_j) in enumerate(zip(z, z_tilde)):
@@ -339,51 +314,9 @@ class SILoss:
                     proj_loss_current /= (len(zs) * bsz)
                     proj_loss +=proj_loss_current
 
-                #print(f"produced_concepts shape: {produced_concepts.shape}")
-                cosine_loss=torch.tensor(0.0, device=images.device)
-                #################################################################################################
-                # commented the cosine sim loss
-                # cosine_sim = F.cosine_similarity(embedded_concepts, produced_concepts, dim=-1)
-                # cosine_loss += 1 - cosine_sim.mean()
-                #################################################################################################
-
-            # mse_criterion = nn.MSELoss()
-
-            # # Mean squared error loss between the model's output vector and the label's embedding
-            # mse_loss = mse_criterion(embedded_concepts, produced_concepts)*200
-        #################################################################################################
-        # commented the contr loss
-        # if len(list_of_denoised_concepts)>1:
-        #     #print(f"list_of_emb_concepts[0] shape: {list_of_emb_concepts[0].shape}")
-        #     contr_loss+=contrastive_loss(list_of_produced_concepts[0], list_of_produced_concepts[1], positive=True)
-        #     contr_loss+=contrastive_loss(list_of_produced_concepts[0], list_of_produced_concepts[2], positive=True)
-        #     contr_loss+=contrastive_loss(list_of_produced_concepts[0][:,0,:], list_of_produced_concepts[3][:,0,:], positive=False)
-        #     contr_loss+=contrastive_loss(list_of_produced_concepts[0][:,2,:], list_of_produced_concepts[4][:,2,:], positive=False)
-        
-        #     contr_loss+=contrastive_loss(list_of_denoised_concepts[0], list_of_denoised_concepts[1], positive=True)
-        #     contr_loss+=contrastive_loss(list_of_denoised_concepts[0], list_of_denoised_concepts[2], positive=True)
-        #     contr_loss+=contrastive_loss(list_of_denoised_concepts[0][:,0,:], list_of_denoised_concepts[3][:,0,:], positive=False)
-        #     contr_loss+=contrastive_loss(list_of_denoised_concepts[0][:,2,:], list_of_denoised_concepts[4][:,2,:], positive=False)
-        #################################################################################################
-        contr_loss=torch.tensor(0.0, device=images.device)
-        # loss_dict={
-        #     "explicd_loss":explicid_loss,
-        #     "loss_cls_of_explicd":loss_cls,
-        #     "logits_similarity":logits_similarity_loss,
-        # }
-        # if  explicd_only==0:
-        #     loss_dict["denoising"]=denoising_loss
-        #     loss_dict["projection"]=proj_loss
-        #     loss_dict["cosine"]=cosine_loss
-        #     loss_dict["sit_cls"]=sit_cls_loss
-        #     loss_dict["contrastive"]=contr_loss
-        #     loss_dict["loss_cls_criteria_only"]=loss_cls_criteria_only
-        #     loss_dict["loss_cls_refined"]=loss_cls_refined
-        #     loss_dict["sparsity"]=sparsity_loss
-        #   return loss_dict
             
         if  explicd_only==0:
-            return denoising_loss, proj_loss, explicid_loss, loss_cls, logits_similarity_loss, cosine_loss, sit_cls_loss, contr_loss, loss_cls_criteria_only, loss_cls_refined, sparsity_loss, attn_explicd_loss, attn_sit_loss
+            return processing_loss, denoising_loss, proj_loss, explicid_loss, loss_cls, logits_similarity_loss, cosine_loss, sit_cls_loss, contr_loss, loss_cls_criteria_only, loss_cls_refined, torch.tensor(0.0, device=images.device), attn_explicd_loss, attn_map_loss_sit_total, sigmas_for_losses, cnn_loss_cls
         else:
-            return None, None, explicid_loss, loss_cls, logits_similarity_loss, None, None, None, None, attn_explicd_loss, attn_sit_loss
+            return None, None, None, explicid_loss, loss_cls, logits_similarity_loss, None, None, None, None, attn_explicd_loss, attn_map_loss_sit_total, sigmas_for_losses, cnn_loss_cls
 

@@ -343,7 +343,9 @@ class SiT(nn.Module):
     
     def forward(self, x, x_pure, x_target,t, y, 
                 concept_label, 
-                image_embeddings, cls_logits, return_logvar=False,  con_on_explicd_pred=True):
+                image_embeddings, cls_logits, return_logvar=False,  con_on_explicd_pred=True,
+                attn_criticial_weights=None, 
+                attn_trivial_weights=None):
         """
         Forward pass of SiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -415,7 +417,7 @@ class SiT(nn.Module):
 
         y_predicted_logits = self.y_logits_embedder_out(combined_embeddings_try[:,-1:,:]) 
         #print("1 3 3")
-        return x,image_embed, minus_embedded_concepts_plus_noise, combined_embeddings_try[:,T:T+self.num_vis_tokens,:], y_predicted_logits.squeeze(1), torch.tensor(0.0, device=x.device), zs
+        return x,image_embed, minus_embedded_concepts_plus_noise, combined_embeddings_try[:,T:T+self.num_vis_tokens,:], y_predicted_logits.squeeze(1), torch.tensor(0.0, device=x.device), zs, torch.tensor(0.0, device=x.device)
 
 
 #################################################################################

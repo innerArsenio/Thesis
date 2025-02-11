@@ -247,6 +247,7 @@ class CustomDataset(Dataset):
         features = np.load(os.path.join(self.features_dir, feature_fname))
         if self.transforms is not None:
             #image, features = self.transforms(torch.from_numpy(image), torch.from_numpy(features))
+            #print(f"shape of image {torch.from_numpy(image).shape}")
             return self.transforms((torch.from_numpy(image), torch.from_numpy(features))), torch.tensor(self.labels[idx])
         else:
             return torch.from_numpy(image), torch.from_numpy(features), torch.tensor(self.labels[idx])

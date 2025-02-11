@@ -51,12 +51,19 @@ def get_score_from_velocity(vt, xt, t, path_type="linear"):
 def compute_diffusion(t_cur):
     return 2 * t_cur
 
+def interpolant(t):
+    alpha_t = 1 - t
+    sigma_t = t
+    d_alpha_t = -1
+    d_sigma_t =  1
+
+    return alpha_t, sigma_t, d_alpha_t, d_sigma_t
 
 def euler_sampler(
         model,
         latents,
         y,
-        imgs,
+        visual_tokens,
         cls_logits,
         num_steps=20,
         heun=False,
@@ -64,31 +71,57 @@ def euler_sampler(
         guidance_low=0.0,
         guidance_high=1.0,
         path_type="linear", # not used, just for compatability
+        attn_critical_weights=None, 
+        attn_trivial_weights=None,
+        longer_visual_tokens = None,
+        vit_l_output=None,
+        critical_mask=None, 
+        trivial_mask=None,
+        patchifyer_model=None
         ):
     # setup conditioning
     if cfg_scale > 1.0:
         y_null = torch.tensor([6] * y.size(0), device=y.device)
-        #imgs_null= torch.zeros_like(imgs)
+        #imgs_null= torch.zeros_like(visual_tokens)
         cls_logits_null = torch.zeros_like(cls_logits)
     _dtype = latents.dtype    
     t_steps = torch.linspace(1, 0, num_steps+1, dtype=torch.float64)
-    x_next = latents.to(torch.float64)
+    #########################################################
+    #x_next = latents.to(torch.float64)
+    #########################################################
+    time_input = torch.rand((y.shape[0], 1, 1, 1))
+    time_input = time_input.to(device=y.device, dtype=latents.dtype)
+    alpha_t, sigma_t, _, _ = interpolant(time_input)
+    #x_next = alpha_t * latents + sigma_t * torch.randn_like(latents)
+    x_next = latents
+    #########################################################s
     device = x_next.device
     concept_label = torch.tensor([CONCEPT_LABEL_MAP[label] for label in y])
     concept_label = concept_label.long().cuda()
+    
     with torch.no_grad():
+        # samples=patchifyer_model.patchify_the_latent(latents)
+        # samples=patchifyer_model.unpatchify_the_latent(samples)
+        # return samples
         for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
             x_cur = x_next
             #print("x next")
             if cfg_scale > 1.0 and t_cur <= guidance_high and t_cur >= guidance_low:
                 model_input = torch.cat([x_cur] * 2, dim=0)
                 y_cur = torch.cat([y, y_null], dim=0)
-                imgs_tokens_input = torch.cat([imgs]*2, dim=0)
+                imgs_tokens_input = torch.cat([visual_tokens]*2, dim=0)
                 concept_label_input = torch.cat([concept_label]*2, dim=0)
                 cls_logits_input = torch.cat([cls_logits, cls_logits_null], dim=0)
+                attn_critical_weights_input =  torch.cat([attn_critical_weights]*2, dim=0)
+                attn_trivial_weights_input =  torch.cat([attn_trivial_weights]*2, dim=0)
             else:
                 model_input = x_cur
-                y_cur = y            
+                y_cur = y
+                imgs_tokens_input = visual_tokens
+                concept_label_input = concept_label
+                cls_logits_input = cls_logits
+                attn_critical_weights_input =  attn_critical_weights
+                attn_trivial_weights_input =  attn_trivial_weights 
             kwargs = dict(y=y_cur)
             time_input = torch.ones(model_input.size(0)).to(device=device, dtype=torch.float64) * t_cur
             #print("1")
@@ -96,15 +129,26 @@ def euler_sampler(
             #img_embed=torch.randn(256, 512).to(device)
 
             d_cur = model(
-                model_input.to(dtype=_dtype), time_input.to(dtype=_dtype), **kwargs, 
+                model_input.to(dtype=_dtype), latents, None, time_input.to(dtype=_dtype), **kwargs,  # if need be will fill in model_pure and model_target
                 concept_label=concept_label_input, 
                 image_embeddings=imgs_tokens_input,
-                cls_logits=cls_logits_input
-                )[0].to(torch.float64)
+                cls_logits=cls_logits_input,
+                attn_critical_weights=attn_critical_weights_input, 
+                attn_trivial_weights=attn_trivial_weights_input,
+                longer_visual_tokens=longer_visual_tokens,
+                vit_l_output=vit_l_output,
+                critical_mask= critical_mask, 
+                trivial_mask = trivial_mask,
+                patchifyer_model=patchifyer_model
+                )[0]
+            #.to(torch.float64)
+            return d_cur
             if cfg_scale > 1. and t_cur <= guidance_high and t_cur >= guidance_low:
                 d_cur_cond, d_cur_uncond = d_cur.chunk(2)
                 d_cur = d_cur_uncond + cfg_scale * (d_cur_cond - d_cur_uncond)                
-            x_next = x_cur + (t_next - t_cur) * d_cur
+            #x_next = x_cur + (t_next - t_cur) * d_cur
+            x_next = d_cur
+            
             #print("2")
             if heun and (i < num_steps - 1):
                 #print("3")
@@ -119,7 +163,16 @@ def euler_sampler(
                     device=model_input.device, dtype=torch.float64
                     ) * t_next
                 d_prime = model(
-                    model_input.to(dtype=_dtype), time_input.to(dtype=_dtype), **kwargs
+                    model_input.to(dtype=_dtype), latents, None,  time_input.to(dtype=_dtype), **kwargs,
+                    concept_label=concept_label_input, 
+                    image_embeddings=imgs_tokens_input,
+                    cls_logits=cls_logits_input,
+                    attn_critical_weights=attn_critical_weights_input, 
+                    attn_trivial_weights=attn_trivial_weights_input,
+                    longer_visual_tokens=longer_visual_tokens,
+                    vit_l_output=vit_l_output,
+                    critical_mask= critical_mask, 
+                    trivial_mask = trivial_mask
                     )[0].to(torch.float64)
                 if cfg_scale > 1.0 and t_cur <= guidance_high and t_cur >= guidance_low:
                     d_prime_cond, d_prime_uncond = d_prime.chunk(2)
