@@ -1,4 +1,4 @@
 from .explicd import ExpLICD
-from .explicd_self_attn import ExpLICD_Self, ExpLICD_ViT_L, ExpLICD_ViT_L_Multiple_Prompts, ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens, PatchSelectorCNNConscise
+from .explicd_self_attn import ExpLICD_Self, ExpLICD_ViT_L, ExpLICD_ViT_L_Multiple_Prompts, ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens, PatchSelectorCNNConscise, ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_SuperPixels
 
 

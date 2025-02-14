@@ -9,6 +9,17 @@ explicid_isic_dict = {
 
 }
 
+explicid_isic_minimal_dict = {
+    'color': ['typical for Actinic Keratoses', 'typical for Basal Cell Carcinoma', 'typical for Benign Keratosis-like Lesions', 'typical for Dermatofibroma', 'typical for Melanoma', 'typical for Melanocytic Nevus', 'typical for Vascular Lesions'],
+    'shape': ['typical for Actinic Keratoses', 'typical for Basal Cell Carcinoma', 'typical for Benign Keratosis-like Lesions', 'typical for Dermatofibroma', 'typical for Melanoma', 'typical for Melanocytic Nevus', 'typical for Vascular Lesions'],
+    'border': ['typical for Actinic Keratoses', 'typical for Basal Cell Carcinoma', 'typical for Benign Keratosis-like Lesions', 'typical for Dermatofibroma', 'typical for Melanoma', 'typical for Melanocytic Nevus', 'typical for Vascular Lesions'],
+    'dermoscopic patterns': ['typical for Actinic Keratoses', 'typical for Basal Cell Carcinoma', 'typical for Benign Keratosis-like Lesions', 'typical for Dermatofibroma', 'typical for Melanoma', 'typical for Melanocytic Nevus', 'typical for Vascular Lesions'],
+    'texture': ['typical for Actinic Keratoses', 'typical for Basal Cell Carcinoma', 'typical for Benign Keratosis-like Lesions', 'typical for Dermatofibroma', 'typical for Melanoma', 'typical for Melanocytic Nevus', 'typical for Vascular Lesions'],
+    'symmetry': ['typical for Actinic Keratoses', 'typical for Basal Cell Carcinoma', 'typical for Benign Keratosis-like Lesions', 'typical for Dermatofibroma', 'typical for Melanoma', 'typical for Melanocytic Nevus', 'typical for Vascular Lesions'],
+    'elevation': ['typical for Actinic Keratoses', 'typical for Basal Cell Carcinoma', 'typical for Benign Keratosis-like Lesions', 'typical for Dermatofibroma', 'typical for Melanoma', 'typical for Melanocytic Nevus', 'typical for Vascular Lesions']
+
+}
+
 explicid_isic_dict_mine = {
     'asymmetry': ['none',   'none or partial', 'partial',  'complete'],
     'border irregularity': ['regular', 'regular or slightly irregular', 'slightly irregular', 'slightly or highly irregular','highly irregular'],

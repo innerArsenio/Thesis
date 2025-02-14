@@ -13,10 +13,12 @@ import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 from torch.nn import functional as F
 from Explicd.model.utils import FFN, FFN_for_SiT
+import torchvision.transforms as T
 
 NUM_OF_CRITERIA = {
     'ISIC': 7,
     'ISIC_MINE': 6,
+    'ISIC_MINIMAL': 7,
 
     'IDRID': 5,
     'IDRID_EDEMA': 6,
@@ -848,6 +850,7 @@ class CrossAttentionImageToken(nn.Module):
 #             nn.SiLU(),
 #             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
 #         )
+    # self.params = nn.ParameterList([nn.Parameter(torch.randn(1)) for _ in range(NUM_OF_CRITERIA[self.task]*2)
 
 
 
@@ -860,15 +863,101 @@ class CrossAttentionImageToken(nn.Module):
 #         for i in range(self.num_vis_tokens):
 #             critical_token = critical_visual_tokens[:,i,:]
 #             critical_weight = attn_critical_weights[:,i,:]
-#             x_critical= x * critical_token.unsqueeze(1) * critical_weight.view(x.shape[0], 256, 1)/self.num_vis_tokens
-#             x=(x+x_critical)/self.num_vis_tokens
+#             x_critical= x * critical_token.unsqueeze(1) * critical_weight.view(x.shape[0], 256, 1)*self.params[i]
 
 #         for i in range(self.num_vis_tokens):
 #             trivial_token = trivial_visual_tokens[:,i,:]
 #             trivial_weight = attn_trivial_weights[:,i,:]
-#             x_trivial= x * trivial_token.unsqueeze(1) * trivial_weight.view(x.shape[0], 256, 1)/self.num_vis_tokens
-#             x=(x+x_trivial)/self.num_vis_tokens
-#         return x
+#             x_trivial= x * trivial_token.unsqueeze(1) * trivial_weight.view(x.shape[0], 256, 1)*self.params[i+7]
+#         return self.norm2(x_critical +x_trivial)
+
+###########################################################################3
+    # def forward(self, x, visual_tokens, attn_critical_weights, attn_trivial_weights, c):
+    # x = self.norm1(x)
+    
+    # # Normalize and process visual tokens
+    # visual_tokens = self.norm_tokens(self.ffn_tokens(visual_tokens))
+    
+    # # Split into critical and trivial tokens
+    # critical_visual_tokens = visual_tokens[:, :self.num_vis_tokens, :]
+    # trivial_visual_tokens = visual_tokens[:, self.num_vis_tokens:, :]
+    
+    # # Expand parameters to match batch size
+    # params_critical = torch.stack(self.params[:7]).view(1, 7, 1)  # Shape (1, 7, 1)
+    # params_trivial = torch.stack(self.params[7:]).view(1, 7, 1)   # Shape (1, 7, 1)
+    
+    # # Compute weighted token interactions in a vectorized way
+    # x_critical = x.unsqueeze(1) * critical_visual_tokens.unsqueeze(2) * attn_critical_weights.unsqueeze(-1) * params_critical
+    # x_trivial = x.unsqueeze(1) * trivial_visual_tokens.unsqueeze(2) * attn_trivial_weights.unsqueeze(-1) * params_trivial
+    
+    # # Reduce across the token dimension
+    # x_critical = x_critical.sum(dim=1)  # Sum over num_vis_tokens
+    # x_trivial = x_trivial.sum(dim=1)
+
+    # return x_critical + x_trivial  # Combine the contributions
+###########################################################################
+
+class SpatialAwarePatchAttentionLoss(nn.Module):
+    def __init__(self, H=16, W=16, sigma=2.0):
+        super().__init__()
+        self.H, self.W = H, W
+        self.sigma = sigma  # Controls locality strength
+        self.register_buffer("spatial_weight", self.compute_distance_matrix(H, W))
+
+    def compute_distance_matrix(self, H, W):
+        grid_x, grid_y = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
+        coords = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1).float()
+        dist_matrix = torch.cdist(coords, coords, p=2)
+        return torch.exp(-dist_matrix / self.sigma).to(device="cuda")
+
+    def compute_mean_color_similarity(self, image_feats):
+        """Compute mean color similarity for patches."""
+        mean_color = image_feats.mean(dim=-1, keepdim=True)  # (B, 1, 256)
+        return 1 - torch.cdist(mean_color, mean_color, p=2)  # (B, 256, 256)
+
+    def compute_texture_similarity(self, image_feats):
+        """Compute texture similarity using Laplacian variance."""
+        laplacian = T.GaussianBlur(3, sigma=(1.5, 1.5))(image_feats) - image_feats
+        texture_variance = laplacian.var(dim=-1, keepdim=True)  # (B, 1, 256)
+        return 1 - torch.cdist(texture_variance, texture_variance, p=2)  # (B, 256, 256)
+
+    def forward(self, image_feats, critical_weights, trivial_weights):
+        B, C, H, W = image_feats.shape
+        num_critical = critical_weights.shape[1]
+        num_trivial = trivial_weights.shape[1]
+        image_feats = image_feats.flatten(2).transpose(1, 2)  # (B, 256, 1024)
+        
+        # Compute different similarity matrices
+        feat_sim = F.cosine_similarity(image_feats.unsqueeze(2), image_feats.unsqueeze(1), dim=-1)  # (B, 256, 256)
+        mean_color_sim = self.compute_mean_color_similarity(image_feats)
+        texture_sim = self.compute_texture_similarity(image_feats)
+        
+        # Combine feature similarity with spatial weight
+        combined_weight = torch.exp(-self.spatial_weight) * feat_sim  # (B, 256, 256)
+        #print(f"combined_weight shape {combined_weight.shape}")
+        combined_weight = torch.zeros_like(combined_weight)
+        
+        # Apply custom similarity measures to specific tokens
+        combined_weight[:, 0, :] = mean_color_sim[:, 0, :]
+        combined_weight[:, :, 0] = mean_color_sim[:, :, 0]
+        #print(f"mean_color_sim shape {mean_color_sim.shape}")
+        #print(f"texture_sim shape {texture_sim.shape}")
+        combined_weight[:, 4, :] = texture_sim[:, 4, :]
+        combined_weight[:, :, 4] = texture_sim[:, :, 4]
+        
+        # Compute intra-critical similarity (should be high)
+        critical_spatial_weights = torch.bmm(critical_weights.view(B, num_critical, H * W), combined_weight)
+        critical_spatial_weights = torch.bmm(critical_spatial_weights, critical_weights.view(B, num_critical, H * W).transpose(1, 2))
+        loss_within = torch.mean(1 - critical_spatial_weights)
+        
+        # Compute cross-mask similarity (should be low)
+        cross_spatial_weights = torch.bmm(critical_weights.view(B, num_critical, H * W), combined_weight)
+        cross_spatial_weights = torch.bmm(cross_spatial_weights, trivial_weights.view(B, num_trivial, H * W).transpose(1, 2))
+        loss_between = torch.mean(cross_spatial_weights)
+        
+        # Balance losses
+        loss = loss_within + 0.5 * loss_between
+        return loss
 
 
 class SiTBlock(nn.Module):
@@ -882,9 +971,10 @@ class SiTBlock(nn.Module):
         self.attn = Attention(
             hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=block_kwargs["qk_norm"]
             )
-        self.cross_attn = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=16, batch_first=True)
-        self.cross_attn_between_patches = nn.MultiheadAttention(embed_dim=768, num_heads=16, batch_first=True)
-        self.cross_attn_vit_output_to_latent = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=16, batch_first=True)
+        num_heads = 14
+        self.cross_attn = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+        self.cross_attn_between_patches = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+        self.cross_attn_vit_output_to_latent = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
         self.task = task
         self.num_vis_tokens = NUM_OF_CRITERIA[self.task]
         
@@ -892,7 +982,7 @@ class SiTBlock(nn.Module):
             self.attn.fused_attn = block_kwargs["fused_attn"]
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.norm_tokens = nn.LayerNorm(768, elementwise_affine=False, eps=1e-6)
+        self.norm_tokens = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
 
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -909,17 +999,19 @@ class SiTBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
+        self.params = nn.ParameterList([nn.Parameter(torch.randn(1)) for _ in range(self.num_vis_tokens*2)])
 
 
 
-    def forward(self, x, longer_visual_tokens, critical_mask):
+    def forward(self, x, longer_visual_tokens, critical_mask, attn_critical_weights, attn_trivial_weights):
         ########################################################## Option to use c
         #print(f"x shape {x.shape}")
-        x = self.norm1(x)
+        x = self.norm1(self.ffn(x))
+        visual_tokens = self.norm_tokens(self.ffn_tokens(longer_visual_tokens))
         ########################################################
-        N, T, D = x.shape
+        #N, T, D = x.shape
         #vit_l_output = self.norm_tokens(self.ffn_tokens(vit_l_output))
-        critical_visual_tokens = self.norm_tokens(self.ffn_tokens(longer_visual_tokens[:, :self.num_vis_tokens, :]))
+        #critical_visual_tokens = self.norm_tokens(self.ffn_tokens(longer_visual_tokens[:, :self.num_vis_tokens, :]))
         #trivial_visual_tokens= self.norm_tokens(self.ffn_tokens(longer_visual_tokens[:, self.num_vis_tokens:, :]))
 
         
@@ -931,19 +1023,20 @@ class SiTBlock(nn.Module):
         #critical_visual_tokens = gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(self.ffn_tokens(longer_visual_tokens[:, :self.num_vis_tokens, :])), shift_mlp, scale_mlp))
         #trivial_visual_tokens = gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(self.ffn_tokens(longer_visual_tokens[:, self.num_vis_tokens:, :])), shift_mlp, scale_mlp))
         
-        critical_latent = self.norm1(x*critical_mask.view(N, T, 1))
-        trivial_latent = self.norm1(x*(1-critical_mask).view(N, T, 1))
-        critical_denoised_latent, _ = self.cross_attn(critical_latent, critical_visual_tokens, critical_visual_tokens)
-        x=critical_denoised_latent*critical_mask.view(N, T, 1)+trivial_latent*(1-critical_mask).view(N, T, 1)
+        #critical_latent = x*critical_mask.view(N, T, 1)
+        #trivial_latent = x*(1-critical_mask).view(N, T, 1)
+
+        #critical_denoised_latent, _ = self.cross_attn(critical_latent, critical_visual_tokens, critical_visual_tokens)
+        #x=critical_denoised_latent*critical_mask.view(N, T, 1)+trivial_latent*(1-critical_mask).view(N, T, 1)
         # critical_denoised_vit_l_output, _ = self.cross_attn(vit_l_output, critical_visual_tokens, critical_visual_tokens)
         # critical_denoised_vit_l_output = critical_denoised_vit_l_output*critical_mask.view(N, T, 1)
         # #trivial_denoised_vit_l_output, _ = self.cross_attn(vit_l_output, trivial_visual_tokens, trivial_visual_tokens)
         # trivial_denoised_vit_l_output = trivial_denoised_vit_l_output*(1-critical_mask).view(N, T, 1)
         # vit_l_output=self.norm2(critical_denoised_vit_l_output+trivial_denoised_vit_l_output)
             ########################################################
-        ### trivial_denoised_latent, _ = self.cross_attn(x, trivial_visual_tokens, trivial_visual_tokens)
-        ### trivial_denoised_latent = trivial_denoised_latent**(1-critical_mask).view(N, T, 1)
-        # trivial_latent = trivial_denoised_latent
+        #trivial_denoised_latent, _ = self.cross_attn(trivial_latent, trivial_visual_tokens, trivial_visual_tokens)
+
+        #x=critical_denoised_latent*(critical_mask.view(N, T, 1))+trivial_denoised_latent*(1-critical_mask.view(N, T, 1))
         ######################################################## Option denoise only critical
         #trivial_latent = x*(1-critical_mask).view(N, T, 1)
 
@@ -969,8 +1062,45 @@ class SiTBlock(nn.Module):
         # x_denoised, _ =self.cross_attn_vit_output_to_latent(x, vit_l_output, vit_l_output)
         # #x=x+self.norm3(x_denoised)
         # x=x+self.norm3(x*vit_l_output)
+    
+        # Normalize and process visual tokens
+        
+        ############################################################################
+        # Split into critical and trivial tokens
+        critical_visual_tokens = visual_tokens[:, :self.num_vis_tokens, :]
+        #print(f"critical_visual_tokens shape {critical_visual_tokens.shape}")
+        critical_visual_tokens[:,1,:]=0
+        critical_visual_tokens[:,2,:]=0
+        critical_visual_tokens[:,3,:]=0
+        critical_visual_tokens[:,5,:]=0
+        critical_visual_tokens[:,6,:]=0
 
-        return x
+        trivial_visual_tokens = visual_tokens[:, self.num_vis_tokens:, :]
+        trivial_visual_tokens[:,1,:]=0
+        trivial_visual_tokens[:,2,:]=0
+        trivial_visual_tokens[:,3,:]=0
+        trivial_visual_tokens[:,5,:]=0
+        trivial_visual_tokens[:,6,:]=0
+
+        # Convert ParameterList to a list of tensors before stacking
+        params_list = list(self.params)  # Convert ParameterList to a list
+        params_critical = torch.stack(params_list[:7]).view(1, 7, 1, 1)  # First 7 params for critical
+        params_trivial = torch.stack(params_list[7:]).view(1, 7, 1, 1)  # Last 7 params for trivial
+
+        # print(f"x.unsqueeze(1) shape {x.unsqueeze(1).shape}")
+        # print(f"critical_visual_tokens.unsqueeze(2) shape {critical_visual_tokens.unsqueeze(2).shape}")
+        # print(f"attn_critical_weights.unsqueeze(-1) shape {attn_critical_weights.unsqueeze(-1).shape}")
+        # print(f"params_critical shape {params_critical.shape}")
+        
+        # Compute weighted token interactions in a vectorized way
+        x_critical = x.unsqueeze(1) * critical_visual_tokens.unsqueeze(2) * attn_critical_weights.unsqueeze(-1) * params_critical
+        x_trivial = x.unsqueeze(1) * trivial_visual_tokens.unsqueeze(2) * attn_trivial_weights.unsqueeze(-1) * params_trivial
+        
+        # Reduce across the token dimension
+        x_critical = x_critical.sum(dim=1)  # Sum over num_vis_tokens
+        x_trivial = x_trivial.sum(dim=1)
+
+        return self.norm2(x_critical + x_trivial)  # Combine the contributions
 
 class FinalLayer(nn.Module):
     """
@@ -1055,6 +1185,8 @@ class SiT(nn.Module):
         self.y_logits_embedder_in = nn.Linear(num_classes, hidden_size)
         self.y_logits_embedder_out = nn.Linear(hidden_size, num_classes)
         self.ffn = FFN(hidden_size, hidden_size*4)
+        self.ffn_vit_output = FFN_for_SiT(1024, hidden_size*4, hidden_size)
+        self.norm_vit_output = nn.LayerNorm(hidden_size)
         self.norm = nn.LayerNorm(hidden_size)
         self.explicd_sigma = torch.nn.Parameter(torch.ones(1))
         self.explicd_attn_sigma = torch.nn.Parameter(torch.ones(1))
@@ -1144,14 +1276,15 @@ class SiT(nn.Module):
                 explicid_imgs_noisy_input=None,
                 critical_mask = None, 
                 trivial_mask = None,
-                patchifyer_model=None):
+                patchifyer_model=None,
+                highlight_the_critical_mask=False):
         """
         Forward pass of SiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-        x=patchifyer_model.patchify_the_latent(x)
+        #x=patchifyer_model.patchify_the_latent(x)
         x_pure = patchifyer_model.patchify_the_latent(x_pure)
         # 
         # return samples
@@ -1165,9 +1298,7 @@ class SiT(nn.Module):
         #x_pure = self.patchifyer_model.patchify_the_latent(x_pure)
         #print(f"self.pos_embed shape {self.pos_embed.shape}")
         #print(f"x shape patchified {x.shape}")
-        N, T, D = x.shape
-        critical_mask =critical_mask.view(N, T, 1)
-        trivial_mask = 1 - critical_mask.view(N, T, 1)
+        #trivial_mask = 1 - critical_mask.view(N, T, 1)
 
         #mask = critical_mask >= 0.8
         #mask = mask.expand(-1, -1, D)
@@ -1181,33 +1312,36 @@ class SiT(nn.Module):
         #critical_mask = torch.sigmoid(critical_mask)
         #critical_mask = (critical_mask > 0.5).float()
         #x_pure_unflattened = x_pure.view(N, H, W, D)  # Shape: (B, 16, 16, 768)
-        crticial_patches = (torch.zeros_like(x) * critical_mask.view(N, T, 1))  # Shape: (B, 1024, 16, 16)
-        trivial_patches = (x * (1-critical_mask).view(N, T, 1))
+        #crticial_patches = (torch.zeros_like(x) * critical_mask.view(N, T, 1))  # Shape: (B, 1024, 16, 16)
+        #trivial_patches = (x * (1-critical_mask).view(N, T, 1))
         # ######################################################## Option denoise only critical
-        x = crticial_patches+trivial_patches
-        x = x*(torch.ones_like(x)-critical_mask.view(N, T, 1))
-        let_see_x=patchifyer_model.unpatchify_the_latent(x)
+        #x = crticial_patches+trivial_patches
+        #x = x*(torch.ones_like(x)-critical_mask.view(N, T, 1)) + torch.rand_like(x)*critical_mask.view(N, T, 1)
+        #x=torch.rand_like(x)
+        #let_see_x=patchifyer_model.unpatchify_the_latent(x)
         #print(f"x shape {x.shape}")
 
-        _, attn_between_patches = self.cross_attn_between_patches(
-            query=x_pure,
-            key=crticial_patches,
-            value=crticial_patches,  
-        )
+        # _, attn_between_patches = self.cross_attn_between_patches(
+        #     query=x_pure,
+        #     key=crticial_patches,
+        #     value=crticial_patches,  
+        # )
 
-        _, attn_in_patches = self.cross_attn_in_patches(
-            query=crticial_patches,
-            key=crticial_patches,
-            value=crticial_patches,  
-        )
+        # _, attn_in_patches = self.cross_attn_in_patches(
+        #     query=crticial_patches,
+        #     key=crticial_patches,
+        #     value=crticial_patches,  
+        # )
 
-        uniform_attention = torch.full_like(attn_in_patches, 1 / T)*critical_mask.view(N, T, 1)  # Ideal uniform distribution
-        inside_attn_loss = torch.nn.functional.mse_loss(attn_in_patches*critical_mask.view(N, T, 1), uniform_attention)
+        # uniform_attention = torch.full_like(attn_in_patches, 1 / T)*critical_mask.view(N, T, 1)  # Ideal uniform distribution
+        # inside_attn_loss = torch.nn.functional.mse_loss(attn_in_patches*critical_mask.view(N, T, 1), uniform_attention)
 
-        outside_attention = attn_between_patches * (1 - critical_mask.view(N, T, 1))  # Masked attention outside critical areas
-        outside_attention_loss = outside_attention.mean()
+        # outside_attention = attn_between_patches * (1 - critical_mask.view(N, T, 1))  # Masked attention outside critical areas
+        # outside_attention_loss = outside_attention.mean()
 
-        attn_map_loss_sit_total=(outside_attention_loss/critical_mask.sum(dim=(-2,-1))).mean() + (inside_attn_loss*critical_mask.sum(dim=(-2,-1))).mean()
+        # attn_map_loss_sit_total=outside_attention_loss+ inside_attn_loss
+        #attn_map_loss_sit_total=(outside_attention_loss/critical_mask.sum(dim=(-2,-1))).mean() + (inside_attn_loss*critical_mask.sum(dim=(-2,-1))).mean()
+        #attn_map_loss_sit_total+=1- critical_mask.sum(dim=(-2,-1)).mean()/256
         ######################################################## Option denoise everything
         #x=x
         ########################################################
@@ -1222,12 +1356,21 @@ class SiT(nn.Module):
         #combined_embeddings_try = torch.cat((x, image_embeddings), dim=1)
         #attn_map_loss_sit_total=torch.tensor(0.0, device=x.device)
         #vit_l_output_for_denoising = vit_l_output.clone().detach()
+        x = self.norm_vit_output(self.ffn_vit_output(vit_l_output))
+        x = torch.rand_like(x)
+        N, T, D = x.shape
+        H = W = int(T ** 0.5)
+        critical_mask =critical_mask.view(N, T, 1)
+        #x = vit_l_output*(1-critical_mask.view(N, T, 1)) + 0.001*torch.rand_like(vit_l_output)*critical_mask.view(N, T, 1)
+        loss_fn = SpatialAwarePatchAttentionLoss()
+
+        #x = vit_l_output
         for i, block in enumerate(self.blocks):
             #combined_embeddings_try, attn_map_loss= block(combined_embeddings_try, c_concepts, attn_critical_weights, attn_trivial_weights)
             #x, attn_map_loss, vit_l_output, image_embeddings , longer_visual_tokens, explicid_imgs_sit_denoised = block(x, vit_l_output, image_embeddings, longer_visual_tokens, attn_critical_weights, attn_trivial_weights)
             #x, attn_map_loss_current = block(x,  image_embeddings, attn_critical_weights, attn_trivial_weights, c) # option 3
             #combined_embeddings_try, attn_map_loss_current = block(combined_embeddings_try,  image_embeddings, attn_critical_weights, attn_trivial_weights, c) # option 4
-            x = block(x,  longer_visual_tokens, critical_mask) # option 4
+            x = block(x, longer_visual_tokens, critical_mask, attn_critical_weights, attn_trivial_weights) # option 4
             ########################################### Option don't change x
             #x, attn_map_loss_current = block(x, longer_visual_tokens, critical_mask, vit_l_output, c)
             ###########################################
@@ -1242,10 +1385,17 @@ class SiT(nn.Module):
         # x_pure = self.unpatchify(self.final_layer(x)) 
         # x = self.final_layer(x)
         # x = self.unpatchify(x)                   # (N, out_channels, H, W)
+        attn_map_loss_sit_total = loss_fn(x.view(N, D, H, W), attn_critical_weights, attn_trivial_weights)
 
-        #x = self.patchifyer_model.unpatchify_the_latent(x)
+
+
+        if highlight_the_critical_mask:
+            x_critical_removed = x_pure*(torch.ones_like(x_pure)-critical_mask.view(N, T, 1)) + 0.001*torch.rand_like(x_pure)*critical_mask.view(N, T, 1)
+            x_critical_removed = patchifyer_model.unpatchify_the_latent(x_critical_removed)
+        #attn_map_loss_sit_total = loss_fn(x.view(N, H, W, D).permute(0, 3, 1, 2), critical_mask)
+        #x = patchifyer_model.unpatchify_the_latent(x)
         #x_pure = self.patchifyer_model.unpatchify_the_latent(x_pure)
-        x=patchifyer_model.unpatchify_the_latent(x)
+        #x=patchifyer_model.unpatchify_the_latent(x)
         x_pure=patchifyer_model.unpatchify_the_latent(x_pure)
         
         
@@ -1259,7 +1409,10 @@ class SiT(nn.Module):
         }
 
         # y_predicted_logits = self.y_logits_embedder_out(combined_embeddings_try[:,-1:,:]) 
-        return let_see_x, x_pure, zs, attn_map_loss_sit_total, sigmas_for_losses
+        if highlight_the_critical_mask:
+            return x, x_pure, x_pure, x_critical_removed
+        else:
+            return x, x_pure, x_pure, zs, attn_map_loss_sit_total, sigmas_for_losses
 
 ########################################################################################
 ########################################################################################
@@ -1489,7 +1642,7 @@ def SiT_L_8(**kwargs):
     return SiT(depth=24, hidden_size=1024, decoder_hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
 
 def SiT_B_2(**kwargs):
-    return SiT(depth=12, hidden_size=768, decoder_hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+    return SiT(depth=12, hidden_size=588, decoder_hidden_size=768, patch_size=2, num_heads=12, **kwargs)
 
 def SiT_B_4(**kwargs):
     return SiT(depth=12, hidden_size=768, decoder_hidden_size=768, patch_size=4, num_heads=12, **kwargs)

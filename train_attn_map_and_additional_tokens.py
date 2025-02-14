@@ -43,8 +43,8 @@ import timm
 from optparse import OptionParser
 from torchvision import transforms
 from Explicd.dataset.isic_dataset import SkinDataset
-from Explicd.model import ExpLICD_ViT_L, ExpLICD, ExpLICD_ViT_L_Multiple_Prompts, ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens, PatchSelectorCNNConscise
-from Explicd.concept_dataset import explicid_isic_dict, explicid_isic_dict_mine, explicid_idrid_dict, explicid_idrid_edema_dict, explicid_busi_dict, explicid_busi_soft_smooth_dict
+from Explicd.model import ExpLICD_ViT_L, ExpLICD, ExpLICD_ViT_L_Multiple_Prompts, ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens, PatchSelectorCNNConscise, ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_SuperPixels
+from Explicd.concept_dataset import explicid_isic_dict, explicid_isic_dict_mine, explicid_idrid_dict, explicid_idrid_edema_dict, explicid_busi_dict, explicid_busi_soft_smooth_dict, explicid_isic_minimal_dict
 import Explicd.utils as utils
 from sklearn.metrics import f1_score
 import random
@@ -70,6 +70,16 @@ CONCEPT_LABEL_MAP_ISIC = [
             [0, 0, 0, 0, 0, 0, 0], # MEL
             [1, 1, 1, 1, 1, 1, 0], # NV
             [6, 3, 1, 6, 1, 2, 0], # VASC
+        ]
+
+CONCEPT_LABEL_MAP_ISIC_MINIMAL = [
+            [0, 0, 0, 0, 0, 0, 0], # AKIEC
+            [1, 1, 1, 1, 1, 1, 1], # BCC
+            [2, 2, 2, 2, 2, 2, 2], # BKL
+            [3, 3, 3, 3, 3, 3, 3], # DF
+            [4, 4, 4, 4, 4, 4, 4], # MEL
+            [5, 5, 5, 5, 5, 5, 5], # NV
+            [6, 6, 6, 6, 6, 6, 6], # VASC
         ]
 
 CONCEPT_LABEL_MAP_ISIC_MINE = [
@@ -134,6 +144,7 @@ CONCEPT_LABEL_MAP_BUSI_SOFT_SMOOTH = [
 CONCEPT_LABEL_MAP_DICT = {
     'ISIC': CONCEPT_LABEL_MAP_ISIC,
     'ISIC_MINE': CONCEPT_LABEL_MAP_ISIC_MINE,
+    'ISIC_MINIMAL':CONCEPT_LABEL_MAP_ISIC_MINIMAL,
 
     'IDRID': CONCEPT_LABEL_MAP_IDRID,
     'IDRID_EDEMA': CONCEPT_LABEL_MAP_IDRID_EDEMA,
@@ -143,13 +154,14 @@ CONCEPT_LABEL_MAP_DICT = {
     
 }
 
-LIST_OF_TASKS = ['ISIC', 'ISIC_MINE','IDRID', 'IDRID_EDEMA', 'BUSI', 'BUSI_SOFT']
+LIST_OF_TASKS = ['ISIC', 'ISIC_MINE', 'ISIC_MINIMAL', 'IDRID', 'IDRID_EDEMA', 'BUSI', 'BUSI_SOFT']
 
-TASK='ISIC'
+TASK='ISIC_MINIMAL'
 
 NUM_OF_CLASSES= {
     'ISIC': 7,
     'ISIC_MINE':7,
+    'ISIC_MINIMAL':7,
 
     'IDRID': 5,
     'IDRID_EDEMA':3,
@@ -161,6 +173,7 @@ NUM_OF_CLASSES= {
 CONCEPTS= {
     'ISIC': explicid_isic_dict,
     'ISIC_MINE': explicid_isic_dict_mine,
+    'ISIC_MINIMAL':explicid_isic_minimal_dict,
 
     'IDRID': explicid_idrid_dict,
     'IDRID_EDEMA': explicid_idrid_edema_dict,
@@ -173,7 +186,7 @@ CONCEPT_HARDNESS_LIST_OPTIONS=["hard","soft_equal","soft_smarter"]
 DO_MUDDLE_CHECK=False
 ADD_GAUSSIAN_NOISE=False
 DO_LOGITS_SIMILARITY=False
-CONCEPT_HARDNESS="soft_equal"
+CONCEPT_HARDNESS="hard"
 DO_CONTR_LOSS = False
 noise_levels = [0, 5, 10, 15, 20]
 
@@ -236,6 +249,7 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0):
         sit_model.zero_grad(set_to_none=True)
 
     exp_pred_list = np.zeros((0), dtype=np.uint8)
+    exp_cnn_critical_pred_list = np.zeros((0), dtype=np.uint8)
     gt_list = np.zeros((0), dtype=np.uint8)
 
     agg_visual_tokens_list=[]
@@ -247,12 +261,14 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0):
             labels = y
 
             imgs_for_explicid=prepare__imgs_for_explicid(raw_image, exp_val_transforms).to("cuda")
-            cls_logits, _, _, _, agg_visual_tokens, _, _, _, _, _, agg_critical_visual_tokens, agg_trivial_visual_tokens, _, _, _= explicd(imgs_for_explicid)
+            patches, patches_colored, cls_logits, cls_minimal_logits, _, _, agg_visual_tokens, _, _, _, _, _, _, agg_critical_visual_tokens, agg_trivial_visual_tokens, cnn_logits_critical, _, _, _= explicd(imgs_for_explicid)
             longer_visual_tokens = torch.cat([agg_critical_visual_tokens, agg_trivial_visual_tokens], dim=1)
             agg_visual_tokens_list.append(longer_visual_tokens)
 
-            _, exp_label_pred = torch.max(cls_logits, dim=1)
+            _, exp_label_pred = torch.max(cls_minimal_logits, dim=1)
+            _, exp_cnn_critical_label = torch.max(cnn_logits_critical, dim=1)
             exp_pred_list = np.concatenate((exp_pred_list, exp_label_pred.cpu().numpy().astype(np.uint8)), axis=0)
+            exp_cnn_critical_pred_list = np.concatenate((exp_cnn_critical_pred_list, exp_cnn_critical_label.cpu().numpy().astype(np.uint8)), axis=0)
             gt_list = np.concatenate((gt_list, labels.cpu().numpy().astype(np.uint8)), axis=0)
         
 
@@ -260,11 +276,13 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0):
         exp_correct = np.sum(gt_list == exp_pred_list)
         exp_acc = 100 * exp_correct / len(exp_pred_list)
         exp_val_f1 = f1_score(gt_list, exp_pred_list, average='macro')
+        exp_cnn_critical_val_f1 = f1_score(gt_list, exp_cnn_critical_pred_list, average='macro')
 
         expl_scores={
             "BMAC":exp_BMAC,
             "f1":exp_val_f1,
-            "Acc":exp_acc
+            "Acc":exp_acc,
+            "cnn critical f1": exp_cnn_critical_val_f1
         }
 
         tokens_and_gt={
@@ -326,8 +344,11 @@ class DualGaussianNoise:
 
 
 def preprocess_raw_image(x, enc_type):
+    resolution = x.shape[-1]
     if 'clip' in enc_type:
+        #print("clip frozen encoder is used")
         x = x / 255.
+        ##x = torch.nn.functional.interpolate(x, 224 * (resolution // 256), mode='bicubic')
         x = torch.nn.functional.interpolate(x, 224, mode='bicubic')
         x = Normalize(CLIP_DEFAULT_MEAN, CLIP_DEFAULT_STD)(x)
     elif 'mocov3' in enc_type or 'mae' in enc_type:
@@ -403,6 +424,27 @@ def requires_grad(model, flag=True):
     for p in model.parameters():
         p.requires_grad = flag
 
+def patches_to_images(patches, patch_size=14):
+    """
+    Splits an image (3, 224, 224) into patches of size (256, D), where D = 14*14*3.
+    
+    Args:
+        image (torch.Tensor): Input image tensor of shape (3, 224, 224).
+        patch_size (int): Size of each patch along one dimension.
+
+    Returns:
+        torch.Tensor: Tensor of shape (256, D) where D = patch_size * patch_size * 3.
+    """
+    # Ensure image is a tensor with shape (B, 3, 224, 224)
+    B, num_patches, D = patches.shape
+    image_size = int(num_patches ** 0.5)*patch_size
+    grid_size = image_size//patch_size
+
+    patches = patches.view(B, num_patches, 3, patch_size, patch_size)
+    patches = patches.view(B, grid_size, grid_size, 3, patch_size, patch_size)
+    patches = patches.permute(0, 3, 1, 4, 2, 5)
+    images = patches.contiguous().view(B, 3, image_size, image_size)
+    return images
 
 #################################################################################
 #                                  Training Loop                                #
@@ -488,6 +530,7 @@ def main(args):
         vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-mse").to(device)
         requires_grad(ema, False)
 
+    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-mse").to(device)
     concept_list = CONCEPTS[TASK]
     conf = argparse.Namespace()
     conf.num_class = NUM_OF_CLASSES[TASK]
@@ -498,10 +541,11 @@ def main(args):
     conf.flag = 2
     conf.do_logits_similarity=DO_LOGITS_SIMILARITY
 
-    explicid = ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
-    explicid.load_state_dict(torch.load("checkoints_fr_val_score_based/ISIC/Explicd_only/Explicd_additional_tokens_for_sit_starter_better.pt")["explicid"])
-    explicid.cnn = PatchSelectorCNNConscise()
-    explicid.load_state_dict(torch.load("checkoints_fr_val_score_based/ISIC/Explicd_only/Explicd_additional_tokens_for_sit_starter_refined_further_maybe.pt")["explicid"])
+    #explicid = ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
+    explicid = ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_SuperPixels(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
+    #explicid.load_state_dict(torch.load("checkoints_fr_val_score_based/ISIC/Explicd_only/Explicd_additional_tokens_for_sit_starter_better.pt")["explicid"])
+    #explicid.cnn = PatchSelectorCNNConscise()
+    #explicid.load_state_dict(torch.load("checkoints_fr_val_score_based/ISIC/Explicd_only/Explicd_additional_tokens_for_sit_starter_refined_further_maybe.pt")["explicid"])
 
     patchifyer_model = Patch_and_Unpatchifier(input_size=latent_size,
             num_classes=NUM_OF_CLASSES[TASK],
@@ -522,6 +566,7 @@ def main(args):
     explicid_train_transforms.transforms.insert(0, transforms.Resize(size=(224,224), interpolation=utils.get_interpolation_mode('bicubic'), max_size=None, antialias=True))    
     explicid_train_transforms.transforms.insert(0, transforms.ToPILImage())
 
+    explicid_train_transforms.transforms.pop(4)
     print("explicid_train_transforms ============",explicid_train_transforms)
 
     exp_val_transforms = copy.deepcopy(conf.preprocess)
@@ -530,7 +575,7 @@ def main(args):
     exp_val_transforms.transforms.insert(0, transforms.ToPILImage())
     exp_val_transforms.transforms.pop(1)
     exp_val_transforms.transforms.insert(1, transforms.Resize(size=(224,224), interpolation=utils.get_interpolation_mode('bicubic'), max_size=None, antialias=True))
-
+    exp_val_transforms.transforms.pop(4)
     print("exp_val_transforms ============",exp_val_transforms)
     
 
@@ -578,7 +623,7 @@ def main(args):
     ])
 
 
-    if TASK=='ISIC' or TASK=='ISIC_MINE':
+    if TASK=='ISIC' or TASK=='ISIC_MINE' or TASK=='ISIC_MINIMAL':
         if DO_MUDDLE_CHECK:
             train_dataset = CustomDataset(args.data_dir, transform= dual_transform, mode='test')
             val_dataset = CustomDataset(args.data_dir, transform= dual_val_transform, mode='val')
@@ -642,7 +687,7 @@ def main(args):
     test_dataloader = DataLoader(
         test_dataset,
         batch_size=local_batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=False
@@ -668,6 +713,7 @@ def main(args):
         print(f"ckpt_name {ckpt_name}")
         if args.explicd_only==0:
             checkpoint_resume_locations=f"{checkpoint_dir_step_based}/SiT/{ckpt_name}"
+            checkpoint_resume_locations= "checkpoints_fr/ISIC/SiT/hilimsya.pt"
         else:
             checkpoint_resume_locations=f"{checkpoint_dir_step_based}/Explicd_only/{ckpt_name}"
         print(f'loading checkpointed from {checkpoint_resume_locations}')
@@ -715,7 +761,7 @@ def main(args):
     )
 
     # Labels to condition the model with (feel free to change):
-    sample_batch_size = 64 // accelerator.num_processes
+    sample_batch_size = 16 // accelerator.num_processes
     (_, gt_xs), _ = next(iter(val_dataloader))
     gt_xs = gt_xs[:sample_batch_size]
     gt_xs = sample_posterior(
@@ -726,9 +772,11 @@ def main(args):
     # Create sampling noise:
     n = ys.size(0)
     xT = torch.randn((n, 4, latent_size, latent_size), device=device)
-    max_exp_val_f1=0  
+    max_exp_val_f1=0
+    max_exp_cnn_critical_val_f1=100
     curve_of_f1 = []
     curve_of_BMAC = []
+    val_score_deserves_sampling = False
     if args.explicd_only==1:
         print("explicd only")
         optimizer.eval()
@@ -744,8 +792,8 @@ def main(args):
         optimizer.zero_grad(set_to_none=True)
         explicid.eval()
         model.eval()
-        expl_scores, _= validation(explicid, model, test_dataloader, exp_val_transforms, explicd_only=1)
-        print('BMAC: %.5f, f1: %.5f'%(expl_scores["BMAC"], expl_scores["f1"]))
+        #expl_scores, _= validation(explicid, model, test_dataloader, exp_val_transforms, explicd_only=1)
+        #print('BMAC: %.5f, f1: %.5f'%(expl_scores["BMAC"], expl_scores["f1"]))
         optimizer.train()
         explicid.train()
         model.train()
@@ -760,97 +808,104 @@ def main(args):
         #     # Selected elements to be stored
         #     imgs_for_sampling = []
         #     imgs_normalized_for_vae = []
+        #     labels_for_sampling = []
         #     # Iterate over the dataset and labels
         #     for img, _ , lab in test_dataset:
         #         img_normalized_for_vae =  img.to(torch.float32) / 127.5 - 1
         #         imgs_for_sampling.append(img)
         #         imgs_normalized_for_vae.append(img_normalized_for_vae)
+        #         labels_for_sampling.append(lab)
         #         if len(imgs_for_sampling) == sample_batch_size:
         #             break
         #     latent=vae.encode(torch.stack(imgs_normalized_for_vae, dim=0).to(device))["latent_dist"].mean
         #     #latents_patchified=patchifyer_model(latent)
         #     imgs_for_explicid=prepare__imgs_for_explicid(imgs_for_sampling, exp_val_transforms).to(device)
-        #     cls_logits, _, _, _, agg_visual_tokens, _, _, attn_criticial_weights, attn_trivial_weights, vit_l_output, agg_critical_visual_tokens, agg_trivial_visual_tokens, _, critical_mask, trivial_mask  = explicid(imgs_for_explicid)
+        #     cls_logits, _, _, _, agg_visual_tokens, _, _, _,  attn_criticial_weights, attn_trivial_weights, vit_l_output, agg_critical_visual_tokens, agg_trivial_visual_tokens, _, _ , critical_mask, trivial_mask  = explicid(imgs_for_explicid)
         #     longer_visual_tokens = torch.cat([agg_critical_visual_tokens, agg_trivial_visual_tokens], dim=1)
-        #     samples = euler_sampler(
-        #         model, 
-        #         xT, 
-        #         ys,
-        #         agg_visual_tokens,
-        #         cls_logits,
-        #         num_steps=50, 
-        #         cfg_scale=0.0,
-        #         guidance_low=0.,
-        #         guidance_high=1.,
-        #         path_type=args.path_type,
-        #         heun=False,
-        #         attn_critical_weights=attn_criticial_weights, 
-        #         attn_trivial_weights=attn_trivial_weights,
-        #         longer_visual_tokens = longer_visual_tokens,
-        #         vit_l_output=vit_l_output,
-        #         critical_mask=critical_mask, 
-        #         trivial_mask=trivial_mask,
-        #         patchifyer_model=patchifyer_model
-        #     ).to(torch.float32)
-        #     recon_samples = vae.decode(samples)["sample"]
-        #     recon_samples = (recon_samples + 1) / 2.
+            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Down
+            # samples = euler_sampler(
+            #     model, 
+            #     xT, 
+            #     labels_for_sampling,
+            #     agg_visual_tokens,
+            #     cls_logits,
+            #     num_steps=50, 
+            #     cfg_scale=0.0,
+            #     guidance_low=0.,
+            #     guidance_high=1.,
+            #     path_type=args.path_type,
+            #     heun=False,
+            #     attn_critical_weights=attn_criticial_weights, 
+            #     attn_trivial_weights=attn_trivial_weights,
+            #     longer_visual_tokens = longer_visual_tokens,
+            #     vit_l_output=vit_l_output,
+            #     critical_mask=critical_mask, 
+            #     trivial_mask=trivial_mask,
+            #     patchifyer_model=patchifyer_model
+            # ).to(torch.float32)
+            # recon_samples = vae.decode(samples)["sample"]
+            # recon_samples = (recon_samples + 1) / 2.
+            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!  Above
 
-        #     gt_samples = vae.decode(latent)["sample"]
-        #     gt_samples = (gt_samples + 1) / 2.
+            # gt_samples = vae.decode(latent)["sample"]
+            # gt_samples = (gt_samples + 1) / 2.
+            # gt_samples = accelerator.gather(gt_samples.to(torch.float32))
             
-        #     # gt_from_patchifier = vae.decode(latents_patchified)["sample"]
-        #     # gt_from_patchifier = (gt_from_patchifier + 1) / 2.
-
-        #     out_samples_pure = accelerator.gather(recon_samples.to(torch.float32))
-        #     gt_samples = accelerator.gather(gt_samples.to(torch.float32))
-        #     gt_from_patchifier = accelerator.gather(gt_from_patchifier.to(torch.float32))
-        #     ################################################################################ Option Tampering with tokens
-        #     # samples_tampered_list=[]
-        #     # for i in range(8):
-        #     #     if i==0:
-        #     #         longer_visual_tokens_tampered=longer_visual_tokens
-        #     #     else:
-        #     #         longer_visual_tokens_tampered=longer_visual_tokens[:,i-1,:]=0
-        #     #     samples_tampered = euler_sampler(
-        #     #         model, 
-        #     #         xT, 
-        #     #         ys,
-        #     #         agg_visual_tokens,
-        #     #         cls_logits,
-        #     #         num_steps=50, 
-        #     #         cfg_scale=4.0,
-        #     #         guidance_low=0.,
-        #     #         guidance_high=1.,
-        #     #         path_type=args.path_type,
-        #     #         heun=False,
-        #     #         attn_critical_weights=attn_criticial_weights, 
-        #     #         attn_trivial_weights=attn_trivial_weights,
-        #     #         longer_visual_tokens = longer_visual_tokens_tampered,
-        #     #         vit_l_output=vit_l_output,
-        #     #         critical_mask=critical_mask, 
-        #     #         trivial_mask=trivial_mask,
-        #     #         patchifyer_model=patchifyer_model
-        #     #     ).to(torch.float32)
-        #     #     samples_tampered = vae.decode((samples_tampered -  latents_bias) / latents_scale).sample
-        #     #     samples_tampered = (samples_tampered + 1) / 2.
+            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!  Down
+            # gt_from_patchifier = vae.decode(latents_patchified)["sample"]
+            # gt_from_patchifier = (gt_from_patchifier + 1) / 2.
+            # out_samples_pure = accelerator.gather(recon_samples.to(torch.float32))
+             # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!  Above
+            #gt_from_patchifier = accelerator.gather(gt_from_patchifier.to(torch.float32))
+            ################################################################################ Option Tampering with tokens
+            # samples_tampered_list=[]
+            # for i in range(8):
+            #     if i==0:
+            #         longer_visual_tokens_tampered=longer_visual_tokens
+            #     else:
+            #         longer_visual_tokens_tampered=longer_visual_tokens
+            #         longer_visual_tokens_tampered[:,i-1,:]=0
+            #     samples_tampered, _, samples_critical_removed = euler_sampler(
+            #         model, 
+            #         xT, 
+            #         torch.stack(labels_for_sampling, dim=0).to(device),
+            #         agg_visual_tokens,
+            #         cls_logits,
+            #         num_steps=50, 
+            #         cfg_scale=0.0,
+            #         guidance_low=0.,
+            #         guidance_high=1.,
+            #         path_type=args.path_type,
+            #         heun=False,
+            #         attn_critical_weights=attn_criticial_weights, 
+            #         attn_trivial_weights=attn_trivial_weights,
+            #         longer_visual_tokens = longer_visual_tokens_tampered,
+            #         vit_l_output=vit_l_output,
+            #         critical_mask=critical_mask, 
+            #         trivial_mask=trivial_mask,
+            #         patchifyer_model=patchifyer_model,
+            #         highlight_the_critical_mask=True
+            #     )
+            #     samples_tampered = vae.decode((samples_tampered -  latents_bias) / latents_scale).sample
+            #     samples_tampered = (samples_tampered + 1) / 2.
                 
-        #     #     out_samples_tampered = accelerator.gather(samples_tampered.to(torch.float32))
-        #     #     samples_tampered_list.append(out_samples_tampered)
+            #     out_samples_tampered = accelerator.gather(samples_tampered.to(torch.float32))
+            #     samples_tampered_list.append(out_samples_tampered)
 
-        #     # accelerator.log({f"samples_untouched": wandb.Image(array2grid(samples_tampered_list[0])),
-        #     #             "gt_samples": wandb.Image(array2grid(gt_samples)),
-        #     #             f"samples first zeroed out": wandb.Image(array2grid(samples_tampered_list[1])),
-        #     #             f"samples second zeroed out": wandb.Image(array2grid(samples_tampered_list[2])),
-        #     #             f"samples third zeroed out": wandb.Image(array2grid(samples_tampered_list[3])),
-        #     #             f"samples fourth zeroed out": wandb.Image(array2grid(samples_tampered_list[4])),
-        #     #             f"samples fifth zeroed out": wandb.Image(array2grid(samples_tampered_list[5])),
-        #     #             f"samples sixth zeroed out": wandb.Image(array2grid(samples_tampered_list[6])),
-        #     #             f"samples seventh zeroed out": wandb.Image(array2grid(samples_tampered_list[7]))
-        #     #             })
-        #     # logging.info("Generating EMA samples done.")
-        #     # return
+            # accelerator.log({f"samples_untouched": wandb.Image(array2grid(samples_tampered_list[0])),
+            #             "gt_samples": wandb.Image(array2grid(gt_samples)),
+            #             f"samples first zeroed out": wandb.Image(array2grid(samples_tampered_list[1])),
+            #             f"samples second zeroed out": wandb.Image(array2grid(samples_tampered_list[2])),
+            #             f"samples third zeroed out": wandb.Image(array2grid(samples_tampered_list[3])),
+            #             f"samples fourth zeroed out": wandb.Image(array2grid(samples_tampered_list[4])),
+            #             f"samples fifth zeroed out": wandb.Image(array2grid(samples_tampered_list[5])),
+            #             f"samples sixth zeroed out": wandb.Image(array2grid(samples_tampered_list[6])),
+            #             f"samples seventh zeroed out": wandb.Image(array2grid(samples_tampered_list[7]))
+            #             })
+            # logging.info("Generating EMA samples done.")
+            # return
         #     ################################################################################
-        
+        # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!  Down
         # accelerator.log({"samples_pure": wandb.Image(array2grid(out_samples_pure)),
         #                     "gt_samples": wandb.Image(array2grid(gt_samples)),
         #                     #"gt_from_patchifier": wandb.Image(array2grid(gt_from_patchifier))
@@ -858,6 +913,7 @@ def main(args):
         
         # logging.info("Generating EMA samples done.")
         # return
+        # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!  Above
         ##############################################################################################################
         if args.explicd_only==0:
             model.train()
@@ -926,16 +982,27 @@ def main(args):
                         list_of_images.append(color_jitter_transform(imgs_for_explicid))
                         list_of_images.append(blur_transform(imgs_for_explicid))
 
-                    processing_loss, loss, proj_loss, explicid_loss, _, logits_similarity_loss, _, _, _, _, _, _, attn_explicd_loss, attn_map_loss_sit_total, _, cnn_loss_cls= loss_fn(model, latent, latent, model_kwargs, zs=zs, 
+                    processing_loss, loss, proj_loss, explicid_loss, loss_cls, logits_similarity_loss, _, _, _, _, _, _, attn_explicd_loss, attn_map_loss_sit_total, _, cnn_loss_cls= loss_fn(model, latent, latent, model_kwargs, zs=zs, 
                                                                         labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch,  explicd_only=0, do_sit=True, do_pretraining_the_patchifyer=False, patchifyer_model=patchifyer_model)
                     processing_loss_mean = processing_loss.mean()
                     loss_mean = loss.mean()
                     proj_loss_mean = proj_loss.mean()* args.proj_coeff
-                    explicid_loss_mean = explicid_loss.mean() *2
-                    logits_similarity_loss_mean= logits_similarity_loss.mean()
+                    explicid_loss_mean = explicid_loss.mean()
+                    #explicid_loss_mean = loss_cls.mean()
+                    #print("train logits_similarity_loss ", logits_similarity_loss)
+                    logits_similarity_loss_mean= 0*logits_similarity_loss.mean()
                     attn_explicd_loss_mean = attn_explicd_loss.mean()
                     attn_map_loss_sit_total_mean = attn_map_loss_sit_total.mean()
-                    cnn_loss_cls_mean = cnn_loss_cls.mean()
+                    cnn_loss_cls_mean = 0*cnn_loss_cls.mean()
+
+                    if explicid_loss_mean>0.3:
+                        loss_mean*=0
+                        attn_explicd_loss_mean*=0
+                        attn_map_loss_sit_total_mean*=0
+
+                    if attn_explicd_loss_mean>0.3:
+                        loss_mean*=0
+                        attn_map_loss_sit_total_mean*=0
 
                     total_loss_magnitude = processing_loss_mean+loss_mean + proj_loss_mean  + explicid_loss_mean + logits_similarity_loss_mean+attn_explicd_loss_mean+attn_map_loss_sit_total_mean+cnn_loss_cls_mean
 
@@ -953,7 +1020,10 @@ def main(args):
                                 + (cnn_loss_weight*cnn_loss_cls_mean)) 
 
                     ## optimization
-                    accelerator.backward(total_loss)
+                    ######################################## Option simple summation of losses
+                    accelerator.backward(total_loss_magnitude)
+                    ######################################## Option use adaptive loss
+                    #accelerator.backward(total_loss)
                     if accelerator.sync_gradients:
                         #params_to_clip = model.parameters()
                         grad_norm = accelerator.clip_grad_norm_(list(explicid.parameters()) + list(model.parameters()), args.max_grad_norm)
@@ -973,7 +1043,7 @@ def main(args):
                         list_of_images.append(color_jitter_transform(imgs_for_explicid))
                         list_of_images.append(blur_transform(imgs_for_explicid))
 
-                    _, _, _, explicid_loss, _, logits_similarity_loss, _, _, _, _, attn_explicd_loss, _, _, cnn_loss_cls = loss_fn(None, x, model_kwargs, zs=zs, 
+                    patches, patches_colored, _, _, _, explicid_loss, _, logits_similarity_loss, _, _, _, _, attn_explicd_loss, _, _, cnn_loss_cls = loss_fn(None, x, model_kwargs, zs=zs, 
                                                                         labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch, explicd_only=1)
 
                     explicid_loss_mean = explicid_loss.mean()
@@ -1004,30 +1074,62 @@ def main(args):
                         torch.save(checkpoint, checkpoint_path)
                         logger.info(f"Saved checkpoint to {checkpoint_path}")
 
-            if (global_step == 1 or (global_step % args.sampling_steps == 0 and global_step > 0)) and args.explicd_only==0:
+            if (global_step == 1 or (global_step % args.sampling_steps == 0 and global_step > 0)) and args.explicd_only==0 or val_score_deserves_sampling==True:
                 from samplers import euler_sampler
                 with torch.no_grad():
                     # Selected elements to be stored
                     imgs_for_sampling = []
                     imgs_normalized_for_vae = []
+                    labels_for_sampling = []
                     # Iterate over the dataset and labels
                     for img, _ , lab in test_dataset:
                         img_normalized_for_vae =  img.to(torch.float32) / 127.5 - 1
                         imgs_for_sampling.append(img)
                         imgs_normalized_for_vae.append(img_normalized_for_vae)
+                        labels_for_sampling.append(lab)
                         if len(imgs_for_sampling) == sample_batch_size:
                             break
-
-                    latent_sampling=vae.encode(torch.stack(imgs_normalized_for_vae, dim=0).to(device))["latent_dist"].mean
+                    latent=vae.encode(torch.stack(imgs_normalized_for_vae, dim=0).to(device))["latent_dist"].mean
+                    #latents_patchified=patchifyer_model(latent)
                     imgs_for_explicid=prepare__imgs_for_explicid(imgs_for_sampling, exp_val_transforms).to(device)
-                    cls_logits, _, _, _, agg_visual_tokens, _, _, attn_criticial_weights, attn_trivial_weights, vit_l_output, agg_critical_visual_tokens, agg_trivial_visual_tokens, _, critical_mask, trivial_mask  = explicid(imgs_for_explicid)
+                    #print(imgs_for_explicid.shape)
+                    patches, patches_colored, cls_logits, cls_minimal_logits, _, _, agg_visual_tokens, _, _, _,  attn_criticial_weights, attn_trivial_weights, vit_l_output, agg_critical_visual_tokens, agg_trivial_visual_tokens, _, _ , critical_mask, trivial_mask  = explicid(imgs_for_explicid)
                     longer_visual_tokens = torch.cat([agg_critical_visual_tokens, agg_trivial_visual_tokens], dim=1)
-                    samples = euler_sampler(
+
+                    # num_patches=256
+                    # patch_size=14
+                    # image_size=224
+                    # grid_size = image_size//patch_size
+
+                    # patches = patches.view(sample_batch_size, num_patches, 3, patch_size, patch_size)
+                    # patches = patches.view(sample_batch_size, grid_size, grid_size, 3, patch_size, patch_size)
+                    # patches = patches.permute(0, 3, 1, 4, 2, 5)
+                    # patches = patches.contiguous().view(sample_batch_size, 3, image_size, image_size)
+
+                    images_from_patches = patches_to_images(patches, patch_size=14)
+                    images_from_patches = accelerator.gather(images_from_patches.to(torch.float32))
+
+                    images_from_patches_colored = patches_to_images(patches_colored, patch_size=14)
+                    images_from_patches_colored = accelerator.gather(images_from_patches_colored.to(torch.float32))
+
+                    gt_samples = vae.decode(latent)["sample"]
+                    gt_samples = (gt_samples + 1) / 2.
+                    gt_samples = accelerator.gather(gt_samples.to(torch.float32))
+                    ############################################################################### Option Tampering with tokens
+                    samples_tampered_list=[]
+                    patches_tampered_list=[]
+                    for i in range(8):
+                        if i==0:
+                            longer_visual_tokens_tampered=longer_visual_tokens
+                        else:
+                            longer_visual_tokens_tampered=longer_visual_tokens
+                            longer_visual_tokens_tampered[:,i-1,:]=0
+                        patches_output, samples_tampered, _, samples_critical_removed = euler_sampler(
                             model, 
-                            latent_sampling, 
-                            ys,
+                            xT, 
+                            torch.stack(labels_for_sampling, dim=0).to(device),
                             agg_visual_tokens,
-                            cls_logits,
+                            cls_minimal_logits,
                             num_steps=50, 
                             cfg_scale=0.0,
                             guidance_low=0.,
@@ -1036,22 +1138,57 @@ def main(args):
                             heun=False,
                             attn_critical_weights=attn_criticial_weights, 
                             attn_trivial_weights=attn_trivial_weights,
-                            longer_visual_tokens = longer_visual_tokens,
+                            longer_visual_tokens = longer_visual_tokens_tampered,
                             vit_l_output=vit_l_output,
                             critical_mask=critical_mask, 
                             trivial_mask=trivial_mask,
-                            patchifyer_model=patchifyer_model
-                        ).to(torch.float32)
-                    samples = vae.decode(samples)["sample"]
-                    samples = (samples + 1) / 2.
+                            patchifyer_model=patchifyer_model,
+                            highlight_the_critical_mask=True
+                        )
+                        # samples_tampered = vae.decode((samples_tampered -  latents_bias) / latents_scale).sample
+                        # samples_tampered = (samples_tampered + 1) / 2.
 
-                    gt_samples = vae.decode(latent)["sample"]
-                    gt_samples = (gt_samples + 1) / 2.
-                out_samples = accelerator.gather(samples.to(torch.float32))
-                gt_samples = accelerator.gather(gt_samples.to(torch.float32))
-                accelerator.log({"samples": wandb.Image(array2grid(out_samples)),
-                                 "gt_samples": wandb.Image(array2grid(gt_samples))})
-                logging.info("Generating EMA samples done.")
+                        # patches_output = patches_output.view(sample_batch_size, num_patches, 3, patch_size, patch_size)
+                        # patches_output = patches_output.view(sample_batch_size, grid_size, grid_size, 3, patch_size, patch_size)
+                        # patches_output = patches_output.permute(0, 3, 1, 4, 2, 5)
+                        # patches_output = patches_output.contiguous().view(sample_batch_size, 3, image_size, image_size)
+                        # patches_output = accelerator.gather(patches_output.to(torch.float32))
+                        
+                        out_samples_tampered = accelerator.gather(samples_tampered.to(torch.float32))
+                        samples_tampered_list.append(out_samples_tampered)
+
+                        out_images_from_patches_tampered = patches_to_images(patches_output, patch_size=14)
+                        patches_tampered_list.append(accelerator.gather(out_images_from_patches_tampered.to(torch.float32)))
+
+                        # out_patches_tampered = accelerator.gather(patches_output.to(torch.float32))
+                        # patches_tampered_list.append(out_patches_tampered)
+
+
+
+                    accelerator.log({f"samples full package": wandb.Image(array2grid(samples_tampered_list[0])),
+                                "gt_samples": wandb.Image(array2grid(gt_samples)),
+                                f"patches full package": wandb.Image(array2grid(patches_tampered_list[0])),
+                                f"patches ground truth": wandb.Image(array2grid(images_from_patches)),
+                                f"patches colored": wandb.Image(array2grid(images_from_patches_colored)),
+                                f"patches first zeroed out": wandb.Image(array2grid(patches_tampered_list[1])),
+                                f"patches second zeroed out": wandb.Image(array2grid(patches_tampered_list[2])),
+                                f"patches third zeroed out": wandb.Image(array2grid(patches_tampered_list[3])),
+                                f"patches fourth zeroed out": wandb.Image(array2grid(patches_tampered_list[4])),
+                                f"patches fifth zeroed out": wandb.Image(array2grid(patches_tampered_list[5])),
+                                f"patches sixth zeroed out": wandb.Image(array2grid(patches_tampered_list[6])),
+                                f"patches seventh zeroed out": wandb.Image(array2grid(patches_tampered_list[7]))
+
+                                #f"samples first zeroed out": wandb.Image(array2grid(samples_tampered_list[1])),
+                                #f"samples second zeroed out": wandb.Image(array2grid(samples_tampered_list[2])),
+                                #f"samples third zeroed out": wandb.Image(array2grid(samples_tampered_list[3])),
+                                #f"samples fourth zeroed out": wandb.Image(array2grid(samples_tampered_list[4])),
+                                #f"samples fifth zeroed out": wandb.Image(array2grid(samples_tampered_list[5])),
+                                #f"samples sixth zeroed out": wandb.Image(array2grid(samples_tampered_list[6])),
+                                #f"samples seventh zeroed out": wandb.Image(array2grid(samples_tampered_list[7]))
+                                })
+                    logging.info("Generating EMA samples done.")
+                    if val_score_deserves_sampling:
+                        return
             if args.explicd_only==0:
                 logs = {
                     "proc_loss": accelerator.gather(processing_loss_mean).mean().detach().item(),
@@ -1059,7 +1196,7 @@ def main(args):
                     "proj_loss": accelerator.gather(proj_loss_mean).mean().detach().item(),
                     "grad_norm": accelerator.gather(grad_norm).mean().detach().item(),
                     "expl_loss": accelerator.gather(explicid_loss_mean).mean().detach().item(),
-                    "lgs_sim": accelerator.gather(logits_similarity_loss_mean).mean().detach().item(),
+                    #"lgs_sim": accelerator.gather(logits_similarity_loss_mean).mean().detach().item(),
                     "attn_exp": accelerator.gather(attn_explicd_loss_mean).mean().detach().item(),
                     "attn_sit": accelerator.gather(attn_map_loss_sit_total_mean).mean().detach().item(),
                     "cnn_cls": accelerator.gather(cnn_loss_cls_mean).mean().detach().item(),
@@ -1084,7 +1221,9 @@ def main(args):
         if args.explicd_only==0:
             model.eval()
         exp_pred_list = np.zeros((0), dtype=np.uint8)
+        exp_cnn_critical_pred_list = np.zeros((0), dtype=np.uint8)
         gt_list = np.zeros((0), dtype=np.uint8)
+        critical_mask_sums = []
         with torch.no_grad():
             for _, ((raw_image, x), y) in enumerate(val_dataloader):
                 
@@ -1102,10 +1241,12 @@ def main(args):
                 torch.cuda.empty_cache()
 
                 imgs_for_explicid=prepare__imgs_for_explicid(raw_image, exp_val_transforms).to(device)
-                cls_logits, _, _, _, agg_visual_tokens, _, _, _, _, _, _, _, _, _, _ = explicid(imgs_for_explicid)
-                _, label_pred = torch.max(cls_logits, dim=1)
-
+                patches, patches_colored, cls_logits, cls_minimal_logits, _, _, agg_visual_tokens, _, _, _, _, _, _, _, _,  cnn_logits_critical, _, critical_mask, _ = explicid(imgs_for_explicid)
+                _, label_pred = torch.max(cls_minimal_logits, dim=1)
+                _, exp_cnn_critical_label = torch.max(cnn_logits_critical, dim=1)
+                critical_mask_sums.append(critical_mask.sum(dim=(-2,-1)).mean())
                 exp_pred_list = np.concatenate((exp_pred_list, label_pred.cpu().numpy().astype(np.uint8)), axis=0)
+                exp_cnn_critical_pred_list = np.concatenate((exp_cnn_critical_pred_list, exp_cnn_critical_label.cpu().numpy().astype(np.uint8)), axis=0)
                 gt_list = np.concatenate((gt_list, labels.cpu().numpy().astype(np.uint8)), axis=0)
 
 
@@ -1114,10 +1255,18 @@ def main(args):
             exp_val_correct = np.sum(gt_list == exp_pred_list)
             exp_val_acc = 100 * exp_val_correct / len(exp_pred_list)
             exp_val_f1 = f1_score(gt_list, exp_pred_list, average='macro')
+            exp_cnn_critical_val_f1 = f1_score(gt_list, exp_cnn_critical_pred_list, average='macro')
+
+            print(f"Val f1 score {exp_val_f1}")
+            print(f"Critical_mask_sums {critical_mask_sums}")
+            print(f"Val f1 CNN critical {exp_cnn_critical_val_f1}")
 
             if args.explicd_only==1:
-                if exp_val_f1>max_exp_val_f1:
-                    max_exp_val_f1=exp_val_f1
+                if exp_val_f1>max_exp_val_f1 or exp_cnn_critical_val_f1>max_exp_cnn_critical_val_f1:
+                    if exp_val_f1>max_exp_val_f1:
+                        max_exp_val_f1=exp_val_f1
+                    else:
+                        max_exp_cnn_critical_val_f1 = exp_cnn_critical_val_f1
                     print('Explicd Val f1', f'{exp_val_f1:.3f}')
                     print('Explicd Val Balanced Acc', f'{exp_val_BMAC:.3f}')
                     if SAVING_BASED_ON_SCORE:
@@ -1137,6 +1286,7 @@ def main(args):
                     print('Explicd Test f1', f'{expl_scores["f1"]:.3f}')
                     print('Explicd Test Acc', f'{expl_scores["Acc"]:.3f}')
                     print('Explicd Test Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
+                    print('Test f1 CNN critical', f'{expl_scores["cnn critical f1"]:.3f}')
                     if epoch>7 and DO_MUDDLE_CHECK: 
                         torch.save(tokens_and_gt,"tokens_and_ground_truths/explicd_tokens_and_gts_0")
                         curve_of_f1.clear()
@@ -1144,7 +1294,7 @@ def main(args):
                         curve_of_f1.append(expl_scores["f1"])
                         curve_of_BMAC.append(expl_scores["BMAC"])
                         for muddle_severity_level in ['0_050','0_1','0_15','0_2']:
-                            expl_scores, _, _, tokens_and_gt = validation(explicid, None, train_muddled_dataloaders[muddle_severity_level], exp_val_transforms, explicd_only=1)
+                            expl_scores, tokens_and_gt = validation(explicid, None, train_muddled_dataloaders[muddle_severity_level], exp_val_transforms, explicd_only=1)
                             torch.save(tokens_and_gt,f"tokens_and_ground_truths/explicd_tokens_and_gts_{muddle_severity_level}")
                             print('Muddle_Severity_Level ', muddle_severity_level)
                             print('Explicd Muddled f1', f'{expl_scores["f1"]:.3f}')
@@ -1155,7 +1305,11 @@ def main(args):
                         print('Curve of BMAC', curve_of_BMAC)
 
             else:
-                if exp_val_f1>max_exp_val_f1:
+                if exp_val_f1>max_exp_val_f1 or exp_cnn_critical_val_f1>max_exp_cnn_critical_val_f1:
+                    if exp_val_f1>max_exp_val_f1:
+                        max_exp_val_f1=exp_val_f1
+                    else:
+                        max_exp_cnn_critical_val_f1 = exp_cnn_critical_val_f1
                     print("new best Explicd model")
                     max_exp_val_f1= exp_val_f1
                     print('Explicd Val f1', f'{exp_val_f1:.3f}')
@@ -1174,14 +1328,18 @@ def main(args):
                         checkpoint_path = f"{checkpoint_dir_val_score_based}/SiT/SiT_with_explicd_hilimsya.pt"
                     if args.resume_step == 0 and SAVING_BASED_ON_SCORE:
                         torch.save(checkpoint_val, checkpoint_path)
+                    ####################################################################
+                    if max_exp_val_f1>0.89:
+                        val_score_deserves_sampling=True
                     explicid.zero_grad(set_to_none=True)
                     model.eval()
                     model.zero_grad(set_to_none=True)
                     optimizer.eval()
-                    expl_scores, sit_scores, expl_refined_scores, tokens_and_gt = validation(explicid, model, test_dataloader, exp_val_transforms, explicd_only=0)
+                    expl_scores, tokens_and_gt = validation(explicid, model, test_dataloader, exp_val_transforms, explicd_only=0)
                     print('Explicd Test f1', f'{expl_scores["f1"]:.3f}')
                     print('Explicd Test Acc', f'{expl_scores["Acc"]:.3f}')
                     print('Explicd Test Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
+                    print('Test f1 CNN critical', f'{expl_scores["cnn critical f1"]:.3f}')
                     if epoch>7 and DO_MUDDLE_CHECK:  
                         torch.save(tokens_and_gt,"tokens_and_ground_truths/sit_tokens_and_gts_0")
                         curve_of_f1.clear()
@@ -1222,7 +1380,7 @@ def parse_args(input_args=None):
     parser.add_argument("--exp-name", type=str, required=True)
     parser.add_argument("--logging-dir", type=str, default="logs")
     parser.add_argument("--report-to", type=str, default="wandb")
-    parser.add_argument("--sampling-steps", type=int, default=5000)
+    parser.add_argument("--sampling-steps", type=int, default=1500)
     parser.add_argument("--resume-step", type=int, default=0)
 
     # model
@@ -1244,7 +1402,7 @@ def parse_args(input_args=None):
     # optimization
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--max-train-steps", type=int, default=400000)
-    parser.add_argument("--checkpointing-steps", type=int, default=5000)
+    parser.add_argument("--checkpointing-steps", type=int, default=1500)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--adam-beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")

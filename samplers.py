@@ -77,7 +77,8 @@ def euler_sampler(
         vit_l_output=None,
         critical_mask=None, 
         trivial_mask=None,
-        patchifyer_model=None
+        patchifyer_model=None,
+        highlight_the_critical_mask=False
         ):
     # setup conditioning
     if cfg_scale > 1.0:
@@ -128,7 +129,7 @@ def euler_sampler(
             #text_embed=torch.randn(256, 512).to(device)
             #img_embed=torch.randn(256, 512).to(device)
 
-            d_cur = model(
+            patches_output, d_cur, _, d_cur_critical_removed = model(
                 model_input.to(dtype=_dtype), latents, None, time_input.to(dtype=_dtype), **kwargs,  # if need be will fill in model_pure and model_target
                 concept_label=concept_label_input, 
                 image_embeddings=imgs_tokens_input,
@@ -139,10 +140,11 @@ def euler_sampler(
                 vit_l_output=vit_l_output,
                 critical_mask= critical_mask, 
                 trivial_mask = trivial_mask,
-                patchifyer_model=patchifyer_model
-                )[0]
+                patchifyer_model=patchifyer_model,
+                highlight_the_critical_mask=highlight_the_critical_mask
+                )
             #.to(torch.float64)
-            return d_cur
+            return patches_output, d_cur.to(torch.float32), None, d_cur_critical_removed.to(torch.float32)
             if cfg_scale > 1. and t_cur <= guidance_high and t_cur >= guidance_low:
                 d_cur_cond, d_cur_uncond = d_cur.chunk(2)
                 d_cur = d_cur_uncond + cfg_scale * (d_cur_cond - d_cur_uncond)                

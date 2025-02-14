@@ -111,7 +111,7 @@ def load_encoders(enc_type, device):
             from models.clip_vit import UpdatedVisionTransformer
             print(f"the model is ViT-{model_config}/14")
             encoder_ = clip.load(f"ViT-{model_config}/14", device='cpu')[0].visual
-            encoder_.load_state_dict(torch.load("./Explicd/model/weights/Clip_Vit_L_15.pth"))
+            #encoder_.load_state_dict(torch.load("./Explicd/model/weights/Clip_Vit_L_15.pth"))
             #encoder = create_model_from_pretrained('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')[0].visual.trunk
             encoder = UpdatedVisionTransformer(encoder_).to(device)
              #.to(device)
@@ -126,7 +126,7 @@ def load_encoders(enc_type, device):
             import timm
             kwargs = dict(img_size=256)
             encoder = vit_large_patch16(**kwargs).to(device)
-            with open(f"ckpts/mae_vit{model_config}.pth", "rb") as f:
+            with open(f"pretrained_encoder_ckpts/mae_pretrain_vit_large.pth", "rb") as f:
                 state_dict = torch.load(f)
             if 'pos_embed' in state_dict["model"].keys():
                 state_dict["model"]['pos_embed'] = timm.layers.pos_embed.resample_abs_pos_embed(

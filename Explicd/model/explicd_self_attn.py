@@ -17,9 +17,20 @@ import torch.nn as nn
 # import cv2
 import matplotlib.pyplot as plt
 from skimage import measure
+from timm import create_model
+from skimage.segmentation import slic
+from skimage.color import rgb2lab
+from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv
+from skimage import img_as_ubyte
+import skimage
+from skimage.color import label2rgb
+import torchvision.transforms as T
+
 NUM_OF_CRITERIA = {
     'ISIC': 7,
     'ISIC_MINE': 6,
+    'ISIC_MINIMAL': 7,
 
     'IDRID': 5,
     'IDRID_EDEMA': 6,
@@ -31,6 +42,7 @@ NUM_OF_CRITERIA = {
 NUM_OF_SIMILARITIES = {
     'ISIC': 34,
     'ISIC_MINE': 24,
+    'ISIC_MINIMAL': 49,
 
     'IDRID': 18,
     'IDRID_EDEMA': 15,
@@ -40,7 +52,7 @@ NUM_OF_SIMILARITIES = {
 }
 
 def get_prefix(task: str, key: str) -> str:
-    if task== "ISIC" or task == "ISIC_MINE":
+    if task== "ISIC" or task == "ISIC_MINE" or task == "ISIC_MINIMAL":
         return f"this is a dermoscopic image, the {key} of the lesion is "
     elif task == "IDRID" or task=='IDRID_EDEMA':
         return f"this is a fundus image, the {key} of the eye is "
@@ -209,8 +221,8 @@ def gpt4_0_second_attention_loss(attn_critical, attn_non_critical,  cluster_sigm
     #orthog_loss = (attn_critical @ attn_non_critical.transpose(1, 2)).pow(2).mean()
     
     # --- Coverage Loss (Ensuring all areas are attended to) ---
-    total_attention = attn_critical.sum(dim=1) + attn_non_critical.sum(dim=1)  # (B, 256)
-    total_attention = total_attention / total_attention.max(dim=-1, keepdim=True)[0]  # Normalize
+    total_attention = attn_critical.sum(dim=1)/2 + attn_non_critical.sum(dim=1)/2  # (B, 256)
+    #total_attention = total_attention / total_attention.max(dim=-1, keepdim=True)[0]  # Normalize
 
     coverage_loss = F.mse_loss(total_attention, torch.ones_like(total_attention))
 
@@ -227,7 +239,7 @@ def gpt4_0_second_attention_loss(attn_critical, attn_non_critical,  cluster_sigm
     # print(f"cluster loss {cluster_loss}")
     # print(f"orthog_loss loss {orthog_loss}")
     # print(f"coverage_loss loss {coverage_loss}")
-    cluster_scale = 0.5
+    cluster_scale = 0
     orthogonal_scale = 1.5
     coverage_scale = 1.5
 
@@ -317,6 +329,208 @@ class AdaptiveCriticalPatchLoss(nn.Module):
 
         return total_loss
 
+
+class SpatialAwarePatchLoss(nn.Module):
+    def __init__(self, gamma=5.0, sigma=0.2):
+        """
+        Args:
+            gamma (float): Controls how strongly distance affects penalties.
+            sigma (float): Controls the sharpness of spatial weighting.
+        """
+        super().__init__()
+        self.gamma = gamma
+        self.sigma = sigma
+
+    def compute_distance_matrix(self, H, W, device):
+        """Compute normalized spatial distance matrix for a grid (H, W)."""
+        coords = torch.stack(torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij"), dim=-1)  # (H, W, 2)
+        coords = coords.reshape(-1, 2).to(device)  # (256, 2) for a 16x16 grid
+
+        # Compute pairwise Euclidean distance
+        dist_matrix = torch.cdist(coords.float(), coords.float(), p=2)  # (256, 256)
+
+        # Normalize to [0,1] using the largest distance in the grid
+        dist_matrix /= dist_matrix.max()
+        return dist_matrix  # (256, 256)
+
+    def forward(self, image_feats, mask):
+        """
+        Args:
+            image_feats (torch.Tensor): Image features (B, 1024, 16, 16).
+            mask (torch.Tensor): Binary segmentation mask (B, 1, 16, 16).
+
+        Returns:
+            torch.Tensor: Spatially aware loss.
+        """
+        B, C, H, W = image_feats.shape
+        num_patches = H * W
+        device = image_feats.device
+
+        # Flatten patches (B, 1024, 256) and mask (B, 1, 256)
+        image_feats = image_feats.view(B, C, num_patches)
+        mask = mask.view(B, 1, num_patches)
+        mask_coverage = mask.mean(dim=2, keepdim=True)  # (B, 1, 1)
+
+        lambda_within = torch.exp(-self.gamma * mask_coverage)
+        lambda_between = torch.exp(self.gamma * mask_coverage)
+
+        # Compute spatial distance matrix (256, 256)
+        D = self.compute_distance_matrix(H, W, device).to(device)  # (256, 256)
+
+        # Convert distance into weight (closer patches get higher weights)
+        #spatial_weight = torch.exp(-self.gamma * D)  # (256, 256)
+        spatial_weight = torch.exp(- (D ** 2) / (2 * self.sigma ** 2))
+
+
+        # Extract critical and trivial patches
+        critical_patches = image_feats * mask  # (B, 1024, 256) * (B, 1, 256)
+        trivial_patches = image_feats * (1 - mask)  # (B, 1024, 256) * (B, 1, 256)
+
+        # Normalize features for cosine similarity
+        critical_patches = F.normalize(critical_patches, p=2, dim=1)
+        trivial_patches = F.normalize(trivial_patches, p=2, dim=1)
+
+        # Compute similarity matrices
+        similarity_critical = torch.bmm(critical_patches.transpose(1, 2), critical_patches)  # (B, 256, 256)
+        similarity_between = torch.bmm(critical_patches.transpose(1, 2), trivial_patches)  # (B, 256, 256)
+
+        # Loss 1: Critical patches should be similar if spatially close
+        loss_within = (((similarity_critical - 1) ** 2 * spatial_weight)*lambda_within).mean()
+
+        # Loss 2: Trivial patches should be dissimilar to nearby critical patches
+        loss_between = ((similarity_between ** 2 * spatial_weight)*lambda_between).mean()
+
+        # Total loss
+        total_loss = loss_within + loss_between
+        return total_loss
+
+# class SpatialAwarePatchAttentionLoss(nn.Module):
+#     def __init__(self, H=16, W=16, sigma=2.0):
+#         super().__init__()
+#         self.H, self.W = H, W
+#         self.sigma = sigma  # Controls locality strength
+        
+#         # Compute spatial distances once and store
+#         self.register_buffer("spatial_weight", self.compute_distance_matrix(H, W))
+
+#     def compute_distance_matrix(self, H, W):
+#         """Compute spatial distance matrix between patches in a 16x16 grid."""
+#         grid_x, grid_y = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
+#         coords = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1).float()  # (256, 2)
+
+#         # Compute pairwise Euclidean distance
+#         dist_matrix = torch.cdist(coords, coords, p=2)  # (256, 256)
+        
+#         # Convert distance to weight (closer = higher weight)
+#         spatial_weight = torch.exp(-dist_matrix / self.sigma).to(device="cuda")
+#         return spatial_weight  # (256, 256)
+
+#     def forward(self, image_feats, critical_weights, trivial_weights):
+#         """
+#         image_feats: (B, 1024, 16, 16)   -> Image features (input to ViT)
+#         critical_tokens: (B, 7, 1024)    -> Critical region token embeddings
+#         trivial_tokens: (B, 14, 1024)    -> Trivial region token embeddings
+#         critical_weights: (B, 7, 256)    -> Attention maps for critical tokens (soft mask)
+#         trivial_weights: (B, 14, 256)    -> Attention maps for trivial tokens (soft mask)
+#         """
+
+#         B, C, H, W = image_feats.shape
+#         _, num_critical, _, _ = critical_weights.shape  # (B, 7, 16, 16)
+#         num_trivial = trivial_weights.shape[1]
+#         image_feats = image_feats.flatten(2).transpose(1, 2)  # (B, 256, 1024)
+
+#         # Compute feature similarity matrix using cosine similarity
+#         feat_sim = F.cosine_similarity(image_feats.unsqueeze(2), image_feats.unsqueeze(1), dim=-1)  # (B, 256, 256)
+
+#         # Combine feature similarity with spatial weight
+#         combined_weight = torch.exp(-self.spatial_weight) * feat_sim  # (B, 256, 256)
+
+#         # Compute intra-critical similarity (should be high)
+#         #print(f"critical_weights shape {critical_weights.shape}")
+#         #print(f"combined_weight shape {combined_weight.shape}")
+#         critical_spatial_weights = torch.bmm(critical_weights.view(B, num_critical, H * W), combined_weight)  # (B, 7, 256)
+#         critical_spatial_weights = torch.bmm(critical_spatial_weights, critical_weights.view(B, num_critical, H * W).transpose(1, 2))  # (B, 7, 7)
+
+#         loss_within = torch.mean(1 - critical_spatial_weights)  # Minimize within-mask dissimilarity
+
+#         # Compute cross-mask similarity (should be low)
+#         cross_spatial_weights = torch.bmm(critical_weights.view(B, num_critical, H * W), combined_weight)  # (B, 7, 256)
+#         cross_spatial_weights = torch.bmm(cross_spatial_weights, trivial_weights.view(B, num_trivial, H * W).transpose(1, 2))  # (B, 7, 14)
+
+#         loss_between = torch.mean(cross_spatial_weights)  # Maximize critical/trivial dissimilarity
+
+#         # Balance losses (avoid collapse to a single mask)
+#         lambda_within = 1.0  # Weight for making critical patches more similar
+#         lambda_between = 0.5  # Weight for separating critical/trivial
+        
+#         loss = lambda_within * loss_within + lambda_between * loss_between
+#         return loss
+
+class SpatialAwarePatchAttentionLoss(nn.Module):
+    def __init__(self, H=16, W=16, sigma=2.0):
+        super().__init__()
+        self.H, self.W = H, W
+        self.sigma = sigma  # Controls locality strength
+        self.register_buffer("spatial_weight", self.compute_distance_matrix(H, W))
+
+    def compute_distance_matrix(self, H, W):
+        grid_x, grid_y = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
+        coords = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1).float()
+        dist_matrix = torch.cdist(coords, coords, p=2)
+        return torch.exp(-dist_matrix / self.sigma).to(device="cuda")
+
+    def compute_mean_color_similarity(self, image_feats):
+        """Compute mean color similarity for patches."""
+        mean_color = image_feats.mean(dim=-1, keepdim=True)  # (B, 1, 256)
+        return 1 - torch.cdist(mean_color, mean_color, p=2)  # (B, 256, 256)
+
+    def compute_texture_similarity(self, image_feats):
+        """Compute texture similarity using Laplacian variance."""
+        laplacian = T.GaussianBlur(3, sigma=(1.5, 1.5))(image_feats) - image_feats
+        texture_variance = laplacian.var(dim=-1, keepdim=True)  # (B, 1, 256)
+        return 1 - torch.cdist(texture_variance, texture_variance, p=2)  # (B, 256, 256)
+
+    def forward(self, image_feats, critical_weights, trivial_weights):
+        B, C, H, W = image_feats.shape
+        num_critical = critical_weights.shape[1]
+        num_trivial = trivial_weights.shape[1]
+        image_feats = image_feats.flatten(2).transpose(1, 2)  # (B, 256, 1024)
+        
+        # Compute different similarity matrices
+        feat_sim = F.cosine_similarity(image_feats.unsqueeze(2), image_feats.unsqueeze(1), dim=-1)  # (B, 256, 256)
+        mean_color_sim = self.compute_mean_color_similarity(image_feats)
+        texture_sim = self.compute_texture_similarity(image_feats)
+        
+        # Combine feature similarity with spatial weight
+        combined_weight = torch.exp(-self.spatial_weight) * feat_sim  # (B, 256, 256)
+        #print(f"combined_weight shape {combined_weight.shape}")
+        combined_weight = torch.zeros_like(combined_weight)
+        
+        # Apply custom similarity measures to specific tokens
+        combined_weight[:, 0, :] = mean_color_sim[:, 0, :]
+        combined_weight[:, :, 0] = mean_color_sim[:, :, 0]
+        #print(f"mean_color_sim shape {mean_color_sim.shape}")
+        #print(f"texture_sim shape {texture_sim.shape}")
+        combined_weight[:, 4, :] = texture_sim[:, 4, :]
+        combined_weight[:, :, 4] = texture_sim[:, :, 4]
+        
+        # Compute intra-critical similarity (should be high)
+        critical_spatial_weights = torch.bmm(critical_weights.view(B, num_critical, H * W), combined_weight)
+        critical_spatial_weights = torch.bmm(critical_spatial_weights, critical_weights.view(B, num_critical, H * W).transpose(1, 2))
+        loss_within = torch.mean(1 - critical_spatial_weights)
+        
+        # Compute cross-mask similarity (should be low)
+        cross_spatial_weights = torch.bmm(critical_weights.view(B, num_critical, H * W), combined_weight)
+        cross_spatial_weights = torch.bmm(cross_spatial_weights, trivial_weights.view(B, num_trivial, H * W).transpose(1, 2))
+        loss_between = torch.mean(cross_spatial_weights)
+        
+        overlap = (critical_weights[:,0,:] * trivial_weights[:,0,:]).sum(dim=1).mean() +(critical_weights[:,4,:] * trivial_weights[:,4,:]).sum(dim=1).mean()
+        
+        # Balance losses
+        loss = loss_within + 0.5 * loss_between + overlap
+        return loss
+
+
 class PatchSelectorCNN(nn.Module):
     def __init__(self):
         super(PatchSelectorCNN, self).__init__()
@@ -331,23 +545,23 @@ class PatchSelectorCNN(nn.Module):
 
     def forward(self, x):
         #################################### Option cascade of cnn
-        # x = F.relu(self.conv1(x))
-        # #softmax_output = F.softmax(self.split_1 / temperature, dim=-1)
-        # # print(f" softmax_output[:,0] shape { softmax_output[:,0].shape}")
-        # # x_critical = x * softmax_output[:,0].view(1, 512, 1, 1)
-        # # x_trivial = x * softmax_output[:,1].view(1, 512, 1, 1)
-        # x = F.relu(self.conv2(x))
-        # # softmax_output = F.softmax(self.split_2 / temperature, dim=-1)
-        # # print(f" softmax_output[:,0] shape { softmax_output[:,0].shape}")
-        # # x_critical = x_critical * softmax_output[:,0].view(1, 512, 1, 1)
-        # # x_trivial = x_trivial * softmax_output[:,1].view(1, 512, 1, 1)
-        # x = F.relu(self.conv3(x))
-        # x = self.conv4(x)
+        x = F.relu(self.conv1(x))
+        #softmax_output = F.softmax(self.split_1 / temperature, dim=-1)
+        # print(f" softmax_output[:,0] shape { softmax_output[:,0].shape}")
+        # x_critical = x * softmax_output[:,0].view(1, 512, 1, 1)
+        # x_trivial = x * softmax_output[:,1].view(1, 512, 1, 1)
+        x = F.relu(self.conv2(x))
+        # softmax_output = F.softmax(self.split_2 / temperature, dim=-1)
+        # print(f" softmax_output[:,0] shape { softmax_output[:,0].shape}")
+        # x_critical = x_critical * softmax_output[:,0].view(1, 512, 1, 1)
+        # x_trivial = x_trivial * softmax_output[:,1].view(1, 512, 1, 1)
+        x = F.relu(self.conv3(x))
+        x = self.conv4(x)
         # x = self.sigmoid(self.conv4(x)
         #################################### Option conscise
-        x = self.conv_conscise(x)
+        #x = self.conv_conscise(x)
         ####################################
-        temperature = 0.05  # Low temperature (small value makes softmax more peaked)
+        temperature = 0.0005  # Low temperature (small value makes softmax more peaked)
         scaled_logits = x / temperature
         #print(f"x shape {x.shape}")
         softmax_output = F.softmax(scaled_logits, dim=1)
@@ -367,9 +581,14 @@ class PatchSelectorCNNConscise(nn.Module):
         self.conv1 = nn.Conv2d(in_channels=1024, out_channels=512, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(in_channels=512, out_channels=2, kernel_size=3, padding=1)
 
+        self.conscise = nn.Conv2d(in_channels=1024, out_channels=2, kernel_size=3, padding=1)
+
     def forward(self, x):
+        #################################### Option 2 layers
         x = F.relu(self.conv1(x))
         x = self.conv2(x)
+        #################################### Option 1 layer
+        #x = self.conscise(x)
         ####################################
         temperature = 0.05  # Low temperature (small value makes softmax more peaked)
         scaled_logits = x / temperature
@@ -571,12 +790,13 @@ def compute_16x16_loss(X, lambda1=1.0, lambda2=1.0, lambda3=1.0, lambda4=1.0):
     loss_background = (X * (distances > (H//4)**2)).pow(2).mean()
     
     # Non-uniformity loss (Encourages variation in pixel values)
-    loss_uniform = -torch.var(X, dim=[1,2]).mean()
+    #loss_uniform = -torch.var(X, dim=[1,2]).mean()
+    loss_uniform = torch.var(X, dim=[1,2]).mean()
 
     smooth_scale=10e2
     compact_scale=10e1
     background_scale=10e2
-    uniform_scale=10e2
+    uniform_scale=0
 
     loss_smooth = smooth_scale * loss_smooth
     loss_compact = compact_scale * loss_compact
@@ -820,6 +1040,190 @@ def deep_snake(mask, image, iterations=10, patch_size=3):
         contour = expand_shrink_contour(mask, image, contour, patch_size)
     
     return contour
+
+def image_to_patches(images, patch_size=14):
+    """
+    Splits an image (3, 224, 224) into patches of size (256, D), where D = 14*14*3.
+    
+    Args:
+        image (torch.Tensor): Input image tensor of shape (3, 224, 224).
+        patch_size (int): Size of each patch along one dimension.
+
+    Returns:
+        torch.Tensor: Tensor of shape (256, D) where D = patch_size * patch_size * 3.
+    """
+    # Ensure image is a tensor with shape (B, 3, 224, 224)
+    B, C, H, W = images.shape
+    num_patches = (H // patch_size) ** 2
+    # Unfold each image into patches (B, 3, 16, 16, 14, 14)
+    patches = images.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)
+
+    # Rearrange dimensions to (B, 16, 16, 3, 14, 14) -> (B, 256, 3, 14, 14)
+    patches = patches.permute(0, 2, 3, 1, 4, 5).reshape(B, num_patches, C, patch_size, patch_size)
+
+    # Flatten each patch into a feature vector (B, 256, D) where D = 14*14*3
+    patches = patches.view(B, num_patches, -1)  # Shape: (B, 256, 588)
+    #print(patches.shape)
+    
+    return patches
+
+def superpixel_segmentation(images, num_segments=100, compactness=10):
+    """
+    Perform superpixel segmentation on a batch of images.
+    
+    Parameters:
+    - images: Tensor of shape (B, 3, 224, 224), the batch of images.
+    - num_segments: Number of superpixels to generate.
+    - compactness: Balance between color and space; higher compactness gives more square superpixels.
+    
+    Returns:
+    - A tensor of shape (B, H, W) with the superpixel labels.
+    """
+    images = images.cpu().numpy()  # Convert to numpy array (B, 3, 224, 224)
+    
+    seg_results = []
+    
+    for img in images:
+        img = np.transpose(img, (1, 2, 0))
+        #img_lab = rgb2lab(img)
+        
+        segments = slic(img, n_segments=num_segments, compactness=compactness, start_label=0)
+        segmented_color = label2rgb(segments, img, kind='overlay', bg_label=-1)
+        seg_results.append(np.transpose(segmented_color, (2, 0, 1)))
+    
+    seg_results = np.stack(seg_results, axis=0)
+    
+    return torch.tensor(seg_results)
+
+def generate_distinct_colors(num_colors):
+    """
+    Generate a list of distinct colors using the HSV color space to ensure no color repeats.
+    
+    Parameters:
+    - num_colors: Number of distinct colors to generate.
+    
+    Returns:
+    - A numpy array of shape (num_colors, 3) containing RGB values for each color.
+    """
+    # Use HSV to generate distinct colors, and then convert to RGB
+    hsv_colors = np.linspace(0, 1, num_colors, endpoint=False)  # Generate hues from 0 to 1
+    colors = np.array([skimage.color.hsv2rgb(np.array([[hue, 1, 1]]))[0][0] for hue in hsv_colors])
+    
+    # Convert colors to integers in the range [0, 255]
+    colors = (colors * 255).astype(np.uint8)
+    
+    return colors
+
+def apply_distinct_colors_to_superpixels(images, superpixels):
+    """
+    Change the image colors so that each superpixel gets its own unique color with no repetition.
+    
+    Parameters:
+    - images: Tensor of shape (B, 3, 224, 224), the batch of images.
+    - superpixels: Tensor of shape (B, H, W), containing the superpixel labels for each pixel.
+    
+    Returns:
+    - A tensor of shape (B, 3, H, W) where each superpixel has a unique color.
+    """
+    B, C, H, W = images.shape
+    colored_images = torch.zeros(B, 3, H, W, dtype=torch.uint8)
+    
+    # Get the number of distinct superpixels (assuming max label is the number of superpixels)
+    max_superpixels = int(superpixels.max() + 1)
+    
+    # Generate distinct colors for each superpixel
+    distinct_colors = generate_distinct_colors(max_superpixels)
+    
+    # Iterate through the batch of images
+    for b in range(B):
+        img = images[b].cpu().numpy()
+        segments = superpixels[b].cpu().numpy()
+        
+        # Create an output image where each superpixel is filled with its unique color
+        colored_img = np.zeros((H, W, 3), dtype=np.uint8)
+        
+        for y in range(H):
+            for x in range(W):
+                label = segments[y, x]
+                colored_img[y, x] = distinct_colors[label]
+        
+        # Convert the colored image back to a tensor and store it in the output batch
+        colored_images[b] = torch.tensor(colored_img).permute(2, 0, 1)
+    
+    return colored_images
+
+# Define a GNN model
+class GNN(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels):
+        super(GNN, self).__init__()
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, out_channels)
+
+    def forward(self, data):
+        if data.edge_index.size(1) == 0:
+            print("Warning: Empty edge_index")
+            return torch.zeros(data.x.size(0), 1024).to(data.x.device)
+        x, edge_index = data.x, data.edge_index
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = self.conv2(x, edge_index)
+        return x
+
+class VisionTransformer7x7(nn.Module):
+    def __init__(self, image_size=224, patch_size=7, embed_dim=144, num_heads=12, num_layers=12):
+        super().__init__()
+        
+        self.patch_size = patch_size
+        self.num_patches = (image_size // patch_size) ** 2  # 1024 patches
+        self.embed_dim = embed_dim
+
+        # Patch embedding layer (Linear projection of patches)
+        self.patch_embed = nn.Linear(patch_size * patch_size * 3, embed_dim)
+
+        # Class token and positional embeddings
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.randn(1, self.num_patches + 1, embed_dim))
+
+        # Transformer Encoder
+        self.encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads),
+            num_layers=num_layers
+        )
+
+        # Classification Head
+        self.head = nn.Linear(embed_dim, 2)  # For ImageNet (change as needed)
+
+    def forward(self, x):
+        B, C, H, W = x.shape  # (Batch, 3, 224, 224)
+
+        # Convert image to patches
+        x = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
+        x = x.permute(0, 2, 3, 1, 4, 5).reshape(B, self.num_patches, -1)  # (B, 1024, 147)
+
+        # Project patches into embedding space
+        x = self.patch_embed(x)  # (B, 1024, 768)
+
+        # Add class token
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, 768)
+        x = torch.cat((cls_tokens, x), dim=1)  # (B, 1025, 768)
+
+        # Add positional embeddings
+        x = x + self.pos_embed  # (B, 1025, 768)
+
+        # Transformer Encoder
+        x = self.encoder(x)  # (B, 1025, 768)
+
+        # Classification token output
+        x = self.head(x[:, 1:, :])  # (B, 1000)
+
+        temperature = 0.05  # Low temperature (small value makes softmax more peaked)
+        scaled_logits = x / temperature
+        #print(f"x shape {x.shape}")
+        softmax_output = F.softmax(scaled_logits, dim=1)
+        #print(softmax_output.shape)
+        x_critical_mask =softmax_output[:,:,0].unsqueeze(1)
+        x_trivial_mask = softmax_output[:,:,1].unsqueeze(1)
+        return x_critical_mask, x_trivial_mask
 
 class CLIPWithSoftPrompts(nn.Module):
     def __init__(self, clip_model, prompt_length=10, embedding_dim=512):
@@ -2218,12 +2622,355 @@ class ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens(nn.Module):
             config.preprocess = preprocess
 
             self.model_visual_ViT_L = clip.load(f"ViT-L/14")[0].visual
+            #self.model_visual_custom = VisionTransformer7x7()
 
             # Convert specific layers or parameters to float32
             for param in self.model_visual_ViT_L.parameters():
                 param.data = param.data.to(torch.float32)
 
             self.model_visual_ViT_L.cuda()
+            #self.model_visual_custom.cuda()
+            
+            self.model.cuda()
+            
+            concept_keys = list(concept_list.keys())
+            self.concept_token_dict = {}
+            for key in concept_keys:
+                prefix = get_prefix(self.config.dataset, key)
+                attr_concept_list = concept_list[key]
+                prefix_attr_concept_list = [prefix + concept for concept in attr_concept_list]
+                tmp_concept_text = self.tokenizer(prefix_attr_concept_list).cuda()
+                #print(f"tmp_concept_text shape: {tmp_concept_text.shape}")
+                _, tmp_concept_feats, logit_scale = self.model(None, tmp_concept_text)
+                self.concept_token_dict[key] = tmp_concept_feats.detach()
+
+            
+            self.logit_scale = logit_scale.detach()
+
+            # Step 1: Move model back to CPU
+            self.model = self.model.to('cpu')
+
+            # Step 2: Delete the model (optional, for memory release)
+            del self.model
+
+            # Step 3: Empty the CUDA memory cache
+            torch.cuda.empty_cache()
+        
+        self.visual_features = []
+
+        self.hook_list = []
+        def hook_fn(module, input, output):
+            self.visual_features.append(output) # detach to aboid saving computation graph
+                                                 # might need to remove if finetune the full model
+        layers = [self.model_visual_ViT_L.transformer.resblocks[11]]
+        for layer in layers:
+            self.hook_list.append(layer.register_forward_hook(hook_fn))
+        
+        self.critical_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, 1024, dtype=torch.float32)))
+        self.trivial_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, 1024, dtype=torch.float32)))
+
+        #self.critical_visual_tokens_pat = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, 147, dtype=torch.float32)))
+        #self.trivial_visual_tokens_pat = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, 147, dtype=torch.float32)))
+
+        self.cross_attn = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
+        self.cross_attn_critical = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
+        self.cross_attn_trivial = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
+        self.cross_attn_between_patches = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
+        self.cross_attn_in_patches = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
+        self.ffn = FFN(1024, 1024*4)
+        self.norm = nn.LayerNorm(1024)
+        self.proj = nn.Linear(in_features=1024, out_features=512, bias=False)
+        self.proj_Sit = nn.Linear(in_features=1024, out_features=768, bias=False)
+        self.proj_Sit_to_explicid = nn.Linear(in_features=768, out_features=512, bias=False)
+
+        # Replace single components with ModuleLists
+        self.ffns = nn.ModuleList([FFN(1024, 1024*4) for _ in range(self.num_of_criteria)])
+        self.norms = nn.ModuleList([nn.LayerNorm(1024) for _ in range(self.num_of_criteria)])
+        self.projs = nn.ModuleList([nn.Linear(in_features=1024, out_features=512, bias=False) for _ in range(self.num_of_criteria)])
+        self.proj_Sits = nn.ModuleList([nn.Linear(in_features=1024, out_features=768, bias=False) for _ in range(self.num_of_criteria)])
+        self.proj_Sits_to_explicids = nn.ModuleList([nn.Linear(in_features=1024, out_features=768, bias=False) for _ in range(self.num_of_criteria)])
+        #                                     34  for ISIC
+        #                                     17 for BUSI
+        self.cls_head = nn.Linear(in_features=NUM_OF_SIMILARITIES[self.config.dataset], out_features=config.num_class)
+
+        self.cluster_sigma = torch.nn.Parameter(torch.ones(1))
+        self.orthogonal_sigma = torch.nn.Parameter(torch.ones(1))
+        self.coverage_sigma = torch.nn.Parameter(torch.ones(1))
+
+        for param in self.model_visual_ViT_L.parameters():
+            param.requires_grad = True
+
+        # for param in self.model_visual_custom.parameters():
+        #     param.requires_grad = True
+        
+        self.critical_visual_tokens.requires_grad = True
+        self.trivial_visual_tokens.requires_grad = True
+
+        ###########################################################
+        self.cnn = PatchSelectorCNN().cuda()
+        self.classifying_critical_cnn = ClassifyingCNN().cuda()
+        self.classifying_trivial_cnn = ClassifyingCNN().cuda()
+        self.gnn = GNN(in_channels=3, hidden_channels=16, out_channels=1024).cuda()
+
+    
+    def get_backbone_params(self):
+        return self.model.visual.trunk.parameters()
+    def get_bridge_params(self):
+        param_list = []
+        
+        param_list.append(self.critical_visual_tokens)
+        param_list.append(self.trivial_visual_tokens)
+        for param in self.cross_attn.parameters():
+            param_list.append(param)
+
+        for param in self.ffn.parameters():
+            param_list.append(param)
+        for param in self.norm.parameters():
+            param_list.append(param)
+        for param in self.proj.parameters():
+            param_list.append(param)
+
+        for i in range(self.num_of_criteria):
+            for param in self.ffns[i].parameters():
+                param_list.append(param)
+            for param in self.norms[i].parameters():
+                param_list.append(param)
+            for param in self.projs[i].parameters():
+                param_list.append(param)
+            for param in self.proj_Sits[i].parameters():
+                param_list.append(param)
+            for param in self.proj_Sits_to_explicids[i].parameters():
+                param_list.append(param)
+
+        for param in self.cls_head.parameters():
+            param_list.append(param)
+
+        return param_list
+
+
+    def forward(self, imgs, refined_tokens=None, explicid_imgs_latents=None):
+        
+        if refined_tokens is not None:
+            image_logits_dict_refined = {}
+            idx = 0
+            refined_tokens = self.proj_Sit_to_explicid(F.normalize(refined_tokens, dim=-1))
+            for key in self.concept_token_dict.keys():
+                image_logits_dict_refined[key] = (self.logit_scale * refined_tokens[:, idx:idx+1, :] @ self.concept_token_dict[key].repeat(refined_tokens.shape[0], 1, 1).permute(0, 2, 1)).squeeze(1)
+                idx += 1
+            image_logits_list_refined = []
+            for key in image_logits_dict_refined.keys():
+                image_logits_list_refined.append(image_logits_dict_refined[key])
+        
+            image_logits_refined = torch.cat(image_logits_list_refined, dim=-1)
+            cls_logits_refined = self.cls_head(image_logits_refined)
+            return cls_logits_refined
+
+        self.visual_features.clear()
+
+        _ = self.model_visual_ViT_L(imgs)
+        #custom_patches = self.model_visual_custom(imgs)
+        #print(f"custom_patches shape {custom_patches.shape}")
+        patches = image_to_patches(imgs, patch_size=14)
+        H_p = W_p = int(patches.shape[1] ** 0.5)
+        D_p = patches.shape[2]
+
+        vit_l_output=self.visual_features[0].permute(1, 0, 2)[:, 1:, :] 
+
+        B=vit_l_output.shape[0]
+
+        critical_visual_tokens = self.critical_visual_tokens.repeat(B, 1, 1)
+        trivial_visual_tokens = self.trivial_visual_tokens.repeat(B, 1, 1)
+        #print(f"vit_l_output.shape in explicd {vit_l_output.shape}") # B 256 1024
+        ############################################################################################################# Option 1
+        B, T, D = vit_l_output.shape  # B: batch size, T: num_patches (256), D: patch_dim (1024)
+        H = W = int(T ** 0.5)  # Assuming T is a perfect square, H = W = 16
+        vit_output_unflattened = vit_l_output.view(B, H, W, D).permute(0, 3, 1, 2)  # Shape: (B, 1024, 16, 16)
+        #vit_output_unflattened_for_exlusive = vit_output_unflattened.clone().detach()
+        #vit_output_unflattened_for_exlusive =vit_output_unflattened
+        # critical_mask = self.cnn(vit_output_unflattened)  # Shape: (B, 1, 16, 16)
+        # trivial_mask = 1-critical_mask
+
+        # # Multiply the mask with the unflattened vision transformer output
+        # crticial_patches = vit_output_unflattened * critical_mask  # Shape: (B, 1024, 16, 16)
+        # trivial_patches = vit_output_unflattened * trivial_mask
+
+        # # Flatten the result back to shape (B, 256, 1024)
+        # vit_l_output_for_critical = crticial_patches.permute(0, 2, 3, 1).view(B, T, D)  # Shape: (B, 256, 1024)
+        # vit_l_output_for_trivial = trivial_patches.permute(0, 2, 3, 1).view(B, T, D)
+        # agg_critical_visual_tokens, attn_criticial_weights = self.cross_attn(critical_visual_tokens, vit_l_output_for_critical, vit_l_output_for_critical)
+        # agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn(trivial_visual_tokens, vit_l_output_for_trivial, vit_l_output_for_trivial)
+        # attention_map_loss, _ = smarter_attention_loss(attn_criticial_weights, attn_trivial_weights)
+
+        #############################################################################################################   Option 2
+        # agg_critical_visual_tokens, attn_criticial_weights = self.cross_attn(critical_visual_tokens, vit_l_output, vit_l_output)
+        # agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn(trivial_visual_tokens, vit_l_output, vit_l_output)
+        # #### This below is good
+        # #attention_map_loss, _ = gpt4_0_second_attention_loss(attn_criticial_weights, attn_trivial_weights, self.cluster_sigma, self.orthogonal_sigma, self.coverage_sigma)
+        # #print(attention_map_loss.device)
+        # attention_map_loss, _ = smarter_attention_loss(attn_criticial_weights, attn_trivial_weights)
+        #############################################################################################################  Option 3
+        
+        critical_mask, trivial_mask = self.cnn(vit_output_unflattened)  # Shape: (B, 1, 16, 16)
+        #attention_map_loss=compute_16x16_loss(critical_mask)
+        #print(f"compute_16x16_loss loss: {attention_map_loss}")
+        overlap_loss=(critical_mask*trivial_mask).sum()
+        #print(f"overlap loss: {overlap_loss}")
+
+        #attention_map_loss=overlap_loss/1000
+        #print(f"overlap_loss loss: {attention_map_loss}")
+        # if attention_map_loss<0.1:
+        #     refined_critical_mask = deep_snake(critical_mask, vit_output_unflattened)
+        #     crticial_patches = vit_output_unflattened * refined_critical_mask
+        #     critical_mask = refined_critical_mask
+        ############################################################################################################# Option for cloning vit_output
+        # Multiply the mask with the unflattened vision transformer output
+        #crticial_patches = vit_output_unflattened * critical_mask  # Shape: (B, 1024, 16, 16)
+        #trivial_patches = vit_output_unflattened * trivial_mask
+
+        crticial_patches = vit_output_unflattened  # Shape: (B, 1024, 16, 16)
+        trivial_patches = vit_output_unflattened
+
+        cnn_logits_critical = self.classifying_critical_cnn(crticial_patches)
+        cnn_logits_trivial = self.classifying_trivial_cnn(trivial_patches)
+        # _, attn_between_patches = self.cross_attn_between_patches(
+        #     query=vit_l_output,
+        #     key=crticial_patches.permute(0, 2, 3, 1).view(B, T, D),
+        #     value=crticial_patches.permute(0, 2, 3, 1).view(B, T, D),  
+        # )
+
+        # _, attn_in_patches = self.cross_attn_in_patches(
+        #     query=crticial_patches.permute(0, 2, 3, 1).view(B, T, D),
+        #     key=crticial_patches.permute(0, 2, 3, 1).view(B, T, D),
+        #     value=crticial_patches.permute(0, 2, 3, 1).view(B, T, D),  
+        # )
+
+        #uniform_attention = torch.full_like(attn_in_patches, 1 / T)*critical_mask.view(B, T, 1)  # Ideal uniform distribution
+        #inside_attn_loss = torch.nn.functional.mse_loss(attn_in_patches*critical_mask.view(B, T, 1), uniform_attention)
+
+        #outside_attention = attn_between_patches * (1 - critical_mask.view(B, T, 1))  # Masked attention outside critical areas
+        # Penalize high attention values outside critical mask
+        #outside_attention_loss = outside_attention.mean()
+        #attention_map_loss+=(outside_attention_loss/critical_mask.sum(dim=(-2,-1))).mean()
+        #attention_map_loss+=(inside_attn_loss*critical_mask.sum(dim=(-2,-1))).mean()*5
+        #attention_map_loss+=critical_mask.sum(dim=(-2,-1)).mean()/10
+        #loss_fn = SpatialAwarePatchLoss()
+        loss_fn = SpatialAwarePatchAttentionLoss()
+       
+        #attention_map_loss=loss_fn(vit_output_unflattened, critical_mask)
+        #if explicid_imgs_latents is not None:
+            #attention_map_loss+=loss_fn(explicid_imgs_latents.view(B, H, W, 768).permute(0, 3, 1, 2), critical_mask)
+            #print(f"loss_fn latent loss: {loss_fn(explicid_imgs_latents.view(B, H, W, 768).permute(0, 3, 1, 2), critical_mask)}")
+            #attention_map_loss+=loss_fn(vit_output_unflattened, critical_mask)
+            #print(f"loss_fn vit_output_unflattened loss: {loss_fn(vit_output_unflattened, critical_mask)}")
+            
+        #attention_map_loss+=1- critical_mask.sum(dim=(-2,-1)).mean()/256
+        #print(f"outside_attention_loss: {outside_attention_loss}")
+        #print(f"inside_attn_loss: {inside_attn_loss}")
+        #print(f"portion of the trivial {1- critical_mask.sum(dim=(-2,-1)).mean()/256}")
+        
+
+        # Flatten the result back to shape (B, 256, 1024)
+        vit_l_output_for_critical = crticial_patches.permute(0, 2, 3, 1).view(B, T, D)  # Shape: (B, 256, 1024)
+        vit_l_output_for_trivial = trivial_patches.permute(0, 2, 3, 1).view(B, T, D)
+        agg_critical_visual_tokens, attn_criticial_weights = self.cross_attn_critical(critical_visual_tokens, vit_l_output_for_critical, vit_l_output_for_critical)
+        agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial(trivial_visual_tokens, vit_l_output_for_trivial, vit_l_output_for_trivial)
+        #attention_map_loss, _ = gpt4_0_second_attention_loss(attn_criticial_weights, attn_trivial_weights, self.cluster_sigma, self.orthogonal_sigma, self.coverage_sigma)
+        attention_map_loss=0
+        attention_map_loss += loss_fn(patches.view(B, D_p, H_p, W_p), attn_criticial_weights.view(B, self.num_of_criteria, H, W), attn_trivial_weights.view(B, self.num_of_criteria, H, W))
+        # for i in range(7):
+        #     #attention_map_loss+=compute_16x16_loss(attn_criticial_weights[:,0,:].unsqueeze(1).view(B, 1, H, W))/7
+        #     attention_map_loss += loss_fn(patches.view(B, 588, H, W), attn_criticial_weights[:,0,:].unsqueeze(1).view(B, 1, H, W))
+        #print(f"agg_critical_visual_tokens shape {agg_critical_visual_tokens.shape}")
+        ############################################################################################################# Option "smarter" attention loss
+        #attention_map_loss, _ = smarter_attention_loss(attn_criticial_weights, attn_trivial_weights, critical_mask, trivial_mask)
+        #############################################################################################################
+
+        agg_critical_visual_tokens_for_explicid = self.proj(self.norm(self.ffn(agg_critical_visual_tokens[:,:self.num_of_criteria,:])))
+        agg_critical_visual_tokens_for_explicid = F.normalize(agg_critical_visual_tokens_for_explicid, dim=-1)
+        
+        agg_critical_visual_tokens_for_SiT = self.proj_Sit(self.norm(self.ffn(agg_critical_visual_tokens)))
+
+        agg_trivial_visual_tokens_for_SiT = self.proj_Sit(self.norm(self.ffn(agg_trivial_visual_tokens)))
+
+        # agg_visual_tokens_for_explicid = self.proj_Sit_to_explicid(agg_visual_tokens_for_SiT)
+        # agg_visual_tokens_for_explicid = F.normalize(agg_visual_tokens_for_explicid, dim=-1)
+
+        image_logits_dict = {}
+        idx = 0
+        for key in self.concept_token_dict.keys():
+            image_logits_dict[key] = (self.logit_scale * agg_critical_visual_tokens_for_explicid[:, idx:idx+1, :] @ self.concept_token_dict[key].repeat(B, 1, 1).permute(0, 2, 1)).squeeze(1)
+            idx += 1
+
+        
+        image_logits_list = []
+
+        for key in image_logits_dict.keys():
+            image_logits_list.append(image_logits_dict[key])
+
+        
+        image_logits = torch.cat(image_logits_list, dim=-1)
+
+        cls_logits_dict = { }
+
+        cls_logits = self.cls_head(image_logits)
+
+
+        #cls_logits_criteria_only = self.cls_head_criteria_only(agg_visual_tokens_for_SiT.mean(dim=1))
+        # print(f"agg_critical_visual_tokens_for_SiT shape: {agg_critical_visual_tokens_for_SiT.shape}")
+        # print(f"agg_trivial_visual_tokens_for_SiT shape: {agg_trivial_visual_tokens_for_SiT.shape}")
+        #combined_tokens = torch.cat((F.normalize(agg_critical_visual_tokens_for_SiT, dim=-1), F.normalize(agg_trivial_visual_tokens_for_SiT, dim=-1)), dim=1)
+        to_return = (patches, cls_logits, None, cls_logits_dict, image_logits_dict,  F.normalize(agg_critical_visual_tokens_for_SiT, dim=-1), 
+                     F.normalize(agg_trivial_visual_tokens_for_SiT, dim=-1), attention_map_loss, overlap_loss, attn_criticial_weights, attn_trivial_weights, 
+                     vit_l_output, agg_critical_visual_tokens, agg_trivial_visual_tokens, cnn_logits_critical, cnn_logits_trivial, critical_mask, trivial_mask)
+
+        return to_return
+    
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+class ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_SuperPixels(nn.Module):  
+    def __init__(self, concept_list, model_name='biomedclip', config=None):
+        super().__init__()
+            
+        self.concept_list = concept_list
+        self.model_name = model_name
+        self.config = config
+        self.num_of_criteria = NUM_OF_CRITERIA[config.dataset]
+        self.device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+       
+        if self.model_name in ['biomedclip', 'openclip']:
+            if self.model_name == 'biomedclip':
+                self.model, preprocess = create_model_from_pretrained('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
+                self.tokenizer = get_tokenizer('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
+            elif self.model_name == 'openclip':
+                self.model, preprocess = create_model_from_pretrained('hf-hub:laion/CLIP-ViT-L-14-laion2B-s32B-b82K')
+                self.tokenizer = get_tokenizer('hf-hub:laion/CLIP-ViT-L-14-laion2B-s32B-b82K')
+               
+            
+            config.preprocess = preprocess
+
+            self.model_visual_ViT_L = clip.load(f"ViT-L/14")[0].visual
+            #self.model_visual_custom = VisionTransformer7x7()
+
+            # Convert specific layers or parameters to float32
+            for param in self.model_visual_ViT_L.parameters():
+                param.data = param.data.to(torch.float32)
+
+            self.model_visual_ViT_L.cuda()
+            #self.model_visual_custom.cuda()
             
             self.model.cuda()
             
@@ -2283,6 +3030,7 @@ class ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens(nn.Module):
         #                                     34  for ISIC
         #                                     17 for BUSI
         self.cls_head = nn.Linear(in_features=NUM_OF_SIMILARITIES[self.config.dataset], out_features=config.num_class)
+        self.minimal_cls_head = nn.Linear(in_features=1024*7, out_features=config.num_class)
 
         self.cluster_sigma = torch.nn.Parameter(torch.ones(1))
         self.orthogonal_sigma = torch.nn.Parameter(torch.ones(1))
@@ -2290,13 +3038,16 @@ class ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens(nn.Module):
 
         for param in self.model_visual_ViT_L.parameters():
             param.requires_grad = True
+
         
         self.critical_visual_tokens.requires_grad = True
         self.trivial_visual_tokens.requires_grad = True
 
         ###########################################################
         self.cnn = PatchSelectorCNN().cuda()
-        self.classifying_cnn = ClassifyingCNN().cuda()
+        self.classifying_critical_cnn = ClassifyingCNN().cuda()
+        self.classifying_trivial_cnn = ClassifyingCNN().cuda()
+        self.gnn = GNN(in_channels=3, hidden_channels=16, out_channels=1024).cuda()
 
     
     def get_backbone_params(self):
@@ -2352,109 +3103,76 @@ class ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens(nn.Module):
             return cls_logits_refined
 
         self.visual_features.clear()
-
         _ = self.model_visual_ViT_L(imgs)
-
+        patches = image_to_patches(imgs, patch_size=14)
+        H_p = W_p = int(patches.shape[1] ** 0.5)
+        D_p = patches.shape[2]
         vit_l_output=self.visual_features[0].permute(1, 0, 2)[:, 1:, :] 
-
         B=vit_l_output.shape[0]
+        #############################################################################
+        # Generate superpixels for the batch
+        #segments_batch = generate_superpixels_batch(imgs)
+        #data_list = create_superpixel_graph_batch(imgs, segments_batch)
+        #print(f"data_list shape {data_list.shape}")
 
+        # # Process superpixels with GNN
+        # superpixel_features_list = [self.gnn(data.to(self.device)) for data in data_list]
+
+        # B = imgs.shape[0]
+        # critical_visual_tokens = self.critical_visual_tokens.repeat(B, 1, 1)
+        # trivial_visual_tokens = self.trivial_visual_tokens.repeat(B, 1, 1)
+
+        # agg_critical_visual_tokens_list = []
+        # agg_trivial_visual_tokens_list = []
+        # attn_criticial_weights_list = []
+        # attn_trivial_weights_list = []
+
+        # for superpixel_features in superpixel_features_list:
+        #     agg_critical_visual_tokens, attn_criticial_weights = self.cross_attn_critical(critical_visual_tokens, superpixel_features, superpixel_features)
+        #     agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial(trivial_visual_tokens, superpixel_features, superpixel_features)
+        #     agg_critical_visual_tokens_list.append(agg_critical_visual_tokens)
+        #     agg_trivial_visual_tokens_list.append(agg_trivial_visual_tokens)
+        #     attn_criticial_weights_list.append(attn_criticial_weights)
+        #     attn_trivial_weights_list.append(attn_trivial_weights)
+
+        # agg_critical_visual_tokens = torch.stack(agg_critical_visual_tokens_list)
+        # agg_trivial_visual_tokens = torch.stack(agg_trivial_visual_tokens_list)
+        # attn_criticial_weights = torch.stack(attn_criticial_weights_list)
+        # attn_trivial_weights = torch.stack(attn_trivial_weights_list)
+
+        #superpixels = superpixel_segmentation(imgs)
+
+        # Step 2: Assign distinct colors to each superpixel
+        #colored_images = apply_distinct_colors_to_superpixels(imgs, superpixels)
+        #patches_colored = image_to_patches(superpixels, patch_size=14)
+        #patches_colored = image_to_patches(colored_images, patch_size=14)
+        #############################################################################
         critical_visual_tokens = self.critical_visual_tokens.repeat(B, 1, 1)
         trivial_visual_tokens = self.trivial_visual_tokens.repeat(B, 1, 1)
-        #print(f"vit_l_output.shape in explicd {vit_l_output.shape}") # B 256 1024
-        ############################################################################################################# Option 1
         B, T, D = vit_l_output.shape  # B: batch size, T: num_patches (256), D: patch_dim (1024)
         H = W = int(T ** 0.5)  # Assuming T is a perfect square, H = W = 16
         vit_output_unflattened = vit_l_output.view(B, H, W, D).permute(0, 3, 1, 2)  # Shape: (B, 1024, 16, 16)
-        #vit_output_unflattened_for_exlusive = vit_output_unflattened.clone().detach()
-        #vit_output_unflattened_for_exlusive =vit_output_unflattened
-        # critical_mask = self.cnn(vit_output_unflattened)  # Shape: (B, 1, 16, 16)
-        # trivial_mask = 1-critical_mask
-
-        # # Multiply the mask with the unflattened vision transformer output
-        # crticial_patches = vit_output_unflattened * critical_mask  # Shape: (B, 1024, 16, 16)
-        # trivial_patches = vit_output_unflattened * trivial_mask
-
-        # # Flatten the result back to shape (B, 256, 1024)
-        # vit_l_output_for_critical = crticial_patches.permute(0, 2, 3, 1).view(B, T, D)  # Shape: (B, 256, 1024)
-        # vit_l_output_for_trivial = trivial_patches.permute(0, 2, 3, 1).view(B, T, D)
-        # agg_critical_visual_tokens, attn_criticial_weights = self.cross_attn(critical_visual_tokens, vit_l_output_for_critical, vit_l_output_for_critical)
-        # agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn(trivial_visual_tokens, vit_l_output_for_trivial, vit_l_output_for_trivial)
-        # attention_map_loss, _ = smarter_attention_loss(attn_criticial_weights, attn_trivial_weights)
-
-        #############################################################################################################   Option 2
-        # agg_critical_visual_tokens, attn_criticial_weights = self.cross_attn(critical_visual_tokens, vit_l_output, vit_l_output)
-        # agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn(trivial_visual_tokens, vit_l_output, vit_l_output)
-        # #### This below is good
-        # #attention_map_loss, _ = gpt4_0_second_attention_loss(attn_criticial_weights, attn_trivial_weights, self.cluster_sigma, self.orthogonal_sigma, self.coverage_sigma)
-        # #print(attention_map_loss.device)
-        # attention_map_loss, _ = smarter_attention_loss(attn_criticial_weights, attn_trivial_weights)
-        #############################################################################################################  Option 3
         
         critical_mask, trivial_mask = self.cnn(vit_output_unflattened)  # Shape: (B, 1, 16, 16)
-        attention_map_loss=compute_16x16_loss(critical_mask)
         overlap_loss=(critical_mask*trivial_mask).sum()
-        #print(f"overlap loss: {overlap_loss}")
 
-        attention_map_loss=overlap_loss/100000
-        # if attention_map_loss<0.1:
-        #     refined_critical_mask = deep_snake(critical_mask, vit_output_unflattened)
-        #     crticial_patches = vit_output_unflattened * refined_critical_mask
-        #     critical_mask = refined_critical_mask
-        ############################################################################################################# Option for cloning vit_output
-        # Multiply the mask with the unflattened vision transformer output
-        crticial_patches = vit_output_unflattened * critical_mask  # Shape: (B, 1024, 16, 16)
-        trivial_patches = vit_output_unflattened * trivial_mask
+        crticial_patches = vit_output_unflattened  # Shape: (B, 1024, 16, 16)
+        trivial_patches = vit_output_unflattened
 
-        cnn_logits = self.classifying_cnn(vit_output_unflattened)
-
-        # _, attn_between_patches = self.cross_attn_between_patches(
-        #     query=vit_l_output,
-        #     key=crticial_patches.permute(0, 2, 3, 1).view(B, T, D),
-        #     value=crticial_patches.permute(0, 2, 3, 1).view(B, T, D),  
-        # )
-
-        # _, attn_in_patches = self.cross_attn_in_patches(
-        #     query=crticial_patches.permute(0, 2, 3, 1).view(B, T, D),
-        #     key=crticial_patches.permute(0, 2, 3, 1).view(B, T, D),
-        #     value=crticial_patches.permute(0, 2, 3, 1).view(B, T, D),  
-        # )
-
-        #uniform_attention = torch.full_like(attn_in_patches, 1 / T)*critical_mask.view(B, T, 1)  # Ideal uniform distribution
-        #inside_attn_loss = torch.nn.functional.mse_loss(attn_in_patches*critical_mask.view(B, T, 1), uniform_attention)
-
-        #outside_attention = attn_between_patches * (1 - critical_mask.view(B, T, 1))  # Masked attention outside critical areas
-        # Penalize high attention values outside critical mask
-        #outside_attention_loss = outside_attention.mean()
-        #attention_map_loss+=(outside_attention_loss/critical_mask.sum(dim=(-2,-1))).mean()
-        #attention_map_loss+=(inside_attn_loss*critical_mask.sum(dim=(-2,-1))).mean()*5
-        #attention_map_loss+=critical_mask.sum(dim=(-2,-1)).mean()/10
-        loss_fn = AdaptiveCriticalPatchLoss()
-        if explicid_imgs_latents is not None:
-            attention_map_loss+=loss_fn(explicid_imgs_latents.view(B, H, W, 768).permute(0, 3, 1, 2), critical_mask)
-        attention_map_loss+=critical_mask.sum(dim=(-2,-1)).mean()/100
-        #print(f"outside_attention_loss: {outside_attention_loss}")
-        #print(f"inside_attn_loss: {inside_attn_loss}")
-
-        # Flatten the result back to shape (B, 256, 1024)
+        cnn_logits_critical = self.classifying_critical_cnn(crticial_patches)
+        cnn_logits_trivial = self.classifying_trivial_cnn(trivial_patches)
+        loss_fn = SpatialAwarePatchAttentionLoss()
         vit_l_output_for_critical = crticial_patches.permute(0, 2, 3, 1).view(B, T, D)  # Shape: (B, 256, 1024)
         vit_l_output_for_trivial = trivial_patches.permute(0, 2, 3, 1).view(B, T, D)
         agg_critical_visual_tokens, attn_criticial_weights = self.cross_attn_critical(critical_visual_tokens, vit_l_output_for_critical, vit_l_output_for_critical)
         agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial(trivial_visual_tokens, vit_l_output_for_trivial, vit_l_output_for_trivial)
-        #print(f"agg_critical_visual_tokens shape {agg_critical_visual_tokens.shape}")
-        ############################################################################################################# Option "smarter" attention loss
-        #attention_map_loss, _ = smarter_attention_loss(attn_criticial_weights, attn_trivial_weights, critical_mask, trivial_mask)
-        #############################################################################################################
+        attention_map_loss=torch.tensor(0.0, device=self.device)
+        attention_map_loss += loss_fn(patches.view(B, D_p, H_p, W_p), attn_criticial_weights.view(B, self.num_of_criteria, H, W), attn_trivial_weights.view(B, self.num_of_criteria, H, W))
 
         agg_critical_visual_tokens_for_explicid = self.proj(self.norm(self.ffn(agg_critical_visual_tokens[:,:self.num_of_criteria,:])))
         agg_critical_visual_tokens_for_explicid = F.normalize(agg_critical_visual_tokens_for_explicid, dim=-1)
-        
         agg_critical_visual_tokens_for_SiT = self.proj_Sit(self.norm(self.ffn(agg_critical_visual_tokens)))
-
         agg_trivial_visual_tokens_for_SiT = self.proj_Sit(self.norm(self.ffn(agg_trivial_visual_tokens)))
-
-        # agg_visual_tokens_for_explicid = self.proj_Sit_to_explicid(agg_visual_tokens_for_SiT)
-        # agg_visual_tokens_for_explicid = F.normalize(agg_visual_tokens_for_explicid, dim=-1)
 
         image_logits_dict = {}
         idx = 0
@@ -2462,26 +3180,25 @@ class ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens(nn.Module):
             image_logits_dict[key] = (self.logit_scale * agg_critical_visual_tokens_for_explicid[:, idx:idx+1, :] @ self.concept_token_dict[key].repeat(B, 1, 1).permute(0, 2, 1)).squeeze(1)
             idx += 1
 
-        
         image_logits_list = []
 
         for key in image_logits_dict.keys():
             image_logits_list.append(image_logits_dict[key])
 
-        
         image_logits = torch.cat(image_logits_list, dim=-1)
-
         cls_logits_dict = { }
-
         cls_logits = self.cls_head(image_logits)
 
+        # Compute weighted sum of patches for each token
+        weighted_features = attn_criticial_weights.unsqueeze(-1) * vit_l_output_for_critical.unsqueeze(1)  # Shape: (B, 7, 256, patch_dim)
+        token_representations = weighted_features.sum(dim=2)  # Shape: (B, 7, patch_dim)
 
-        #cls_logits_criteria_only = self.cls_head_criteria_only(agg_visual_tokens_for_SiT.mean(dim=1))
-        # print(f"agg_critical_visual_tokens_for_SiT shape: {agg_critical_visual_tokens_for_SiT.shape}")
-        # print(f"agg_trivial_visual_tokens_for_SiT shape: {agg_trivial_visual_tokens_for_SiT.shape}")
-        #combined_tokens = torch.cat((F.normalize(agg_critical_visual_tokens_for_SiT, dim=-1), F.normalize(agg_trivial_visual_tokens_for_SiT, dim=-1)), dim=1)
-        to_return = (cls_logits, None, cls_logits_dict, image_logits_dict,  F.normalize(agg_critical_visual_tokens_for_SiT, dim=-1), 
-                     F.normalize(agg_trivial_visual_tokens_for_SiT, dim=-1), attention_map_loss, attn_criticial_weights, attn_trivial_weights, 
-                     vit_l_output, agg_critical_visual_tokens, agg_trivial_visual_tokens, cnn_logits, critical_mask, trivial_mask)
+        # Concatenate token representations
+        concatenated_tokens = token_representations.view(B, -1)  # Shape: (B, 7 * patch_dim)
+
+        cls_minimal_logits = self.minimal_cls_head(concatenated_tokens)
+        to_return = (patches, patches, cls_logits, cls_minimal_logits, cls_logits_dict, image_logits_dict,  F.normalize(agg_critical_visual_tokens_for_SiT, dim=-1), 
+                     F.normalize(agg_trivial_visual_tokens_for_SiT, dim=-1), attention_map_loss, overlap_loss, attn_criticial_weights, attn_trivial_weights, 
+                     vit_l_output, agg_critical_visual_tokens, agg_trivial_visual_tokens, cnn_logits_critical, cnn_logits_trivial, critical_mask, trivial_mask)
 
         return to_return
