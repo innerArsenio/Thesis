@@ -26,11 +26,15 @@ from skimage import img_as_ubyte
 import skimage
 from skimage.color import label2rgb
 import torchvision.transforms as T
+from skimage.util import img_as_float
+from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+import copy
 
 NUM_OF_CRITERIA = {
     'ISIC': 7,
     'ISIC_MINE': 6,
     'ISIC_MINIMAL': 7,
+    'ISIC_SOFT': 6,
 
     'IDRID': 5,
     'IDRID_EDEMA': 6,
@@ -43,6 +47,7 @@ NUM_OF_SIMILARITIES = {
     'ISIC': 34,
     'ISIC_MINE': 24,
     'ISIC_MINIMAL': 49,
+    'ISIC_SOFT': 12,
 
     'IDRID': 18,
     'IDRID_EDEMA': 15,
@@ -52,7 +57,7 @@ NUM_OF_SIMILARITIES = {
 }
 
 def get_prefix(task: str, key: str) -> str:
-    if task== "ISIC" or task == "ISIC_MINE" or task == "ISIC_MINIMAL":
+    if task== "ISIC" or task == "ISIC_MINE" or task == "ISIC_MINIMAL" or task == "ISIC_SOFT":
         return f"this is a dermoscopic image, the {key} of the lesion is "
     elif task == "IDRID" or task=='IDRID_EDEMA':
         return f"this is a fundus image, the {key} of the eye is "
@@ -369,10 +374,12 @@ class SpatialAwarePatchLoss(nn.Module):
         # Flatten patches (B, 1024, 256) and mask (B, 1, 256)
         image_feats = image_feats.view(B, C, num_patches)
         mask = mask.view(B, 1, num_patches)
-        mask_coverage = mask.mean(dim=2, keepdim=True)  # (B, 1, 1)
+        #mask_coverage = mask.mean(dim=2, keepdim=True)  # (B, 1, 1)
 
-        lambda_within = torch.exp(-self.gamma * mask_coverage)
-        lambda_between = torch.exp(self.gamma * mask_coverage)
+        #lambda_within = torch.exp(-self.gamma * mask_coverage)
+        #lambda_between = torch.exp(self.gamma * mask_coverage)
+        lambda_within = 1
+        lambda_between = 1
 
         # Compute spatial distance matrix (256, 256)
         D = self.compute_distance_matrix(H, W, device).to(device)  # (256, 256)
@@ -492,6 +499,8 @@ class SpatialAwarePatchAttentionLoss(nn.Module):
 
     def forward(self, image_feats, critical_weights, trivial_weights):
         B, C, H, W = image_feats.shape
+        #critical_weights = torch.sigmoid(critical_weights / 0.005)
+        #trivial_weights = torch.sigmoid(trivial_weights / 0.005)
         num_critical = critical_weights.shape[1]
         num_trivial = trivial_weights.shape[1]
         image_feats = image_feats.flatten(2).transpose(1, 2)  # (B, 256, 1024)
@@ -575,6 +584,45 @@ class PatchSelectorCNN(nn.Module):
         return x_critical_mask, x_trivial_mask
 
 
+class PatchSelectorCNN_kernel_14(nn.Module):
+    def __init__(self, temperature=0.1):
+        super(PatchSelectorCNN_kernel_14, self).__init__()
+        self.temperature = temperature
+        
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=14, stride=14, padding=0),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            #nn.MaxPool2d(2, 2),
+            
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            #nn.MaxPool2d(2, 2),
+            
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.ReLU(),
+            #nn.MaxPool2d(2, 2),
+        )
+        
+        self.classifier = nn.Conv2d(512, 2, kernel_size=1)  # 2 channels: critical/trivial
+    
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = self.classifier(x)  # Output shape: (batch, 2, H, W)
+        
+        # Apply softmax with low temperature
+        x = F.softmax(x / self.temperature, dim=1)
+
+        x_critical_mask =x[:,0,:, :].unsqueeze(1)
+        x_trivial_mask = x[:,1,:, :].unsqueeze(1)
+
+        return x_critical_mask, x_trivial_mask
+
 class PatchSelectorCNNConscise(nn.Module):
     def __init__(self):
         super(PatchSelectorCNNConscise, self).__init__()
@@ -601,7 +649,7 @@ class PatchSelectorCNNConscise(nn.Module):
 class ClassifyingCNN(nn.Module):
     def __init__(self, num_classes=7):
         super(ClassifyingCNN, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels=1024, out_channels=512, kernel_size=3)
+        self.conv1 = nn.Conv2d(in_channels=768, out_channels=512, kernel_size=3)
         self.conv2 = nn.Conv2d(in_channels=512, out_channels=256, kernel_size=3)
         self.conv3 = nn.Conv2d(in_channels=256, out_channels=128, kernel_size=3)
         self.conv4 = nn.Conv2d(in_channels=128, out_channels=64, kernel_size=3)
@@ -1067,90 +1115,113 @@ def image_to_patches(images, patch_size=14):
     
     return patches
 
-def superpixel_segmentation(images, num_segments=100, compactness=10):
-    """
-    Perform superpixel segmentation on a batch of images.
-    
-    Parameters:
-    - images: Tensor of shape (B, 3, 224, 224), the batch of images.
-    - num_segments: Number of superpixels to generate.
-    - compactness: Balance between color and space; higher compactness gives more square superpixels.
-    
-    Returns:
-    - A tensor of shape (B, H, W) with the superpixel labels.
-    """
-    images = images.cpu().numpy()  # Convert to numpy array (B, 3, 224, 224)
-    
-    seg_results = []
-    
-    for img in images:
-        img = np.transpose(img, (1, 2, 0))
-        #img_lab = rgb2lab(img)
-        
-        segments = slic(img, n_segments=num_segments, compactness=compactness, start_label=0)
-        segmented_color = label2rgb(segments, img, kind='overlay', bg_label=-1)
-        seg_results.append(np.transpose(segmented_color, (2, 0, 1)))
-    
-    seg_results = np.stack(seg_results, axis=0)
-    
-    return torch.tensor(seg_results)
-
-def generate_distinct_colors(num_colors):
-    """
-    Generate a list of distinct colors using the HSV color space to ensure no color repeats.
-    
-    Parameters:
-    - num_colors: Number of distinct colors to generate.
-    
-    Returns:
-    - A numpy array of shape (num_colors, 3) containing RGB values for each color.
-    """
-    # Use HSV to generate distinct colors, and then convert to RGB
-    hsv_colors = np.linspace(0, 1, num_colors, endpoint=False)  # Generate hues from 0 to 1
-    colors = np.array([skimage.color.hsv2rgb(np.array([[hue, 1, 1]]))[0][0] for hue in hsv_colors])
-    
-    # Convert colors to integers in the range [0, 255]
-    colors = (colors * 255).astype(np.uint8)
-    
-    return colors
-
-def apply_distinct_colors_to_superpixels(images, superpixels):
-    """
-    Change the image colors so that each superpixel gets its own unique color with no repetition.
-    
-    Parameters:
-    - images: Tensor of shape (B, 3, 224, 224), the batch of images.
-    - superpixels: Tensor of shape (B, H, W), containing the superpixel labels for each pixel.
-    
-    Returns:
-    - A tensor of shape (B, 3, H, W) where each superpixel has a unique color.
-    """
+# Superpixel Segmentation with Ordered Labels and Fixed Padding
+def segment_superpixels(images, n_segments=81, compactness=10, fixed_superpixels=81):
+    """ Segment images into superpixels, return ordered labels, and pad to fixed number. """
     B, C, H, W = images.shape
-    colored_images = torch.zeros(B, 3, H, W, dtype=torch.uint8)
+    images_np = images.permute(0, 2, 3, 1).cpu().numpy()  # Convert to (B, H, W, C)
+    superpixel_labels = []
     
-    # Get the number of distinct superpixels (assuming max label is the number of superpixels)
-    max_superpixels = int(superpixels.max() + 1)
+    for img in images_np:
+        img_float = img_as_float(img)
+        segments = slic(img_float, n_segments=n_segments, compactness=compactness)
+        unique_labels = np.unique(segments)
+        centroids = [np.mean(np.argwhere(segments == l), axis=0) for l in unique_labels]
+        sorted_indices = np.argsort([c[0] * W + c[1] for c in centroids])
+        sorted_labels = unique_labels[sorted_indices]
+        
+        ordered_segments = np.full((H, W), fixed_superpixels - 1, dtype=np.int64)
+        for i, label in enumerate(sorted_labels[:fixed_superpixels]):
+            ordered_segments[segments == label] = i
+        
+        superpixel_labels.append(ordered_segments)
     
-    # Generate distinct colors for each superpixel
-    distinct_colors = generate_distinct_colors(max_superpixels)
+    return torch.tensor(np.stack(superpixel_labels)).to("cuda")  # Shape (B, H, W)
+
+# Interpolate Patch Embeddings to Original Resolution
+def interpolate_patch_embeddings(vit_output):
+    """ Upsample patch embeddings to match original image resolution. """
+    B, N, D = vit_output.shape  # (Batch, Num Patches, Patch Dim)
+    H, W = int(N ** 0.5), int(N ** 0.5)  # Assuming square patches
+    vit_output = vit_output.view(B, H, W, D).permute(0, 3, 1, 2)  # (B, D, H, W)
+    vit_output = F.interpolate(vit_output, size=(224, 224), mode='bilinear', align_corners=False)
+    return vit_output.permute(0, 2, 3, 1)  # (B, 224, 224, D)
+
+# Aggregate Patch Embeddings into Superpixel Representations
+def aggregate_superpixel_embeddings(vit_output, superpixel_labels, fixed_superpixels=81):
+    """ Aggregate patch embeddings into superpixel embeddings with fixed padding. """
+    B, H, W, D = vit_output.shape  # (Batch, 224, 224, Patch Dim)
+    superpixel_embeddings = torch.zeros((B, fixed_superpixels, D), device=vit_output.device)
     
-    # Iterate through the batch of images
     for b in range(B):
-        img = images[b].cpu().numpy()
-        segments = superpixels[b].cpu().numpy()
-        
-        # Create an output image where each superpixel is filled with its unique color
-        colored_img = np.zeros((H, W, 3), dtype=np.uint8)
-        
-        for y in range(H):
-            for x in range(W):
-                label = segments[y, x]
-                colored_img[y, x] = distinct_colors[label]
-        
-        # Convert the colored image back to a tensor and store it in the output batch
-        colored_images[b] = torch.tensor(colored_img).permute(2, 0, 1)
+        labels = superpixel_labels[b]
+        for i in range(fixed_superpixels):
+            mask = (labels == i).unsqueeze(-1).expand(-1, -1, D)  # Shape (224, 224, D)
+            if mask.any():
+                sp_embedding = (vit_output[b] * mask).sum(dim=(0, 1)) / mask.sum()
+                superpixel_embeddings[b, i] = sp_embedding
     
-    return colored_images
+    return superpixel_embeddings  # Shape (B, fixed_superpixels, 1024)
+
+def rgb_to_hsv_torch(rgb_tensor):
+    """
+    Convert a PyTorch tensor from RGB to HSV.
+    
+    Args:
+        rgb_tensor (torch.Tensor): Tensor of shape (B, 3, H, W) with values in [0, 1].
+    
+    Returns:
+        torch.Tensor: HSV tensor of shape (B, 3, H, W) with H in [0, 1], S in [0, 1], V in [0, 1].
+    """
+    r, g, b = rgb_tensor[:, 0, :, :], rgb_tensor[:, 1, :, :], rgb_tensor[:, 2, :, :]
+
+    # Compute Value (Brightness)
+    v = torch.max(rgb_tensor, dim=1)[0]
+
+    # Compute Saturation
+    min_rgb = torch.min(rgb_tensor, dim=1)[0]
+    s = (v - min_rgb) / (v + 1e-10)  # Avoid division by zero
+
+    # Compute Hue
+    delta = v - min_rgb + 1e-10  # Small epsilon to prevent NaN
+    h = torch.zeros_like(v)
+
+    # Conditions for hue computation
+    mask_r = (v == r)
+    mask_g = (v == g)
+    mask_b = (v == b)
+
+    h[mask_r] = (g[mask_r] - b[mask_r]) / delta[mask_r] % 6
+    h[mask_g] = (b[mask_g] - r[mask_g]) / delta[mask_g] + 2
+    h[mask_b] = (r[mask_b] - g[mask_b]) / delta[mask_b] + 4
+
+    h = h / 6  # Normalize hue to [0,1]
+
+    # Stack H, S, V back together
+    hsv_tensor = torch.stack([h, s, v], dim=1)
+    
+    return hsv_tensor
+
+# Circular Convolution Layer
+class CircularConv(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.conv = nn.Conv1d(in_dim, out_dim, kernel_size=3, padding=1, groups=1, padding_mode='circular')
+    
+    def forward(self, x):
+        x = x.permute(0, 2, 1)  # Convert (B, fixed_superpixels, 1024) -> (B, 1024, fixed_superpixels)
+        x = F.relu(self.conv(x))
+        return x.permute(0, 2, 1)  # Convert back
+
+# Node Classification with Soft Mask
+class NodeClassifier(nn.Module):
+    def __init__(self, in_dim):
+        super().__init__()
+        self.fc = nn.Linear(in_dim, 1)  # Single value for soft mask
+    
+    def forward(self, h):
+        mask = torch.sigmoid(self.fc(h)/ 0.005)  # Low temperature sigmoid
+        return mask * h  # Apply soft mask to features
 
 # Define a GNN model
 class GNN(torch.nn.Module):
@@ -1170,7 +1241,7 @@ class GNN(torch.nn.Module):
         return x
 
 class VisionTransformer7x7(nn.Module):
-    def __init__(self, image_size=224, patch_size=7, embed_dim=144, num_heads=12, num_layers=12):
+    def __init__(self, image_size=224, patch_size=7, embed_dim=1024, num_heads=16, num_layers=12):
         super().__init__()
         
         self.patch_size = patch_size
@@ -1213,17 +1284,17 @@ class VisionTransformer7x7(nn.Module):
         # Transformer Encoder
         x = self.encoder(x)  # (B, 1025, 768)
 
-        # Classification token output
-        x = self.head(x[:, 1:, :])  # (B, 1000)
+        # # Classification token output
+        # x = self.head(x[:, 1:, :])  # (B, 1000)
 
-        temperature = 0.05  # Low temperature (small value makes softmax more peaked)
-        scaled_logits = x / temperature
-        #print(f"x shape {x.shape}")
-        softmax_output = F.softmax(scaled_logits, dim=1)
-        #print(softmax_output.shape)
-        x_critical_mask =softmax_output[:,:,0].unsqueeze(1)
-        x_trivial_mask = softmax_output[:,:,1].unsqueeze(1)
-        return x_critical_mask, x_trivial_mask
+        # temperature = 0.05  # Low temperature (small value makes softmax more peaked)
+        # scaled_logits = x / temperature
+        # #print(f"x shape {x.shape}")
+        # softmax_output = F.softmax(scaled_logits, dim=1)
+        # #print(softmax_output.shape)
+        # x_critical_mask =softmax_output[:,:,0].unsqueeze(1)
+        # x_trivial_mask = softmax_output[:,:,1].unsqueeze(1)
+        return x
 
 class CLIPWithSoftPrompts(nn.Module):
     def __init__(self, clip_model, prompt_length=10, embedding_dim=512):
@@ -2963,14 +3034,14 @@ class ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_SuperPixels(nn.Modu
             config.preprocess = preprocess
 
             self.model_visual_ViT_L = clip.load(f"ViT-L/14")[0].visual
-            #self.model_visual_custom = VisionTransformer7x7()
+            self.model_visual_custom = VisionTransformer7x7()
 
             # Convert specific layers or parameters to float32
             for param in self.model_visual_ViT_L.parameters():
                 param.data = param.data.to(torch.float32)
 
             self.model_visual_ViT_L.cuda()
-            #self.model_visual_custom.cuda()
+            self.model_visual_custom.cuda()
             
             self.model.cuda()
             
@@ -3010,12 +3081,23 @@ class ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_SuperPixels(nn.Modu
         self.critical_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, 1024, dtype=torch.float32)))
         self.trivial_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, 1024, dtype=torch.float32)))
 
+        self.critical_visual_tokens_smaller = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, 1024, dtype=torch.float32)))
+        self.trivial_visual_tokens_smaller  = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, 1024, dtype=torch.float32)))
+
         self.cross_attn = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
         self.cross_attn_critical = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
         self.cross_attn_trivial = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
+
+        self.cross_attn_critical_smaller = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
+        self.cross_attn_trivial_smaller = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
+
         self.cross_attn_between_patches = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
         self.cross_attn_in_patches = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
         self.ffn = FFN(1024, 1024*4)
+
+        self.ffn_smaller = FFN(1024, 1024*4)
+        self.norm_smaller = nn.LayerNorm(1024)
+
         self.norm = nn.LayerNorm(1024)
         self.proj = nn.Linear(in_features=1024, out_features=512, bias=False)
         self.proj_Sit = nn.Linear(in_features=1024, out_features=768, bias=False)
@@ -3043,11 +3125,15 @@ class ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_SuperPixels(nn.Modu
         self.critical_visual_tokens.requires_grad = True
         self.trivial_visual_tokens.requires_grad = True
 
+        self.critical_visual_tokens_smaller.requires_grad = True
+        self.trivial_visual_tokens_smaller.requires_grad = True
+
         ###########################################################
         self.cnn = PatchSelectorCNN().cuda()
         self.classifying_critical_cnn = ClassifyingCNN().cuda()
         self.classifying_trivial_cnn = ClassifyingCNN().cuda()
-        self.gnn = GNN(in_channels=3, hidden_channels=16, out_channels=1024).cuda()
+        self.gnn =  CircularConv(in_dim=1024, out_dim=1024).cuda()
+        self.node_classifier =  NodeClassifier(in_dim=1024).cuda()
 
     
     def get_backbone_params(self):
@@ -3108,69 +3194,57 @@ class ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_SuperPixels(nn.Modu
         H_p = W_p = int(patches.shape[1] ** 0.5)
         D_p = patches.shape[2]
         vit_l_output=self.visual_features[0].permute(1, 0, 2)[:, 1:, :] 
-        B=vit_l_output.shape[0]
+        B, T, D = vit_l_output.shape  # B: batch size, T: num_patches (256), D: patch_dim (1024)
+        H = W = int(T ** 0.5)  # Assuming T is a perfect square, H = W = 16
         #############################################################################
+        #custom_patches = self.model_visual_custom(imgs)[:, 1:, :]
+        superpixel_labels = segment_superpixels(imgs)
+        vit_output_upsampled = interpolate_patch_embeddings(vit_l_output)
+        superpixel_embeddings = aggregate_superpixel_embeddings(vit_output_upsampled, superpixel_labels.to(self.device))
+        #T_superpixel = superpixel_embeddings.shape[1]
+        #print(f"superpixel_embeddings.shape {superpixel_embeddings.shape}")
+        #superpixel_embeddings_unflattened = superpixel_embeddings.view(B, int(T_superpixel ** 0.5), int(T_superpixel ** 0.5), D).permute(0, 3, 1, 2)
+        #critical_mask, trivial_mask = self.cnn(superpixel_embeddings_unflattened)
+        #crticial_superpixels = (superpixel_embeddings_unflattened * critical_mask).permute(0, 2, 3, 1).view(B, T_superpixel, D)  # Shape: (B, 1024, 16, 16)
+        #trivial_superpixels  = (superpixel_embeddings_unflattened * trivial_mask).permute(0, 2, 3, 1).view(B, T_superpixel, D)
+        processed_superpixels = self.gnn(superpixel_embeddings)
+        crticial_superpixels = self.node_classifier(processed_superpixels)
+        #print(f"crticial_superpixels.shape {crticial_superpixels.shape}")
+        trivial_superpixels = processed_superpixels - crticial_superpixels
+        #print(f"superpixel_embeddings shape {superpixel_embeddings.shape}")
+
+        critical_visual_tokens_smaller = self.critical_visual_tokens_smaller.repeat(B, 1, 1)
+        trivial_visual_tokens_smaller = self.trivial_visual_tokens_smaller.repeat(B, 1, 1)
+
+        agg_critical_visual_tokens, attn_critical_weights = self.cross_attn_critical_smaller(critical_visual_tokens_smaller, crticial_superpixels, crticial_superpixels)
+        agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial_smaller(trivial_visual_tokens_smaller, trivial_superpixels, trivial_superpixels)
+                                                # self.proj(the tokens from X to 512
+        agg_critical_visual_tokens_for_explicid = self.proj(self.norm_smaller(self.ffn_smaller(agg_critical_visual_tokens[:,:self.num_of_criteria,:])))
+        agg_critical_visual_tokens_for_explicid = F.normalize(agg_critical_visual_tokens_for_explicid, dim=-1)
+        #print(f"custom_patches shape {custom_patches.shape}")
         # Generate superpixels for the batch
         #segments_batch = generate_superpixels_batch(imgs)
         #data_list = create_superpixel_graph_batch(imgs, segments_batch)
-        #print(f"data_list shape {data_list.shape}")
 
-        # # Process superpixels with GNN
-        # superpixel_features_list = [self.gnn(data.to(self.device)) for data in data_list]
-
-        # B = imgs.shape[0]
-        # critical_visual_tokens = self.critical_visual_tokens.repeat(B, 1, 1)
-        # trivial_visual_tokens = self.trivial_visual_tokens.repeat(B, 1, 1)
-
-        # agg_critical_visual_tokens_list = []
-        # agg_trivial_visual_tokens_list = []
-        # attn_criticial_weights_list = []
-        # attn_trivial_weights_list = []
-
-        # for superpixel_features in superpixel_features_list:
-        #     agg_critical_visual_tokens, attn_criticial_weights = self.cross_attn_critical(critical_visual_tokens, superpixel_features, superpixel_features)
-        #     agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial(trivial_visual_tokens, superpixel_features, superpixel_features)
-        #     agg_critical_visual_tokens_list.append(agg_critical_visual_tokens)
-        #     agg_trivial_visual_tokens_list.append(agg_trivial_visual_tokens)
-        #     attn_criticial_weights_list.append(attn_criticial_weights)
-        #     attn_trivial_weights_list.append(attn_trivial_weights)
-
-        # agg_critical_visual_tokens = torch.stack(agg_critical_visual_tokens_list)
-        # agg_trivial_visual_tokens = torch.stack(agg_trivial_visual_tokens_list)
-        # attn_criticial_weights = torch.stack(attn_criticial_weights_list)
-        # attn_trivial_weights = torch.stack(attn_trivial_weights_list)
-
-        #superpixels = superpixel_segmentation(imgs)
-
-        # Step 2: Assign distinct colors to each superpixel
-        #colored_images = apply_distinct_colors_to_superpixels(imgs, superpixels)
-        #patches_colored = image_to_patches(superpixels, patch_size=14)
-        #patches_colored = image_to_patches(colored_images, patch_size=14)
         #############################################################################
-        critical_visual_tokens = self.critical_visual_tokens.repeat(B, 1, 1)
-        trivial_visual_tokens = self.trivial_visual_tokens.repeat(B, 1, 1)
-        B, T, D = vit_l_output.shape  # B: batch size, T: num_patches (256), D: patch_dim (1024)
-        H = W = int(T ** 0.5)  # Assuming T is a perfect square, H = W = 16
-        vit_output_unflattened = vit_l_output.view(B, H, W, D).permute(0, 3, 1, 2)  # Shape: (B, 1024, 16, 16)
         
-        critical_mask, trivial_mask = self.cnn(vit_output_unflattened)  # Shape: (B, 1, 16, 16)
-        overlap_loss=(critical_mask*trivial_mask).sum()
+        # PLAN make superpixel representation into a square?
+        #superpixel_embeddings_unflattened = superpixel_embeddings.view(B, 10, 10, D).permute(0, 3, 1, 2)  # Shape: (B, 1024, 16, 16)
+        
+        #critical_mask, trivial_mask = self.cnn(vit_output_unflattened)  # Shape: (B, 1, 16, 16)
+        critical_mask, trivial_mask = None, None
+        overlap_loss = torch.tensor(0.0, device=self.device)
+        #overlap_loss=(critical_mask*trivial_mask).sum()
 
-        crticial_patches = vit_output_unflattened  # Shape: (B, 1024, 16, 16)
-        trivial_patches = vit_output_unflattened
+        #crticial_superpixels = vit_output_unflattened * critical_mask  # Shape: (B, 1024, 16, 16)
+        #trivial_superpixels  = vit_output_unflattened * trivial_mask
 
-        cnn_logits_critical = self.classifying_critical_cnn(crticial_patches)
-        cnn_logits_trivial = self.classifying_trivial_cnn(trivial_patches)
-        loss_fn = SpatialAwarePatchAttentionLoss()
-        vit_l_output_for_critical = crticial_patches.permute(0, 2, 3, 1).view(B, T, D)  # Shape: (B, 256, 1024)
-        vit_l_output_for_trivial = trivial_patches.permute(0, 2, 3, 1).view(B, T, D)
-        agg_critical_visual_tokens, attn_criticial_weights = self.cross_attn_critical(critical_visual_tokens, vit_l_output_for_critical, vit_l_output_for_critical)
-        agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial(trivial_visual_tokens, vit_l_output_for_trivial, vit_l_output_for_trivial)
-        attention_map_loss=torch.tensor(0.0, device=self.device)
-        attention_map_loss += loss_fn(patches.view(B, D_p, H_p, W_p), attn_criticial_weights.view(B, self.num_of_criteria, H, W), attn_trivial_weights.view(B, self.num_of_criteria, H, W))
-
-        agg_critical_visual_tokens_for_explicid = self.proj(self.norm(self.ffn(agg_critical_visual_tokens[:,:self.num_of_criteria,:])))
-        agg_critical_visual_tokens_for_explicid = F.normalize(agg_critical_visual_tokens_for_explicid, dim=-1)
+        #loss_fn = SpatialAwarePatchAttentionLoss()
+        #vit_l_output_for_critical = crticial_superpixels.permute(0, 2, 3, 1).view(B, T, D)  # Shape: (B, 256, 1024)
+        #vit_l_output_for_trivial = trivial_superpixels.permute(0, 2, 3, 1).view(B, T, D)
+        attn_explicd_loss=torch.tensor(0.0, device=self.device)
+        #attn_explicd_loss += loss_fn(patches.view(B, D_p, H_p, W_p), attn_critical_weights.view(B, self.num_of_criteria, H, W), attn_trivial_weights.view(B, self.num_of_criteria, H, W))
+        #############################################################################
         agg_critical_visual_tokens_for_SiT = self.proj_Sit(self.norm(self.ffn(agg_critical_visual_tokens)))
         agg_trivial_visual_tokens_for_SiT = self.proj_Sit(self.norm(self.ffn(agg_trivial_visual_tokens)))
 
@@ -3186,19 +3260,1678 @@ class ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_SuperPixels(nn.Modu
             image_logits_list.append(image_logits_dict[key])
 
         image_logits = torch.cat(image_logits_list, dim=-1)
-        cls_logits_dict = { }
+        #cls_logits_dict = { }
         cls_logits = self.cls_head(image_logits)
 
-        # Compute weighted sum of patches for each token
-        weighted_features = attn_criticial_weights.unsqueeze(-1) * vit_l_output_for_critical.unsqueeze(1)  # Shape: (B, 7, 256, patch_dim)
-        token_representations = weighted_features.sum(dim=2)  # Shape: (B, 7, patch_dim)
+        # # Compute weighted sum of patches for each token
+        # weighted_features = torch.sigmoid(attn_criticial_weights / 0.005).unsqueeze(-1) * vit_l_output_for_critical.unsqueeze(1)  # Shape: (B, 7, 256, patch_dim)
+        # token_representations = weighted_features.sum(dim=2)  # Shape: (B, 7, patch_dim)
 
-        # Concatenate token representations
-        concatenated_tokens = token_representations.view(B, -1)  # Shape: (B, 7 * patch_dim)
+        # # Concatenate token representations
+        # concatenated_tokens = token_representations.view(B, -1)  # Shape: (B, 7 * patch_dim)
 
-        cls_minimal_logits = self.minimal_cls_head(concatenated_tokens)
-        to_return = (patches, patches, cls_logits, cls_minimal_logits, cls_logits_dict, image_logits_dict,  F.normalize(agg_critical_visual_tokens_for_SiT, dim=-1), 
-                     F.normalize(agg_trivial_visual_tokens_for_SiT, dim=-1), attention_map_loss, overlap_loss, attn_criticial_weights, attn_trivial_weights, 
-                     vit_l_output, agg_critical_visual_tokens, agg_trivial_visual_tokens, cnn_logits_critical, cnn_logits_trivial, critical_mask, trivial_mask)
+        to_return_dict = {
+            "patches":patches,
+            "critical_mask":critical_mask,
+            "trivial_mask":trivial_mask,
+            "cls_logits":cls_logits,
+            "image_logits_dict":image_logits_dict,
+            "agg_critical_visual_tokens_for_SiT":F.normalize(agg_critical_visual_tokens_for_SiT, dim=-1),
+            "agg_trivial_visual_tokens_for_SiT":F.normalize(agg_trivial_visual_tokens_for_SiT, dim=-1),
+            "attn_explicd_loss":attn_explicd_loss,
+            "overlap_loss":overlap_loss,
+            "attn_critical_weights":attn_critical_weights,
+            "attn_trivial_weights":attn_trivial_weights,
+            "vit_l_output":vit_l_output,
+            "agg_critical_visual_tokens":agg_critical_visual_tokens,
+            "agg_trivial_visual_tokens":agg_trivial_visual_tokens
+        }
 
-        return to_return
+        doing_cnn_critical=True
+        doing_cnn_trivial=True
+
+        if doing_cnn_critical:
+            #to_return_dict["cnn_logits_critical"] = self.classifying_critical_cnn(crticial_superpixels)
+            to_return_dict["cnn_logits_critical"] = None
+
+        if doing_cnn_trivial:
+            #to_return_dict["cnn_logits_trivial"] = self.classifying_trivial_cnn(trivial_superpixels)
+            to_return_dict["cnn_logits_trivial"] = None
+
+        #cls_minimal_logits = self.minimal_cls_head(concatenated_tokens)
+            
+        # to_return = (patches, patches, cls_logits, cls_minimal_logits, cls_logits_dict, image_logits_dict,  F.normalize(agg_critical_visual_tokens_for_SiT, dim=-1), 
+        #              F.normalize(agg_trivial_visual_tokens_for_SiT, dim=-1), attention_map_loss, overlap_loss, attn_criticial_weights, attn_trivial_weights, 
+        #              vit_l_output, agg_critical_visual_tokens, agg_trivial_visual_tokens, cnn_logits_critical, cnn_logits_trivial, critical_mask, trivial_mask)
+
+        return to_return_dict
+    
+
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+
+class ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_Representation_Learning(nn.Module):  
+
+    def __init__(self, concept_list, model_name='biomedclip', config=None):
+        super().__init__()
+            
+        self.concept_list = concept_list
+        self.model_name = model_name
+        self.config = config
+        self.num_of_criteria = NUM_OF_CRITERIA[config.dataset]
+        self.device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+       
+        if self.model_name in ['biomedclip', 'openclip']:
+            if self.model_name == 'biomedclip':
+                self.model, preprocess = create_model_from_pretrained('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
+                self.tokenizer = get_tokenizer('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
+            elif self.model_name == 'openclip':
+                self.model, preprocess = create_model_from_pretrained('hf-hub:laion/CLIP-ViT-L-14-laion2B-s32B-b82K')
+                self.tokenizer = get_tokenizer('hf-hub:laion/CLIP-ViT-L-14-laion2B-s32B-b82K')
+               
+            
+            config.preprocess = preprocess
+
+            #self.model_visual_ViT_L = clip.load(f"ViT-L/14")[0].visual
+
+            #####
+            model_vis_ViT_L = clip.load(f"ViT-L/14")[0].visual
+            
+            transformer = model_vis_ViT_L.transformer
+
+            # Remove the last residual attention block from the Sequential container
+            new_resblocks = nn.Sequential(*list(transformer.resblocks.children())[:-12])
+
+            # Update the new model's transformer with the modified resblocks
+            transformer.resblocks = new_resblocks
+
+            # Initialize 7 separate instances of model_visual_ViT_L
+            #self.model_visual_ViT_Ls = [clip.load(f"ViT-L/14")[0].visual for _ in range(7)]
+            self.model_visual_ViT_Ls = nn.ModuleList([copy.deepcopy(model_vis_ViT_L) for _ in range(self.num_of_criteria)])
+            # Convert specific layers or parameters to float32
+            for model_visual_ViT_L in self.model_visual_ViT_Ls:
+                for param in model_visual_ViT_L.parameters():
+                    param.data = param.data.to(torch.float32)
+                model_visual_ViT_L.cuda()
+            #####
+
+            #self.model_visual_custom = VisionTransformer7x7()
+
+            # Convert specific layers or parameters to float32
+            # for param in self.model_visual_ViT_L.parameters():
+            #     param.data = param.data.to(torch.float32)
+
+            #self.model_visual_ViT_L.cuda()
+            #self.model_visual_custom.cuda()
+            
+            self.model.cuda()
+            
+            concept_keys = list(concept_list.keys())
+            self.concept_token_dict = {}
+            for key in concept_keys:
+                prefix = get_prefix(self.config.dataset, key)
+                attr_concept_list = concept_list[key]
+                prefix_attr_concept_list = [prefix + concept for concept in attr_concept_list]
+                tmp_concept_text = self.tokenizer(prefix_attr_concept_list).cuda()
+                #print(f"tmp_concept_text shape: {tmp_concept_text.shape}")
+                _, tmp_concept_feats, logit_scale = self.model(None, tmp_concept_text)
+                self.concept_token_dict[key] = tmp_concept_feats.detach()
+
+            
+            self.logit_scale = logit_scale.detach()
+
+            # Step 1: Move model back to CPU
+            self.model = self.model.to('cpu')
+
+            # Step 2: Delete the model (optional, for memory release)
+            del self.model
+            del model_vis_ViT_L
+
+            # Step 3: Empty the CUDA memory cache
+            torch.cuda.empty_cache()
+        
+        #self.visual_features = []
+        #####
+        self.visual_features = [[] for _ in range(self.num_of_criteria)]
+        #####
+        self.hook_list = []
+
+        # def hook_fn(module, input, output):
+        #     self.visual_features.append(output) # detach to aboid saving computation graph
+        #                                          # might need to remove if finetune the full model
+        # layers = [self.model_visual_ViT_L.transformer.resblocks[11]]
+        # for layer in layers:
+        #     self.hook_list.append(layer.register_forward_hook(hook_fn))
+
+        #####
+        def hook_fn(module, input, output, idx):
+            self.visual_features[idx].append(output)  # detach to avoid saving computation graph
+
+        layers = [model_visual_ViT_L.transformer.resblocks[11] for model_visual_ViT_L in self.model_visual_ViT_Ls]
+        for idx, layer in enumerate(layers):
+            self.hook_list.append(layer.register_forward_hook(lambda module, input, output, idx=idx: hook_fn(module, input, output, idx)))
+        #####
+        
+        self.critical_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, 1024, dtype=torch.float32)))
+        self.trivial_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, 1024, dtype=torch.float32)))
+
+        self.critical_visual_tokens_smaller = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, 1024, dtype=torch.float32)))
+        self.trivial_visual_tokens_smaller  = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, 1024, dtype=torch.float32)))
+
+        self.cross_attn = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
+        self.cross_attn_critical = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
+        self.cross_attns_criticals = nn.ModuleList([nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True) for _ in range(self.num_of_criteria)])
+        self.cross_attn_trivial = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
+    
+        self.self_attn_critical = Attention(1024, num_heads=16, qkv_bias=True, qk_norm=True)
+
+        self.cross_attn_critical_smaller = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
+        self.cross_attn_trivial_smaller = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
+
+        self.cross_attn_between_patches = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
+        self.cross_attn_in_patches = nn.MultiheadAttention(embed_dim=1024, num_heads=16, batch_first=True)
+        self.ffn = FFN(1024, 1024*4)
+
+        self.ffn_smaller = FFN(1024, 1024*4)
+        self.norm_smaller = nn.LayerNorm(1024)
+
+        self.norm = nn.LayerNorm(1024)
+        self.proj = nn.Linear(in_features=1024, out_features=512, bias=False)
+
+        dim_of_sit_tokens = 768
+        num_heads_sit = 16
+        self.proj_tokens_for_Sit = nn.Linear(in_features=1024, out_features=dim_of_sit_tokens, bias=False)
+        self.proj_vit_output_for_Sit = nn.Linear(in_features=1024, out_features=dim_of_sit_tokens, bias=False)
+        self.norm_vit_output_for_Sit = nn.LayerNorm(dim_of_sit_tokens)
+        self.norm_tokens_for_Sit = nn.LayerNorm(dim_of_sit_tokens)
+        self.cross_attn_critical_for_Sit = nn.MultiheadAttention(embed_dim=dim_of_sit_tokens, num_heads=num_heads_sit, batch_first=True)
+
+        self.proj_Sit = nn.Linear(in_features=1024, out_features=768, bias=False)
+        #self.proj_Sit_to_explicid = nn.Linear(in_features=768, out_features=512, bias=False)
+
+        #                                     34  for ISIC
+        #                                     17 for BUSI
+        self.cls_head = nn.Linear(in_features=NUM_OF_SIMILARITIES[self.config.dataset], out_features=config.num_class)
+        self.minimal_cls_head = nn.Linear(in_features=1024*7, out_features=config.num_class)
+
+        self.cluster_sigma = torch.nn.Parameter(torch.ones(1))
+        self.orthogonal_sigma = torch.nn.Parameter(torch.ones(1))
+        self.coverage_sigma = torch.nn.Parameter(torch.ones(1))
+
+        # for param in self.model_visual_ViT_L.parameters():
+        #     param.requires_grad = True
+
+        #####
+        for model_visual_ViT_L in self.model_visual_ViT_Ls:
+            for param in model_visual_ViT_L.parameters():
+                    param.requires_grad = True
+        #####
+        
+        self.critical_visual_tokens.requires_grad = True
+        self.trivial_visual_tokens.requires_grad = True
+
+        self.critical_visual_tokens_smaller.requires_grad = True
+        self.trivial_visual_tokens_smaller.requires_grad = True
+
+        ###########################################################
+        self.cnn = PatchSelectorCNN().cuda()
+        self.classifying_critical_cnn = ClassifyingCNN().cuda()
+        #self.classifying_trivial_cnn = ClassifyingCNN().cuda()
+        #self.gnn =  CircularConv(in_dim=1024, out_dim=1024).cuda()
+        #self.node_classifier =  NodeClassifier(in_dim=1024).cuda()
+
+    
+    def get_backbone_params(self):
+        return self.model.visual.trunk.parameters()
+    def get_bridge_params(self):
+        param_list = []
+        
+        param_list.append(self.critical_visual_tokens)
+        param_list.append(self.trivial_visual_tokens)
+        for param in self.cross_attn.parameters():
+            param_list.append(param)
+
+        for param in self.ffn.parameters():
+            param_list.append(param)
+        for param in self.norm.parameters():
+            param_list.append(param)
+        for param in self.proj.parameters():
+            param_list.append(param)
+
+        for i in range(self.num_of_criteria):
+            for param in self.ffns[i].parameters():
+                param_list.append(param)
+            for param in self.norms[i].parameters():
+                param_list.append(param)
+            for param in self.projs[i].parameters():
+                param_list.append(param)
+            for param in self.proj_Sits[i].parameters():
+                param_list.append(param)
+            for param in self.proj_Sits_to_explicids[i].parameters():
+                param_list.append(param)
+
+        for param in self.cls_head.parameters():
+            param_list.append(param)
+
+        return param_list
+
+
+    def forward(self, imgs, refined_tokens=None, explicid_imgs_latents=None):
+        
+        if refined_tokens is not None:
+            image_logits_dict_refined = {}
+            idx = 0
+            refined_tokens = self.proj_Sit_to_explicid(F.normalize(refined_tokens, dim=-1))
+            for key in self.concept_token_dict.keys():
+                image_logits_dict_refined[key] = (self.logit_scale * refined_tokens[:, idx:idx+1, :] @ self.concept_token_dict[key].repeat(refined_tokens.shape[0], 1, 1).permute(0, 2, 1)).squeeze(1)
+                idx += 1
+            image_logits_list_refined = []
+            for key in image_logits_dict_refined.keys():
+                image_logits_list_refined.append(image_logits_dict_refined[key])
+        
+            image_logits_refined = torch.cat(image_logits_list_refined, dim=-1)
+            cls_logits_refined = self.cls_head(image_logits_refined)
+            return cls_logits_refined
+
+        #self.visual_features.clear()
+        #_ = self.model_visual_ViT_L(imgs)
+        self.visual_features = [[] for _ in range(self.num_of_criteria)]
+        # Forward pass through each model_visual_ViT_L instance
+        for idx, model_visual_ViT_L in enumerate(self.model_visual_ViT_Ls):
+            _ = model_visual_ViT_L(imgs)
+        patches = image_to_patches(imgs, patch_size=14)
+        H_p = W_p = int(patches.shape[1] ** 0.5)
+        D_p = patches.shape[2]
+        # Combine the outputs from the 7 instances
+        vit_l_outputs = [self.visual_features[idx][0].permute(1, 0, 2)[:, 1:, :] for idx in range(self.num_of_criteria)]
+        #vit_l_output = torch.cat(vit_l_outputs, dim=1)
+
+        #vit_l_output=self.visual_features[0].permute(1, 0, 2)[:, 1:, :] 
+        B, T, D = vit_l_outputs[0].shape  # B: batch size, T: num_patches (256), D: patch_dim (1024)
+        H = W = int(T ** 0.5)  # Assuming T is a perfect square, H = W = 16
+
+        critical_visual_tokens = []
+        attn_critical_weights=[]
+        for i in range(7):
+            #print(f"self.critical_visual_tokens shape {self.critical_visual_tokens.shape}")
+            critical_visual_token = self.critical_visual_tokens[i].repeat(B, 1, 1)
+            agg_critical_visual_token, attn_critical_weight = self.cross_attns_criticals[i](critical_visual_token, vit_l_outputs[i], vit_l_outputs[i])
+            critical_visual_tokens.append(agg_critical_visual_token)
+            attn_critical_weights.append(attn_critical_weight)
+
+        agg_critical_visual_tokens = torch.cat(critical_visual_tokens, dim=1)
+        attn_critical_weights = torch.cat(attn_critical_weights, dim=1)
+        #critical_visual_tokens = self.critical_visual_tokens.repeat(B, 1, 1)
+        trivial_visual_tokens = self.trivial_visual_tokens.repeat(B, 1, 1)
+
+        #vit_output_unflattened = vit_l_outputs[0].view(B, H, W, D).permute(0, 3, 1, 2)  # Shape: (B, 1024, 16, 16)
+        #critical_mask, trivial_mask = self.cnn(vit_output_unflattened)  # Shape: (B, 1, 16, 16)
+        critical_mask, trivial_mask = torch.zeros(B, 1, 16, 16).cuda(), torch.zeros(B, 1, 16, 16).cuda()
+
+        #loss_fn = SpatialAwarePatchAttentionLoss()
+        #vit_l_output_for_critical = (vit_output_unflattened * critical_mask).permute(0, 2, 3, 1).view(B, T, D)  # Shape: (B, 256, 1024)
+        #vit_l_output_for_trivial = (vit_output_unflattened * trivial_mask).permute(0, 2, 3, 1).view(B, T, D)
+
+        #vit_l_output_for_critical = self.self_attn_critical(vit_l_output_for_critical)
+
+        #agg_critical_visual_tokens, attn_critical_weights = self.cross_attn_critical(critical_visual_tokens, vit_l_output, vit_l_output)
+        agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial(trivial_visual_tokens, vit_l_outputs[0], vit_l_outputs[0])
+                                                # self.proj(the tokens from X to 512
+        agg_critical_visual_tokens_for_explicid = self.proj(self.norm(self.ffn(agg_critical_visual_tokens[:,:self.num_of_criteria,:])))
+        agg_critical_visual_tokens_for_explicid = F.normalize(agg_critical_visual_tokens_for_explicid, dim=-1)
+
+        #vit_output_for_Sit = self.norm_vit_output_for_Sit(self.proj_vit_output_for_Sit(vit_l_output))
+        attn_explicd_loss = torch.tensor(0.0, device=self.device)
+        #critical_visual_tokens_for_representation = F.normalize(self.proj_tokens_for_Sit(agg_critical_visual_tokens), dim=-1)
+        #print(attn_critical_weights.shape)
+        #print(attn_critical_weights[0,1,:])
+        #loss_fn = nn.MSELoss()
+        #attn_explicd_loss = loss_fn(attn_critical_weights, attn_critical_weights_representation)
+        # if explicid_imgs_latents is not None:
+        #     _, attn_critical_weights_representation = self.cross_attn_critical_for_Sit(critical_visual_tokens_for_representation, explicid_imgs_latents, explicid_imgs_latents)
+        #     temperature = 0.5  # Adjust temperature to make softmax sharper or smoother
+        #     for i in range(self.num_of_criteria):
+        #         normalized_attention_map_1 = F.softmax(attn_critical_weights[:,i,:] / temperature, dim=-1)
+        #         normalized_attention_map_2 = F.softmax(attn_critical_weights_representation[:,i,:] / temperature, dim=-1)
+                #attn_explicd_loss += F.kl_div(F.log_softmax(normalized_attention_map_1, dim=-1), F.softmax(normalized_attention_map_2, dim=-1), reduction='batchmean')
+                #attn_explicd_loss += loss_fn(normalized_attention_map_1, normalized_attention_map_2)
+            #print(f"attn_explicd_loss {attn_explicd_loss}")
+        #_, attn_critical_weights_representation = self.cross_attn_critical_for_Sit(critical_visual_tokens_for_representation, vit_output_for_Sit, vit_output_for_Sit)
+        # for i in range(7):
+        #     attn_explicd_loss+=compute_16x16_loss(attn_critical_weights[:,i,:].unsqueeze(1).view(B, 1, H, W))/7
+        #attn_explicd_loss = 1 - F.cosine_similarity(attn_critical_weights.view(B, -1), attn_critical_weights_representation.view(B, -1), dim=1)
+        #attn_explicd_loss = F.kl_div(F.log_softmax(attn_critical_weights, dim=-1), F.softmax(attn_critical_weights_representation, dim=-1), reduction='batchmean')
+        #_, attn_trivial_weights_representation = self.cross_attn_trivial(trivial_visual_tokens, vit_output_for_Sit, vit_output_for_Sit)
+        #############################################################################
+        #custom_patches = self.model_visual_custom(imgs)[:, 1:, :]
+        # superpixel_labels = segment_superpixels(imgs)
+        # vit_output_upsampled = interpolate_patch_embeddings(vit_l_output)
+        # superpixel_embeddings = aggregate_superpixel_embeddings(vit_output_upsampled, superpixel_labels.to(self.device))
+        # #T_superpixel = superpixel_embeddings.shape[1]
+        # #print(f"superpixel_embeddings.shape {superpixel_embeddings.shape}")
+        # #superpixel_embeddings_unflattened = superpixel_embeddings.view(B, int(T_superpixel ** 0.5), int(T_superpixel ** 0.5), D).permute(0, 3, 1, 2)
+        # #critical_mask, trivial_mask = self.cnn(superpixel_embeddings_unflattened)
+        # #crticial_superpixels = (superpixel_embeddings_unflattened * critical_mask).permute(0, 2, 3, 1).view(B, T_superpixel, D)  # Shape: (B, 1024, 16, 16)
+        # #trivial_superpixels  = (superpixel_embeddings_unflattened * trivial_mask).permute(0, 2, 3, 1).view(B, T_superpixel, D)
+        # processed_superpixels = self.gnn(superpixel_embeddings)
+        # crticial_superpixels = self.node_classifier(processed_superpixels)
+        # #print(f"crticial_superpixels.shape {crticial_superpixels.shape}")
+        # trivial_superpixels = processed_superpixels - crticial_superpixels
+        # #print(f"superpixel_embeddings shape {superpixel_embeddings.shape}")
+
+        # critical_visual_tokens_smaller = self.critical_visual_tokens_smaller.repeat(B, 1, 1)
+        # trivial_visual_tokens_smaller = self.trivial_visual_tokens_smaller.repeat(B, 1, 1)
+
+        # agg_critical_visual_tokens, attn_critical_weights = self.cross_attn_critical_smaller(critical_visual_tokens_smaller, crticial_superpixels, crticial_superpixels)
+        # agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial_smaller(trivial_visual_tokens_smaller, trivial_superpixels, trivial_superpixels)
+        #                                         # self.proj(the tokens from X to 512
+        # agg_critical_visual_tokens_for_explicid = self.proj(self.norm_smaller(self.ffn_smaller(agg_critical_visual_tokens[:,:self.num_of_criteria,:])))
+        # agg_critical_visual_tokens_for_explicid = F.normalize(agg_critical_visual_tokens_for_explicid, dim=-1)
+        #print(f"custom_patches shape {custom_patches.shape}")
+        # Generate superpixels for the batch
+        #segments_batch = generate_superpixels_batch(imgs)
+        #data_list = create_superpixel_graph_batch(imgs, segments_batch)
+
+        #############################################################################
+        
+        # PLAN make superpixel representation into a square?
+        #superpixel_embeddings_unflattened = superpixel_embeddings.view(B, 10, 10, D).permute(0, 3, 1, 2)  # Shape: (B, 1024, 16, 16)
+        
+        #critical_mask, trivial_mask = None, None
+        overlap_loss = torch.tensor(0.0, device=self.device)
+        #overlap_loss=(critical_mask*trivial_mask).sum()
+
+        #crticial_superpixels = vit_output_unflattened * critical_mask  # Shape: (B, 1024, 16, 16)
+        #trivial_superpixels  = vit_output_unflattened * trivial_mask
+
+        #loss_fn = SpatialAwarePatchAttentionLoss()
+        #vit_l_output_for_critical = crticial_superpixels.permute(0, 2, 3, 1).view(B, T, D)  # Shape: (B, 256, 1024)
+        #vit_l_output_for_trivial = trivial_superpixels.permute(0, 2, 3, 1).view(B, T, D)
+        #attn_explicd_loss=torch.tensor(0.0, device=self.device)
+        #attn_explicd_loss += loss_fn(patches.view(B, D_p, H_p, W_p), attn_critical_weights.view(B, self.num_of_criteria, H, W), attn_trivial_weights.view(B, self.num_of_criteria, H, W))
+        #############################################################################
+        agg_critical_visual_tokens_for_SiT = self.proj_Sit(self.norm(agg_critical_visual_tokens))
+        agg_trivial_visual_tokens_for_SiT = self.proj_Sit(self.norm((agg_trivial_visual_tokens)))
+
+        image_logits_dict = {}
+        idx = 0
+        for key in self.concept_token_dict.keys():
+            image_logits_dict[key] = (self.logit_scale * agg_critical_visual_tokens_for_explicid[:, idx:idx+1, :] @ self.concept_token_dict[key].repeat(B, 1, 1).permute(0, 2, 1)).squeeze(1)
+            idx += 1
+
+        image_logits_list = []
+
+        for key in image_logits_dict.keys():
+            image_logits_list.append(image_logits_dict[key])
+
+        image_logits = torch.cat(image_logits_list, dim=-1)
+        #cls_logits_dict = { }
+        cls_logits = self.cls_head(image_logits)
+
+        # # Compute weighted sum of patches for each token
+        # weighted_features = torch.sigmoid(attn_criticial_weights / 0.005).unsqueeze(-1) * vit_l_output_for_critical.unsqueeze(1)  # Shape: (B, 7, 256, patch_dim)
+        # token_representations = weighted_features.sum(dim=2)  # Shape: (B, 7, patch_dim)
+
+        # # Concatenate token representations
+        # concatenated_tokens = token_representations.view(B, -1)  # Shape: (B, 7 * patch_dim)
+
+        to_return_dict = {
+            "patches":patches,
+            "patches_colored":patches,
+            "critical_mask":critical_mask,
+            "trivial_mask":trivial_mask,
+            "cls_logits":cls_logits,
+            "image_logits_dict":image_logits_dict,
+            "agg_critical_visual_tokens_for_SiT":F.normalize(agg_critical_visual_tokens_for_SiT, dim=-1),
+            "agg_trivial_visual_tokens_for_SiT":F.normalize(agg_trivial_visual_tokens_for_SiT, dim=-1),
+            "attn_explicd_loss":attn_explicd_loss,
+            "overlap_loss":overlap_loss,
+            "attn_critical_weights":attn_critical_weights,
+            "attn_trivial_weights":attn_trivial_weights,
+            "vit_l_output":vit_l_outputs[0],
+            "agg_critical_visual_tokens":agg_critical_visual_tokens,
+            "agg_trivial_visual_tokens":agg_trivial_visual_tokens
+        }
+
+        doing_cnn_critical = True
+        doing_cnn_trivial=False
+
+        to_return_dict["cnn_logits_critical"] = None
+        to_return_dict["cnn_logits_trivial"] = None
+
+        if doing_cnn_critical and explicid_imgs_latents is not None:
+            to_return_dict["cnn_logits_critical"] = self.classifying_critical_cnn(explicid_imgs_latents.view(B, 16, 16, 768).permute(0, 3, 1, 2))
+        else:
+            to_return_dict["cnn_logits_critical"] = cls_logits
+
+        if doing_cnn_trivial:
+            to_return_dict["cnn_logits_trivial"] = self.classifying_trivial_cnn(vit_l_outputs[0])
+
+        #cls_minimal_logits = self.minimal_cls_head(concatenated_tokens)
+            
+        # to_return = (patches, patches, cls_logits, cls_minimal_logits, cls_logits_dict, image_logits_dict,  F.normalize(agg_critical_visual_tokens_for_SiT, dim=-1), 
+        #              F.normalize(agg_trivial_visual_tokens_for_SiT, dim=-1), attention_map_loss, overlap_loss, attn_criticial_weights, attn_trivial_weights, 
+        #              vit_l_output, agg_critical_visual_tokens, agg_trivial_visual_tokens, cnn_logits_critical, cnn_logits_trivial, critical_mask, trivial_mask)
+
+        return to_return_dict
+    
+
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+    
+
+class ExpLICD_ViT_L_Classic(nn.Module):  
+    def __init__(self, concept_list, model_name='biomedclip', config=None):
+        super().__init__()
+            
+        self.concept_list = concept_list
+        self.model_name = model_name
+        self.config = config
+        self.num_of_criteria = NUM_OF_CRITERIA[config.dataset]
+        self.device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+       
+        if self.model_name in ['biomedclip', 'openclip']:
+            if self.model_name == 'biomedclip':
+                self.model, preprocess = create_model_from_pretrained('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
+                self.tokenizer = get_tokenizer('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
+            elif self.model_name == 'openclip':
+                self.model, preprocess = create_model_from_pretrained('hf-hub:laion/CLIP-ViT-L-14-laion2B-s32B-b82K')
+                self.tokenizer = get_tokenizer('hf-hub:laion/CLIP-ViT-L-14-laion2B-s32B-b82K')
+               
+            
+            config.preprocess = preprocess
+
+            self.model_visual_ViT_L = clip.load(f"ViT-L/14")[0].visual
+
+            #self.model_visual_custom = VisionTransformer7x7()
+
+            #Convert specific layers or parameters to float32
+            for param in self.model_visual_ViT_L.parameters():
+                param.data = param.data.to(torch.float32)
+
+            self.model_visual_ViT_L.cuda()
+            #self.model_visual_custom.cuda()
+            
+            self.model.cuda()
+            
+            concept_keys = list(concept_list.keys())
+            self.concept_token_dict = {}
+            for key in concept_keys:
+                prefix = get_prefix(self.config.dataset, key)
+                attr_concept_list = concept_list[key]
+                prefix_attr_concept_list = [prefix + concept for concept in attr_concept_list]
+                tmp_concept_text = self.tokenizer(prefix_attr_concept_list).cuda()
+                #print(f"tmp_concept_text shape: {tmp_concept_text.shape}")
+                _, tmp_concept_feats, logit_scale = self.model(None, tmp_concept_text)
+                self.concept_token_dict[key] = tmp_concept_feats.detach()
+
+            
+            self.logit_scale = logit_scale.detach()
+
+            ################ Option Clip L
+            # Step 1: Move model back to CPU
+            self.model = self.model.to('cpu')
+
+            # Step 2: Delete the model (optional, for memory release)
+            del self.model
+
+            # Step 3: Empty the CUDA memory cache
+            torch.cuda.empty_cache()
+            ################
+        
+        self.visual_features = []
+        self.hook_list = []
+
+        def hook_fn(module, input, output):
+            self.visual_features.append(output) # detach to aboid saving computation graph
+                                                 # might need to remove if finetune the full model
+        
+        ################# Option BioMedclip
+        # layers = [self.model.visual.trunk.blocks[11]]
+
+        # for param in self.model.text.parameters():
+        #     param.requires_grad = False
+        # for param in self.model.visual.trunk.parameters():
+        #     param.requires_grad = True
+        ################# Option Clip L
+        layers = [self.model_visual_ViT_L.transformer.resblocks[23]]
+        #################
+
+        for layer in layers:
+            self.hook_list.append(layer.register_forward_hook(hook_fn))
+
+        
+        hidden_size = 1024
+        num_heads = 16
+        self.critical_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
+        self.trivial_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
+
+        self.critical_visual_tokens_smaller = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
+        self.trivial_visual_tokens_smaller  = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
+
+        self.cross_attn = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+        self.cross_attn_critical = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+        self.cross_attns_criticals = nn.ModuleList([nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True) for _ in range(self.num_of_criteria)])
+        self.cross_attn_trivial = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+    
+        self.self_attn_critical = Attention(hidden_size, num_heads=num_heads, qkv_bias=False, qk_norm=True)
+
+        self.cross_attn_critical_smaller = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+        self.cross_attn_trivial_smaller = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+
+        self.cross_attn_between_patches = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+        self.cross_attn_in_patches = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+        self.ffn = FFN(hidden_size, hidden_size*4)
+
+        self.ffn_smaller = FFN(hidden_size, hidden_size*4)
+        self.norm_smaller = nn.LayerNorm(hidden_size)
+
+        self.norm_before = nn.LayerNorm(hidden_size)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.proj = nn.Linear(in_features=hidden_size, out_features=512, bias=False)
+
+        dim_of_sit_tokens = 768
+        num_heads_sit = 16
+        self.proj_tokens_for_Sit = nn.Linear(in_features=hidden_size, out_features=dim_of_sit_tokens, bias=False)
+        self.proj_vit_output_for_Sit = nn.Linear(in_features=hidden_size, out_features=dim_of_sit_tokens, bias=False)
+        self.norm_vit_output_for_Sit = nn.LayerNorm(dim_of_sit_tokens)
+        self.norm_tokens_for_Sit = nn.LayerNorm(dim_of_sit_tokens)
+        self.cross_attn_critical_for_Sit = nn.MultiheadAttention(embed_dim=dim_of_sit_tokens, num_heads=num_heads_sit, batch_first=True)
+
+        self.proj_Sit = nn.Linear(in_features=hidden_size, out_features=768, bias=False)
+        #self.proj_Sit_to_explicid = nn.Linear(in_features=768, out_features=512, bias=False)
+
+        #                                     34  for ISIC
+        #                                     17 for BUSI
+        self.cls_head = nn.Linear(in_features=NUM_OF_SIMILARITIES[self.config.dataset], out_features=config.num_class)
+        self.minimal_cls_head = nn.Linear(in_features=hidden_size*7, out_features=config.num_class)
+
+        self.cluster_sigma = torch.nn.Parameter(torch.ones(1))
+        self.orthogonal_sigma = torch.nn.Parameter(torch.ones(1))
+        self.coverage_sigma = torch.nn.Parameter(torch.ones(1))
+
+        for param in self.model_visual_ViT_L.parameters():
+            param.requires_grad = True
+
+
+        self.critical_visual_tokens.requires_grad = True
+        self.trivial_visual_tokens.requires_grad = True
+
+        self.critical_visual_tokens_smaller.requires_grad = True
+        self.trivial_visual_tokens_smaller.requires_grad = True
+
+        ###########################################################
+        self.cnn = PatchSelectorCNN().cuda()
+        self.classifying_critical_cnn = ClassifyingCNN().cuda()
+        #self.classifying_trivial_cnn = ClassifyingCNN().cuda()
+        #self.gnn =  CircularConv(in_dim=1024, out_dim=1024).cuda()
+        #self.node_classifier =  NodeClassifier(in_dim=1024).cuda()
+
+    
+    def get_backbone_params(self):
+        return self.model.visual.trunk.parameters()
+    def get_bridge_params(self):
+        param_list = []
+        
+        param_list.append(self.critical_visual_tokens)
+        param_list.append(self.trivial_visual_tokens)
+        for param in self.cross_attn.parameters():
+            param_list.append(param)
+
+        for param in self.ffn.parameters():
+            param_list.append(param)
+        for param in self.norm.parameters():
+            param_list.append(param)
+        for param in self.proj.parameters():
+            param_list.append(param)
+
+        for i in range(self.num_of_criteria):
+            for param in self.ffns[i].parameters():
+                param_list.append(param)
+            for param in self.norms[i].parameters():
+                param_list.append(param)
+            for param in self.projs[i].parameters():
+                param_list.append(param)
+            for param in self.proj_Sits[i].parameters():
+                param_list.append(param)
+            for param in self.proj_Sits_to_explicids[i].parameters():
+                param_list.append(param)
+
+        for param in self.cls_head.parameters():
+            param_list.append(param)
+
+        return param_list
+
+
+    def forward(self, imgs, refined_tokens=None, explicid_imgs_latents=None):
+        
+        if refined_tokens is not None:
+            image_logits_dict_refined = {}
+            idx = 0
+            refined_tokens = self.proj_Sit_to_explicid(F.normalize(refined_tokens, dim=-1))
+            for key in self.concept_token_dict.keys():
+                image_logits_dict_refined[key] = (self.logit_scale * refined_tokens[:, idx:idx+1, :] @ self.concept_token_dict[key].repeat(refined_tokens.shape[0], 1, 1).permute(0, 2, 1)).squeeze(1)
+                idx += 1
+            image_logits_list_refined = []
+            for key in image_logits_dict_refined.keys():
+                image_logits_list_refined.append(image_logits_dict_refined[key])
+        
+            image_logits_refined = torch.cat(image_logits_list_refined, dim=-1)
+            cls_logits_refined = self.cls_head(image_logits_refined)
+            return cls_logits_refined
+
+        self.visual_features.clear()
+        patches = image_to_patches(imgs, patch_size=14)
+        ################# Option BioMedclip
+        # _, _, _ = self.model(imgs, None)
+        # vit_l_output = self.visual_features[0][:, 1:, :]
+        ################# Option Clip L
+        _ = self.model_visual_ViT_L(imgs)
+        vit_l_output=self.visual_features[0].permute(1, 0, 2)[:, 1:, :]
+        #################
+        B, T, D = vit_l_output.shape  # B: batch size, T: num_patches (256), D: patch_dim (1024)
+        H = W = int(T ** 0.5)  # Assuming T is a perfect square, H = W = 16
+        ############################################################################   Option use Attention Loss for the tokens
+        vit_output_unflattened = vit_l_output.view(B, H, W, D).permute(0, 3, 1, 2)  # Shape: (B, 1024, 16, 16)
+        #vit_output_unflattened_for_exlusive = vit_output_unflattened.clone().detach()
+        #vit_output_unflattened_for_exlusive =vit_output_unflattened
+        critical_mask, trivial_mask = self.cnn(vit_output_unflattened)  # Shape: (B, 1, 16, 16)
+        #trivial_mask = 1-critical_mask
+        vit_l_output_for_critical = (vit_output_unflattened * critical_mask).permute(0, 2, 3, 1).view(B, T, D)  # Shape: (B, 256, 1024)
+        vit_l_output_for_trivial = (vit_output_unflattened * trivial_mask).permute(0, 2, 3, 1).view(B, T, D)
+        #CAUTION: The above line is for the case where the attention loss is used for the tokens
+               
+        critical_visual_tokens = self.critical_visual_tokens.repeat(B, 1, 1)
+        trivial_visual_tokens = self.trivial_visual_tokens.repeat(B, 1, 1)
+
+        #vit_output_unflattened = vit_l_output.view(B, H, W, D).permute(0, 3, 1, 2)  # Shape: (B, 1024, 16, 16)
+        #critical_mask, trivial_mask = self.cnn(vit_output_unflattened)  # Shape: (B, 1, 16, 16)
+        #critical_mask, trivial_mask = torch.zeros(B, 1, 16, 16).cuda(), torch.zeros(B, 1, 16, 16).cuda()
+        ############################################################################   Option use self-attention for the tokens
+        #critical_visual_tokens = self.self_attn_critical(critical_visual_tokens)
+        #CAUTION The above line is for the case where the self-attention is used for the tokens
+
+        agg_critical_visual_tokens, attn_critical_weights = self.cross_attn_critical(critical_visual_tokens, vit_l_output_for_critical, vit_l_output)
+        agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial(trivial_visual_tokens, vit_l_output_for_trivial, vit_l_output)
+        ############################################################################   Option use self-attention for the tokens
+        agg_critical_visual_tokens = self.self_attn_critical(agg_critical_visual_tokens)
+        #CAUTION The above line is for the case where the self-attention is used for the tokens
+                                                # self.proj(the tokens from X to 512
+        agg_critical_visual_tokens_for_explicid = self.proj(self.norm(self.ffn(agg_critical_visual_tokens[:,:self.num_of_criteria,:])))
+        agg_critical_visual_tokens_for_explicid = F.normalize(agg_critical_visual_tokens_for_explicid, dim=-1)
+
+        #vit_output_for_Sit = self.norm_vit_output_for_Sit(self.proj_vit_output_for_Sit(vit_l_output))
+        attn_explicd_loss = torch.tensor(0.0, device=self.device)
+
+        overlap_loss = torch.tensor(0.0, device=self.device)
+
+        #############################################################################
+        agg_critical_visual_tokens_for_SiT = self.proj_Sit(self.norm(agg_critical_visual_tokens))
+        agg_trivial_visual_tokens_for_SiT = self.proj_Sit(self.norm((agg_trivial_visual_tokens)))
+
+        image_logits_dict = {}
+        idx = 0
+        for key in self.concept_token_dict.keys():
+            ############################### Option dot product
+            image_logits_dict[key] = (self.logit_scale *agg_critical_visual_tokens_for_explicid[:, idx:idx+1, :] @ self.concept_token_dict[key].repeat(B, 1, 1).permute(0, 2, 1)).squeeze(1)
+            ############################### Option cosine similarity
+            #norm_agg_visual_tokens = F.normalize(agg_critical_visual_tokens_for_explicid[:, idx:idx+1, :], dim=-1)
+            #norm_concept_embedding = F.normalize(self.concept_token_dict[key], dim=-1)
+            #cosine_similarity = torch.matmul(norm_agg_visual_tokens, norm_concept_embedding.repeat(B, 1, 1).permute(0, 2, 1)).squeeze(1)
+            #image_logits_dict[key] = self.logit_scale * cosine_similarity
+            ###############################
+            idx += 1
+
+        image_logits_list = []
+
+        for key in image_logits_dict.keys():
+            #image_logits_list.append(F.softmax(image_logits_dict[key], dim=1))
+            image_logits_list.append(image_logits_dict[key])
+
+        image_logits = torch.cat(image_logits_list, dim=-1)
+        cls_logits = self.cls_head(image_logits)
+
+
+        to_return_dict = {
+            "patches":patches,
+            "patches_colored":patches,
+            "critical_mask":critical_mask,
+            "trivial_mask":trivial_mask,
+            "cls_logits":cls_logits,
+            "image_logits_dict":image_logits_dict,
+            "agg_critical_visual_tokens_for_SiT":F.normalize(agg_critical_visual_tokens_for_SiT, dim=-1),
+            "agg_trivial_visual_tokens_for_SiT":F.normalize(agg_trivial_visual_tokens_for_SiT, dim=-1),
+            "attn_explicd_loss":attn_explicd_loss,
+            "overlap_loss":overlap_loss,
+            "attn_critical_weights":attn_critical_weights,
+            "attn_trivial_weights":attn_trivial_weights,
+            "vit_l_output":vit_l_output,
+            "agg_critical_visual_tokens":agg_critical_visual_tokens,
+            "agg_trivial_visual_tokens":agg_trivial_visual_tokens
+        }
+
+        doing_cnn_critical = True
+        doing_cnn_trivial=False
+
+        to_return_dict["cnn_logits_critical"] = None
+        to_return_dict["cnn_logits_trivial"] = None
+
+        if doing_cnn_critical and explicid_imgs_latents is not None:
+            to_return_dict["cnn_logits_critical"] = self.classifying_critical_cnn(explicid_imgs_latents.view(B, 16, 16, 768).permute(0, 3, 1, 2))
+        else:
+            to_return_dict["cnn_logits_critical"] = cls_logits
+
+        if doing_cnn_trivial:
+            to_return_dict["cnn_logits_trivial"] = self.classifying_trivial_cnn(vit_l_output)
+
+ 
+        return to_return_dict
+    
+
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+    
+class ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Branching(nn.Module):  
+
+    def __init__(self, concept_list, model_name='biomedclip', config=None):
+        super().__init__()
+            
+        self.concept_list = concept_list
+        self.model_name = model_name
+        self.config = config
+        self.num_of_criteria = NUM_OF_CRITERIA[config.dataset]
+        self.device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print("Branching")
+       
+        if self.model_name in ['biomedclip', 'openclip']:
+            if self.model_name == 'biomedclip':
+                self.model, preprocess = create_model_from_pretrained('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
+                self.tokenizer = get_tokenizer('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
+            elif self.model_name == 'openclip':
+                self.model, preprocess = create_model_from_pretrained('hf-hub:laion/CLIP-ViT-L-14-laion2B-s32B-b82K')
+                self.tokenizer = get_tokenizer('hf-hub:laion/CLIP-ViT-L-14-laion2B-s32B-b82K')
+               
+            
+            config.preprocess = preprocess
+
+             # Load the shared stem of the vision transformer
+            self.shared_stem = clip.load(f"ViT-L/14")[0].visual
+            # Convert specific layers or parameters to float32
+            for param in self.shared_stem.parameters():
+                param.data = param.data.to(torch.float32)
+            
+            self.shared_stem.cuda()
+
+             # Create 7 separate branches for the remaining layers
+            self.branches = nn.ModuleList([copy.deepcopy(self.shared_stem.transformer.resblocks[14:]) for _ in range(self.num_of_criteria)])
+
+            self.model.cuda()
+            
+            concept_keys = list(concept_list.keys())
+            self.concept_token_dict = {}
+            for key in concept_keys:
+                prefix = get_prefix(self.config.dataset, key)
+                attr_concept_list = concept_list[key]
+                prefix_attr_concept_list = [prefix + concept for concept in attr_concept_list]
+                tmp_concept_text = self.tokenizer(prefix_attr_concept_list).cuda()
+                #print(f"tmp_concept_text shape: {tmp_concept_text.shape}")
+                _, tmp_concept_feats, logit_scale = self.model(None, tmp_concept_text)
+                self.concept_token_dict[key] = tmp_concept_feats.detach()
+
+            
+            self.logit_scale = logit_scale.detach()
+
+            # Step 1: Move model back to CPU
+            self.model = self.model.to('cpu')
+
+            # Step 2: Delete the model (optional, for memory release)
+            del self.model
+
+            # Step 3: Empty the CUDA memory cache
+            torch.cuda.empty_cache()
+        
+        self.visual_features = [[] for _ in range(7)]
+        # self.hook_list = []
+
+        # def hook_fn(module, input, output, idx):
+        #     self.visual_features[idx].append(output)  # detach to avoid saving computation graph
+
+        # layers = [branch[-1] for branch in self.branches]
+        # for idx, layer in enumerate(layers):
+        #     self.hook_list.append(layer.register_forward_hook(lambda module, input, output, idx=idx: hook_fn(module, input, output, idx)))
+        
+        hidden_size = 1024
+        num_heads = 16
+        self.critical_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
+        self.trivial_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
+
+        self.cross_attns_criticals = nn.ModuleList([nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True) for _ in range(self.num_of_criteria)])
+        self.ffns = nn.ModuleList([FFN(hidden_size, hidden_size*4) for _ in range(self.num_of_criteria)])
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden_size) for _ in range(self.num_of_criteria)])
+        self.norms_before = nn.ModuleList([nn.LayerNorm(hidden_size) for _ in range(self.num_of_criteria)])
+        self.projs = nn.ModuleList([nn.Linear(in_features=hidden_size, out_features=512, bias=False) for _ in range(self.num_of_criteria)])
+
+        self.cross_attn_trivial = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+    
+        self.ffn = FFN(hidden_size, hidden_size*4)
+        
+        self.ffn_smaller = FFN(hidden_size, hidden_size*4)
+        self.norm_smaller = nn.LayerNorm(hidden_size)
+
+        self.norm_before = nn.LayerNorm(hidden_size)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.proj = nn.Linear(in_features=hidden_size, out_features=512, bias=False)
+
+        dim_of_sit_tokens = 768
+        num_heads_sit = 16
+        self.proj_tokens_for_Sit = nn.Linear(in_features=hidden_size, out_features=dim_of_sit_tokens, bias=False)
+        self.proj_vit_output_for_Sit = nn.Linear(in_features=hidden_size, out_features=dim_of_sit_tokens, bias=False)
+        self.norm_vit_output_for_Sit = nn.LayerNorm(dim_of_sit_tokens)
+        self.norm_tokens_for_Sit = nn.LayerNorm(dim_of_sit_tokens)
+        self.cross_attn_critical_for_Sit = nn.MultiheadAttention(embed_dim=dim_of_sit_tokens, num_heads=num_heads_sit, batch_first=True)
+        self.proj_Sit = nn.Linear(in_features=hidden_size, out_features=768, bias=False)
+
+        #                                     34  for ISIC
+        #                                     17 for BUSI
+        self.cls_head = nn.Linear(in_features=NUM_OF_SIMILARITIES[self.config.dataset], out_features=config.num_class)
+        self.minimal_cls_head = nn.Linear(in_features=1024*7, out_features=config.num_class)
+
+        self.cluster_sigma = torch.nn.Parameter(torch.ones(1))
+        self.orthogonal_sigma = torch.nn.Parameter(torch.ones(1))
+        self.coverage_sigma = torch.nn.Parameter(torch.ones(1))
+
+
+        #####
+        for param in self.shared_stem.parameters():
+            param.requires_grad = True
+
+        for branch in self.branches:
+            for param in branch.parameters():
+                    param.requires_grad = True
+
+        #####
+        
+        self.critical_visual_tokens.requires_grad = True
+        self.trivial_visual_tokens.requires_grad = True
+
+        ###########################################################
+        self.cnn = PatchSelectorCNN().cuda()
+        self.classifying_critical_cnn = ClassifyingCNN().cuda()
+
+    
+    def get_backbone_params(self):
+        return self.model.visual.trunk.parameters()
+    def get_bridge_params(self):
+        param_list = []
+        
+        param_list.append(self.critical_visual_tokens)
+        param_list.append(self.trivial_visual_tokens)
+
+        for param in self.ffn.parameters():
+            param_list.append(param)
+        for param in self.norm.parameters():
+            param_list.append(param)
+        for param in self.proj.parameters():
+            param_list.append(param)
+
+        for i in range(self.num_of_criteria):
+            for param in self.ffns[i].parameters():
+                param_list.append(param)
+            for param in self.norms[i].parameters():
+                param_list.append(param)
+            for param in self.projs[i].parameters():
+                param_list.append(param)
+
+        for param in self.cls_head.parameters():
+            param_list.append(param)
+
+        return param_list
+
+
+    def forward(self, imgs, explicid_imgs_latents=None):
+        self.visual_features = [[] for _ in range(7)]
+
+        # Forward pass through the shared convolutional layer and the first 7 transformer blocks
+        x = self.shared_stem.conv1(imgs)  # Convolutional layer
+        x = x.flatten(2).transpose(1, 2)  # Flatten and transpose
+        x = self.shared_stem.ln_pre(x)  # Layer normalization
+        #print(f"x.shape {x.shape}")
+        #print(f"self.shared_stem.positional_embedding.shape {self.shared_stem.positional_embedding.shape}")
+        x = x + self.shared_stem.positional_embedding[:x.size(1), :]  # Positional embedding
+        for i in range(14):
+            x = self.shared_stem.transformer.resblocks[i](x)  # First 7 transformer blocks
+
+        # Forward pass through each branch
+        for idx, branch in enumerate(self.branches):
+            branch_output = x
+            for layer in branch:
+                branch_output = layer(branch_output)
+            self.visual_features[idx].append(branch_output)
+
+        # Combine the outputs from the 7 branches
+        vit_l_outputs = [self.visual_features[idx][0] for idx in range(self.num_of_criteria)]
+
+        patches = image_to_patches(imgs, patch_size=14)
+        B, _, _ = vit_l_outputs[0].shape  # B: batch size, T: num_patches (256), D: patch_dim (1024)
+        #print(f"vit_l_outputs[0].shape {vit_l_outputs[0].shape}")
+
+        attn_critical_weights=[]
+        agg_critical_visual_tokens_1024 = []
+        agg_critical_visual_tokens = []
+        for i in range(7):
+            #print(f"self.critical_visual_tokens shape {self.critical_visual_tokens.shape}")
+            critical_visual_token = self.critical_visual_tokens[i].repeat(B, 1, 1)
+            #print(critical_visual_token.shape)
+            agg_critical_visual_token, attn_critical_weight = self.cross_attns_criticals[i](critical_visual_token, vit_l_outputs[i], vit_l_outputs[i])
+            agg_critical_visual_tokens_1024.append(agg_critical_visual_token)
+            agg_critical_visual_token_512 = self.projs[i](self.norms[i](self.ffns[i](agg_critical_visual_token)))
+            agg_critical_visual_token_512 = F.normalize(agg_critical_visual_token_512, dim=-1)
+            #print(agg_critical_visual_token_512.shape)
+            agg_critical_visual_tokens.append(agg_critical_visual_token_512)
+            attn_critical_weights.append(attn_critical_weight)
+
+        agg_critical_visual_tokens_for_explicid = torch.cat(agg_critical_visual_tokens, dim=1)
+        #print(agg_critical_visual_tokens_for_explicid.shape)
+        attn_critical_weights = torch.cat(attn_critical_weights, dim=1)
+        
+        trivial_visual_tokens = self.trivial_visual_tokens.repeat(B, 1, 1)
+        critical_mask, trivial_mask = torch.zeros(B, 1, 16, 16), torch.zeros(B, 1, 16, 16)
+        agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial(trivial_visual_tokens, vit_l_outputs[0], vit_l_outputs[0])
+                                                # self.proj(the tokens from X to 512
+        attn_explicd_loss = torch.tensor(0.0, device=self.device)
+
+        overlap_loss = torch.tensor(0.0, device=self.device)
+ 
+        agg_critical_visual_tokens_for_SiT = self.proj_Sit(self.norm(torch.cat(agg_critical_visual_tokens_1024, dim=1)))
+        agg_trivial_visual_tokens_for_SiT = self.proj_Sit(self.norm((agg_trivial_visual_tokens)))
+
+        image_logits_dict = {}
+        idx = 0
+        for key in self.concept_token_dict.keys():
+            image_logits_dict[key] = (self.logit_scale * agg_critical_visual_tokens_for_explicid[:, idx:idx+1, :] @ self.concept_token_dict[key].repeat(B, 1, 1).permute(0, 2, 1)).squeeze(1)
+            idx += 1
+
+        image_logits_list = []
+
+        for key in image_logits_dict.keys():
+            image_logits_list.append(image_logits_dict[key])
+
+        image_logits = torch.cat(image_logits_list, dim=-1)
+        cls_logits = self.cls_head(image_logits)
+
+        to_return_dict = {
+            "patches":patches,
+            "patches_colored":patches,
+            "critical_mask":critical_mask,
+            "trivial_mask":trivial_mask,
+            "cls_logits":cls_logits,
+            "image_logits_dict":image_logits_dict,
+            "agg_critical_visual_tokens_for_SiT":F.normalize(agg_critical_visual_tokens_for_SiT, dim=-1),
+            "agg_trivial_visual_tokens_for_SiT":F.normalize(agg_trivial_visual_tokens_for_SiT, dim=-1),
+            "attn_explicd_loss":attn_explicd_loss,
+            "overlap_loss":overlap_loss,
+            "attn_critical_weights":attn_critical_weights,
+            "attn_trivial_weights":attn_trivial_weights,
+            "vit_l_output":vit_l_outputs[0],
+            "agg_critical_visual_tokens":torch.cat(agg_critical_visual_tokens_1024, dim=1),
+            "agg_trivial_visual_tokens":agg_trivial_visual_tokens
+        }
+
+        doing_cnn_critical = True
+
+        to_return_dict["cnn_logits_critical"] = None
+        to_return_dict["cnn_logits_trivial"] = None
+
+        if doing_cnn_critical and explicid_imgs_latents is not None:
+            to_return_dict["cnn_logits_critical"] = self.classifying_critical_cnn(explicid_imgs_latents.view(B, 16, 16, 768).permute(0, 3, 1, 2))
+        else:
+            to_return_dict["cnn_logits_critical"] = cls_logits
+
+
+        return to_return_dict
+    
+
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+
+
+
+class ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Cascade(nn.Module):  
+
+
+    def __init__(self, concept_list, model_name='biomedclip', config=None):
+        super().__init__()
+            
+        self.concept_list = concept_list
+        self.model_name = model_name
+        self.config = config
+        self.num_of_criteria = NUM_OF_CRITERIA[config.dataset]
+        self.device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print("Branching")
+       
+        if self.model_name in ['biomedclip', 'openclip']:
+            if self.model_name == 'biomedclip':
+                self.model, preprocess = create_model_from_pretrained('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
+                self.tokenizer = get_tokenizer('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
+            elif self.model_name == 'openclip':
+                self.model, preprocess = create_model_from_pretrained('hf-hub:laion/CLIP-ViT-L-14-laion2B-s32B-b82K')
+                self.tokenizer = get_tokenizer('hf-hub:laion/CLIP-ViT-L-14-laion2B-s32B-b82K')
+               
+            
+            config.preprocess = preprocess
+
+             # Load the shared stem of the vision transformer
+            self.shared_stem = clip.load(f"ViT-L/14")[0].visual
+            # Convert specific layers or parameters to float32
+            for param in self.shared_stem.parameters():
+                param.data = param.data.to(torch.float32)
+            
+            self.shared_stem.cuda()
+
+             # Create 7 separate branches for the remaining layers
+            self.branches = nn.ModuleList([copy.deepcopy(self.shared_stem.transformer.resblocks[7:]) for _ in range(self.num_of_criteria//7)])
+
+            self.model.cuda()
+            
+            concept_keys = list(concept_list.keys())
+            self.concept_token_dict = {}
+            for key in concept_keys:
+                prefix = get_prefix(self.config.dataset, key)
+                attr_concept_list = concept_list[key]
+                prefix_attr_concept_list = [prefix + concept for concept in attr_concept_list]
+                tmp_concept_text = self.tokenizer(prefix_attr_concept_list).cuda()
+                #print(f"tmp_concept_text shape: {tmp_concept_text.shape}")
+                _, tmp_concept_feats, logit_scale = self.model(None, tmp_concept_text)
+                self.concept_token_dict[key] = tmp_concept_feats.detach()
+
+            
+            self.logit_scale = logit_scale.detach()
+
+            # Step 1: Move model back to CPU
+            self.model = self.model.to('cpu')
+
+            # Step 2: Delete the model (optional, for memory release)
+            del self.model
+
+            # Step 3: Empty the CUDA memory cache
+            torch.cuda.empty_cache()
+        
+        self.visual_features = [[] for _ in range(7)]
+        # self.hook_list = []
+
+        # def hook_fn(module, input, output, idx):
+        #     self.visual_features[idx].append(output)  # detach to avoid saving computation graph
+
+        # layers = [branch[-1] for branch in self.branches]
+        # for idx, layer in enumerate(layers):
+        #     self.hook_list.append(layer.register_forward_hook(lambda module, input, output, idx=idx: hook_fn(module, input, output, idx)))
+        
+        hidden_size = 1024
+        num_heads = 16
+        self.critical_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
+        self.trivial_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
+
+        self.cross_attns_criticals = nn.ModuleList([nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True) for _ in range(self.num_of_criteria*5)])
+        self.ffns = nn.ModuleList([FFN(hidden_size, hidden_size*4) for _ in range(self.num_of_criteria)])
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden_size) for _ in range(self.num_of_criteria)])
+        self.norms_before = nn.ModuleList([nn.LayerNorm(hidden_size) for _ in range(self.num_of_criteria)])
+        self.projs = nn.ModuleList([nn.Linear(in_features=hidden_size, out_features=512, bias=False) for _ in range(self.num_of_criteria)])
+
+        self.cross_attn_trivial = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+    
+        self.ffn = FFN(hidden_size, hidden_size*4)
+        
+        self.ffn_smaller = FFN(hidden_size, hidden_size*4)
+        self.norm_smaller = nn.LayerNorm(hidden_size)
+
+        self.norm_before = nn.LayerNorm(hidden_size)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.proj = nn.Linear(in_features=hidden_size, out_features=512, bias=False)
+
+        dim_of_sit_tokens = 768
+        num_heads_sit = 16
+        self.proj_tokens_for_Sit = nn.Linear(in_features=hidden_size, out_features=dim_of_sit_tokens, bias=False)
+        self.proj_vit_output_for_Sit = nn.Linear(in_features=hidden_size, out_features=dim_of_sit_tokens, bias=False)
+        self.norm_vit_output_for_Sit = nn.LayerNorm(dim_of_sit_tokens)
+        self.norm_tokens_for_Sit = nn.LayerNorm(dim_of_sit_tokens)
+        self.cross_attn_critical_for_Sit = nn.MultiheadAttention(embed_dim=dim_of_sit_tokens, num_heads=num_heads_sit, batch_first=True)
+        self.proj_Sit = nn.Linear(in_features=hidden_size, out_features=768, bias=False)
+
+        #                                     34  for ISIC
+        #                                     17 for BUSI
+        self.cls_head = nn.Linear(in_features=NUM_OF_SIMILARITIES[self.config.dataset], out_features=config.num_class)
+        self.minimal_cls_head = nn.Linear(in_features=1024*7, out_features=config.num_class)
+
+        self.cluster_sigma = torch.nn.Parameter(torch.ones(1))
+        self.orthogonal_sigma = torch.nn.Parameter(torch.ones(1))
+        self.coverage_sigma = torch.nn.Parameter(torch.ones(1))
+
+
+        #####
+        for param in self.shared_stem.parameters():
+            param.requires_grad = True
+
+        for branch in self.branches:
+            for param in branch.parameters():
+                    param.requires_grad = True
+
+        #####
+        
+        self.critical_visual_tokens.requires_grad = True
+        self.trivial_visual_tokens.requires_grad = True
+
+        ###########################################################
+        self.cnn = PatchSelectorCNN().cuda()
+        self.classifying_critical_cnn = ClassifyingCNN().cuda()
+
+    
+    def get_backbone_params(self):
+        return self.model.visual.trunk.parameters()
+    def get_bridge_params(self):
+        param_list = []
+        
+        param_list.append(self.critical_visual_tokens)
+        param_list.append(self.trivial_visual_tokens)
+
+        for param in self.ffn.parameters():
+            param_list.append(param)
+        for param in self.norm.parameters():
+            param_list.append(param)
+        for param in self.proj.parameters():
+            param_list.append(param)
+
+        for i in range(self.num_of_criteria):
+            for param in self.ffns[i].parameters():
+                param_list.append(param)
+            for param in self.norms[i].parameters():
+                param_list.append(param)
+            for param in self.projs[i].parameters():
+                param_list.append(param)
+
+        for param in self.cls_head.parameters():
+            param_list.append(param)
+
+        return param_list
+
+
+    def forward(self, imgs, explicid_imgs_latents=None):
+        self.visual_features = [[] for _ in range(7)]
+
+        # Forward pass through the shared convolutional layer and the first 7 transformer blocks
+        x = self.shared_stem.conv1(imgs)  # Convolutional layer
+        x = x.flatten(2).transpose(1, 2)  # Flatten and transpose
+        x = self.shared_stem.ln_pre(x)  # Layer normalization
+        #print(f"x.shape {x.shape}")
+        #print(f"self.shared_stem.positional_embedding.shape {self.shared_stem.positional_embedding.shape}")
+        x = x + self.shared_stem.positional_embedding[:x.size(1), :]  # Positional embedding
+        for i in range(7):
+            x = self.shared_stem.transformer.resblocks[i](x)  # First 7 transformer blocks
+
+        B = x.shape[0]
+        critical_visual_tokens = self.critical_visual_tokens.repeat(B, 1, 1)
+        # Forward pass through each branch
+        for idx, branch in enumerate(self.branches):
+            branch_output = x
+            for l, layer in enumerate(branch):
+                branch_output = layer(branch_output)
+                critical_visual_tokens, attn_critical_weights = self.cross_attns_criticals[l](critical_visual_tokens, branch_output, branch_output)
+            self.visual_features[idx].append(branch_output)
+
+        agg_critical_visual_tokens_for_explicid = self.proj(self.norm(self.ffn(critical_visual_tokens)))
+        agg_critical_visual_tokens_for_explicid = F.normalize(agg_critical_visual_tokens_for_explicid, dim=-1)
+
+        # Combine the outputs from the 7 branches
+        vit_l_outputs = [self.visual_features[idx][0] for idx in range(self.num_of_criteria//7)]
+
+        patches = image_to_patches(imgs, patch_size=14)
+        
+        trivial_visual_tokens = self.trivial_visual_tokens.repeat(B, 1, 1)
+        critical_mask, trivial_mask = torch.zeros(B, 1, 16, 16), torch.zeros(B, 1, 16, 16)
+        agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial(trivial_visual_tokens, vit_l_outputs[0], vit_l_outputs[0])
+                                                # self.proj(the tokens from X to 512
+        attn_explicd_loss = torch.tensor(0.0, device=self.device)
+
+        overlap_loss = torch.tensor(0.0, device=self.device)
+ 
+        agg_critical_visual_tokens_for_SiT = self.proj_Sit(self.norm(critical_visual_tokens))
+        agg_trivial_visual_tokens_for_SiT = self.proj_Sit(self.norm((agg_trivial_visual_tokens)))
+
+        image_logits_dict = {}
+        idx = 0
+        for key in self.concept_token_dict.keys():
+            image_logits_dict[key] = (self.logit_scale * agg_critical_visual_tokens_for_explicid[:, idx:idx+1, :] @ self.concept_token_dict[key].repeat(B, 1, 1).permute(0, 2, 1)).squeeze(1)
+            idx += 1
+
+        image_logits_list = []
+
+        for key in image_logits_dict.keys():
+            image_logits_list.append(image_logits_dict[key])
+
+        image_logits = torch.cat(image_logits_list, dim=-1)
+        cls_logits = self.cls_head(image_logits)
+
+        to_return_dict = {
+            "patches":patches,
+            "patches_colored":patches,
+            "critical_mask":critical_mask,
+            "trivial_mask":trivial_mask,
+            "cls_logits":cls_logits,
+            "image_logits_dict":image_logits_dict,
+            "agg_critical_visual_tokens_for_SiT":F.normalize(agg_critical_visual_tokens_for_SiT, dim=-1),
+            "agg_trivial_visual_tokens_for_SiT":F.normalize(agg_trivial_visual_tokens_for_SiT, dim=-1),
+            "attn_explicd_loss":attn_explicd_loss,
+            "overlap_loss":overlap_loss,
+            "attn_critical_weights":attn_critical_weights,
+            "attn_trivial_weights":attn_trivial_weights,
+            "vit_l_output":vit_l_outputs[0],
+            "agg_critical_visual_tokens":critical_visual_tokens,
+            "agg_trivial_visual_tokens":agg_trivial_visual_tokens
+        }
+
+        doing_cnn_critical = True
+
+        to_return_dict["cnn_logits_critical"] = None
+        to_return_dict["cnn_logits_trivial"] = None
+
+        if doing_cnn_critical and explicid_imgs_latents is not None:
+            to_return_dict["cnn_logits_critical"] = self.classifying_critical_cnn(explicid_imgs_latents.view(B, 16, 16, 768).permute(0, 3, 1, 2))
+        else:
+            to_return_dict["cnn_logits_critical"] = cls_logits
+
+
+        return to_return_dict
+    
+
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+########################################################################################
+    
+
+class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):  
+    def __init__(self, concept_list, model_name='biomedclip', config=None):
+        super().__init__()
+            
+        self.concept_list = concept_list
+        self.model_name = model_name
+        self.config = config
+        self.num_of_criteria = NUM_OF_CRITERIA[config.dataset]
+        self.device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+       
+        if self.model_name in ['biomedclip', 'openclip']:
+            if self.model_name == 'biomedclip':
+                self.model, preprocess = create_model_from_pretrained('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
+                self.tokenizer = get_tokenizer('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
+            elif self.model_name == 'openclip':
+                self.model, preprocess = create_model_from_pretrained('hf-hub:laion/CLIP-ViT-L-14-laion2B-s32B-b82K')
+                self.tokenizer = get_tokenizer('hf-hub:laion/CLIP-ViT-L-14-laion2B-s32B-b82K')
+               
+            
+            config.preprocess = preprocess
+
+            self.model_visual_ViT_L = clip.load(f"ViT-L/14")[0].visual
+
+            #self.model_visual_custom = VisionTransformer7x7()
+
+            #Convert specific layers or parameters to float32
+            for param in self.model_visual_ViT_L.parameters():
+                param.data = param.data.to(torch.float32)
+
+            self.model_visual_ViT_L.cuda()
+            #self.model_visual_custom.cuda()
+            
+            self.model.cuda()
+            
+            concept_keys = list(concept_list.keys())
+            self.concept_token_dict = {}
+            for key in concept_keys:
+                prefix = get_prefix(self.config.dataset, key)
+                attr_concept_list = concept_list[key]
+                prefix_attr_concept_list = [prefix + concept for concept in attr_concept_list]
+                tmp_concept_text = self.tokenizer(prefix_attr_concept_list).cuda()
+                #print(f"tmp_concept_text shape: {tmp_concept_text.shape}")
+                _, tmp_concept_feats, logit_scale = self.model(None, tmp_concept_text)
+                self.concept_token_dict[key] = tmp_concept_feats.detach()
+
+            
+            self.logit_scale = logit_scale.detach()
+
+            ################ Option Clip L
+            # Step 1: Move model back to CPU
+            self.model = self.model.to('cpu')
+
+            # Step 2: Delete the model (optional, for memory release)
+            del self.model
+
+            # Step 3: Empty the CUDA memory cache
+            torch.cuda.empty_cache()
+            ################
+        
+        self.visual_features = []
+        self.hook_list = []
+
+        def hook_fn(module, input, output):
+            self.visual_features.append(output) # detach to aboid saving computation graph
+                                                 # might need to remove if finetune the full model
+        
+        ################# Option BioMedclip
+        # layers = [self.model.visual.trunk.blocks[11]]
+
+        # for param in self.model.text.parameters():
+        #     param.requires_grad = False
+        # for param in self.model.visual.trunk.parameters():
+        #     param.requires_grad = True
+        ################# Option Clip L
+        layers = [self.model_visual_ViT_L.transformer.resblocks[23]]
+        #################
+
+        for layer in layers:
+            self.hook_list.append(layer.register_forward_hook(hook_fn))
+
+        
+        hidden_size = 1024
+        num_heads = 16
+        self.critical_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
+        self.trivial_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
+
+        self.critical_visual_tokens_smaller = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
+        self.trivial_visual_tokens_smaller  = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
+
+        self.cross_attn = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+        self.cross_attn_critical = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+        self.cross_attns_criticals = nn.ModuleList([nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True) for _ in range(self.num_of_criteria)])
+        self.cross_attn_trivial = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+    
+        self.self_attn_critical = Attention(hidden_size, num_heads=num_heads, qkv_bias=False, qk_norm=True)
+
+        self.cross_attn_critical_smaller = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+        self.cross_attn_trivial_smaller = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+
+        self.cross_attn_between_patches = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+        self.cross_attn_in_patches = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
+        self.ffn = FFN(hidden_size, hidden_size*4)
+
+        self.ffn_smaller = FFN(hidden_size, hidden_size*4)
+        self.norm_smaller = nn.LayerNorm(hidden_size)
+
+        self.norm_before = nn.LayerNorm(hidden_size)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.proj = nn.Linear(in_features=hidden_size, out_features=512, bias=False)
+
+        dim_of_sit_tokens = 768
+        num_heads_sit = 16
+        self.proj_tokens_for_Sit = nn.Linear(in_features=hidden_size, out_features=dim_of_sit_tokens, bias=False)
+        self.proj_vit_output_for_Sit = nn.Linear(in_features=hidden_size, out_features=dim_of_sit_tokens, bias=False)
+        self.norm_vit_output_for_Sit = nn.LayerNorm(dim_of_sit_tokens)
+        self.norm_tokens_for_Sit = nn.LayerNorm(dim_of_sit_tokens)
+        self.cross_attn_critical_for_Sit = nn.MultiheadAttention(embed_dim=dim_of_sit_tokens, num_heads=num_heads_sit, batch_first=True)
+
+        self.proj_Sit = nn.Linear(in_features=hidden_size, out_features=768, bias=False)
+        #self.proj_Sit_to_explicid = nn.Linear(in_features=768, out_features=512, bias=False)
+
+        #                                     34  for ISIC
+        #                                     17 for BUSI
+        self.cls_head = nn.Linear(in_features=NUM_OF_SIMILARITIES[self.config.dataset], out_features=config.num_class)
+        self.minimal_cls_head = nn.Linear(in_features=hidden_size*7, out_features=config.num_class)
+
+        self.cluster_sigma = torch.nn.Parameter(torch.ones(1))
+        self.orthogonal_sigma = torch.nn.Parameter(torch.ones(1))
+        self.coverage_sigma = torch.nn.Parameter(torch.ones(1))
+
+        for param in self.model_visual_ViT_L.parameters():
+            param.requires_grad = True
+
+
+        self.critical_visual_tokens.requires_grad = True
+        self.trivial_visual_tokens.requires_grad = True
+
+        self.critical_visual_tokens_smaller.requires_grad = True
+        self.trivial_visual_tokens_smaller.requires_grad = True
+
+        ###########################################################
+        self.cnn = PatchSelectorCNN().cuda()
+        self.cnn_kernel_14 = PatchSelectorCNN_kernel_14().cuda()
+        self.classifying_critical_cnn = ClassifyingCNN().cuda()
+        #self.classifying_trivial_cnn = ClassifyingCNN().cuda()
+        #self.gnn =  CircularConv(in_dim=1024, out_dim=1024).cuda()
+        #self.node_classifier =  NodeClassifier(in_dim=1024).cuda()
+
+    
+    def get_backbone_params(self):
+        return self.model.visual.trunk.parameters()
+    def get_bridge_params(self):
+        param_list = []
+        
+        param_list.append(self.critical_visual_tokens)
+        param_list.append(self.trivial_visual_tokens)
+        for param in self.cross_attn.parameters():
+            param_list.append(param)
+
+        for param in self.ffn.parameters():
+            param_list.append(param)
+        for param in self.norm.parameters():
+            param_list.append(param)
+        for param in self.proj.parameters():
+            param_list.append(param)
+
+        for i in range(self.num_of_criteria):
+            for param in self.ffns[i].parameters():
+                param_list.append(param)
+            for param in self.norms[i].parameters():
+                param_list.append(param)
+            for param in self.projs[i].parameters():
+                param_list.append(param)
+            for param in self.proj_Sits[i].parameters():
+                param_list.append(param)
+            for param in self.proj_Sits_to_explicids[i].parameters():
+                param_list.append(param)
+
+        for param in self.cls_head.parameters():
+            param_list.append(param)
+
+        return param_list
+
+
+    def forward(self, imgs, refined_tokens=None, explicid_imgs_latents=None):
+        
+        if refined_tokens is not None:
+            image_logits_dict_refined = {}
+            idx = 0
+            refined_tokens = self.proj_Sit_to_explicid(F.normalize(refined_tokens, dim=-1))
+            for key in self.concept_token_dict.keys():
+                image_logits_dict_refined[key] = (self.logit_scale * refined_tokens[:, idx:idx+1, :] @ self.concept_token_dict[key].repeat(refined_tokens.shape[0], 1, 1).permute(0, 2, 1)).squeeze(1)
+                idx += 1
+            image_logits_list_refined = []
+            for key in image_logits_dict_refined.keys():
+                image_logits_list_refined.append(image_logits_dict_refined[key])
+        
+            image_logits_refined = torch.cat(image_logits_list_refined, dim=-1)
+            cls_logits_refined = self.cls_head(image_logits_refined)
+            return cls_logits_refined
+
+        self.visual_features.clear()
+        patches = image_to_patches(imgs, patch_size=14)
+        B, T, D_patch = patches.shape  # B: batch size, T: num_patches (256), D: patch_dim (1024)
+        #print(patches.shape)
+        ################# Option BioMedclip
+        # _, _, _ = self.model(imgs, None)
+        # vit_l_output = self.visual_features[0][:, 1:, :]
+        ################# Option Clip L
+        ################# Option gradual
+        _ = self.model_visual_ViT_L(imgs)
+        critical_mask, trivial_mask = self.cnn_kernel_14(imgs)  # Shape: (B, 1, 16, 16)
+        loss_fn = SpatialAwarePatchLoss()
+        attn_explicd_loss = torch.tensor(0.0, device=self.device)
+        #attn_explicd_loss += 10*loss_fn(patches.permute(0, 2, 1).view(B, D_patch, int(T ** 0.5), int(T ** 0.5)), critical_mask)
+        
+        # vit_l_output = self.model_visual_ViT_L.conv1(imgs)  # Convolutional layer
+        # vit_l_output = vit_l_output.flatten(2).transpose(1, 2)  # Flatten and transpose
+        # vit_l_output = self.model_visual_ViT_L.ln_pre(vit_l_output)  # Layer normalization
+        # vit_l_output = vit_l_output + self.model_visual_ViT_L.positional_embedding[:vit_l_output.size(1), :]  # Positional embedding
+        # for i in range(23):
+        #     vit_l_output = self.model_visual_ViT_L.transformer.resblocks[i](vit_l_output)  # First 7 transformer blocks
+        #print(vit_l_output.shape)
+        ################# Option instanentous
+        vit_l_output=self.visual_features[0].permute(1, 0, 2)[:, 1:, :]
+        #################
+        B, T, D = vit_l_output.shape  # B: batch size, T: num_patches (256), D: patch_dim (1024)
+        H = W = int(T ** 0.5)  # Assuming T is a perfect square, H = W = 16
+        ############################################################################   Option use Attention Loss for the tokens
+        vit_output_unflattened = vit_l_output.view(B, H, W, D).permute(0, 3, 1, 2)  # Shape: (B, 1024, 16, 16)
+        #vit_output_unflattened_for_exlusive = vit_output_unflattened.clone().detach()
+        #vit_output_unflattened_for_exlusive =vit_output_unflattened
+        #critical_mask, trivial_mask = self.cnn(vit_output_unflattened)  # Shape: (B, 1, 16, 16)
+        #trivial_mask = 1-critical_mask
+        critical_mask, trivial_mask = torch.zeros(B, 1, 16, 16).cuda(), torch.zeros(B, 1, 16, 16).cuda()
+        vit_l_output_for_critical = (vit_output_unflattened * critical_mask).permute(0, 2, 3, 1).view(B, T, D)  # Shape: (B, 256, 1024)
+        vit_l_output_for_trivial = (vit_output_unflattened * trivial_mask).permute(0, 2, 3, 1).view(B, T, D)
+        #CAUTION: The above line is for the case where the attention loss is used for the tokens
+               
+        critical_visual_tokens = self.critical_visual_tokens.repeat(B, 1, 1)
+        trivial_visual_tokens = self.trivial_visual_tokens.repeat(B, 1, 1)
+
+        #vit_output_unflattened = vit_l_output.view(B, H, W, D).permute(0, 3, 1, 2)  # Shape: (B, 1024, 16, 16)
+        #critical_mask, trivial_mask = self.cnn(vit_output_unflattened)  # Shape: (B, 1, 16, 16)
+        #critical_mask, trivial_mask = torch.zeros(B, 1, 16, 16).cuda(), torch.zeros(B, 1, 16, 16).cuda()
+        ############################################################################   Option use self-attention for the tokens
+        #critical_visual_tokens = self.self_attn_critical(critical_visual_tokens)
+        #CAUTION The above line is for the case where the self-attention is used for the tokens
+
+        agg_critical_visual_tokens, attn_critical_weights = self.cross_attn_critical(critical_visual_tokens, vit_l_output, vit_l_output)
+        agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial(trivial_visual_tokens, vit_l_output, vit_l_output)
+        d_products = torch.matmul(agg_critical_visual_tokens, vit_l_output_for_critical.permute(0, 2, 1))/(D**0.5)
+        #print(f"d_products.shape {d_products.shape}")
+        ############################################################################   Option use self-attention for the tokens
+        #agg_critical_visual_tokens = self.self_attn_critical(agg_critical_visual_tokens)
+        #CAUTION The above line is for the case where the self-attention is used for the tokens
+                                                # self.proj(the tokens from X to 512
+        agg_critical_visual_tokens_for_explicid = self.proj(self.norm(self.ffn(agg_critical_visual_tokens[:,:self.num_of_criteria,:])))
+        agg_critical_visual_tokens_for_explicid = F.normalize(agg_critical_visual_tokens_for_explicid, dim=-1)
+
+        #vit_output_for_Sit = self.norm_vit_output_for_Sit(self.proj_vit_output_for_Sit(vit_l_output))
+        #attn_explicd_loss = torch.tensor(0.0, device=self.device)
+
+        overlap_loss = torch.tensor(0.0, device=self.device)
+
+        #############################################################################
+        agg_critical_visual_tokens_for_SiT = self.proj_Sit(self.norm(self.ffn_smaller(agg_critical_visual_tokens)))
+        agg_trivial_visual_tokens_for_SiT = self.proj_Sit(self.norm(self.ffn_smaller(agg_trivial_visual_tokens)))
+
+        image_logits_dict = {}
+        idx = 0
+        for key in self.concept_token_dict.keys():
+            ############################### Option dot product
+            image_logits_dict[key] = (self.logit_scale *agg_critical_visual_tokens_for_explicid[:, idx:idx+1, :] @ self.concept_token_dict[key].repeat(B, 1, 1).permute(0, 2, 1)).squeeze(1)
+            ############################### Option cosine similarity
+            #norm_agg_visual_tokens = F.normalize(agg_critical_visual_tokens_for_explicid[:, idx:idx+1, :], dim=-1)
+            #norm_concept_embedding = F.normalize(self.concept_token_dict[key], dim=-1)
+            #cosine_similarity = torch.matmul(norm_agg_visual_tokens, norm_concept_embedding.repeat(B, 1, 1).permute(0, 2, 1)).squeeze(1)
+            #image_logits_dict[key] = self.logit_scale * cosine_similarity
+            ###############################
+            idx += 1
+
+        image_logits_list = []
+
+        for key in image_logits_dict.keys():
+            #image_logits_list.append(F.softmax(image_logits_dict[key], dim=1))
+            image_logits_list.append(image_logits_dict[key])
+
+        image_logits = torch.cat(image_logits_list, dim=-1)
+        cls_logits = self.cls_head(image_logits)
+
+
+        to_return_dict = {
+            "patches":patches,
+            "patches_colored":patches,
+            "critical_mask":critical_mask,
+            "trivial_mask":trivial_mask,
+            "cls_logits":cls_logits,
+            "image_logits_dict":image_logits_dict,
+            "agg_critical_visual_tokens_for_SiT":F.normalize(agg_critical_visual_tokens_for_SiT, dim=-1),
+            "agg_trivial_visual_tokens_for_SiT":F.normalize(agg_trivial_visual_tokens_for_SiT, dim=-1),
+            "attn_explicd_loss":attn_explicd_loss,
+            "overlap_loss":overlap_loss,
+            "attn_critical_weights":attn_critical_weights,
+            "attn_trivial_weights":attn_trivial_weights,
+            "vit_l_output":vit_l_output,
+            "agg_critical_visual_tokens":agg_critical_visual_tokens,
+            "agg_trivial_visual_tokens":agg_trivial_visual_tokens
+        }
+
+        doing_cnn_critical = True
+        doing_cnn_trivial=False
+
+        to_return_dict["cnn_logits_critical"] = None
+        to_return_dict["cnn_logits_trivial"] = None
+
+        if doing_cnn_critical and explicid_imgs_latents is not None:
+            to_return_dict["cnn_logits_critical"] = self.classifying_critical_cnn(explicid_imgs_latents.view(B, 16, 16, 768).permute(0, 3, 1, 2))
+        else:
+            to_return_dict["cnn_logits_critical"] = cls_logits
+
+        if doing_cnn_trivial:
+            to_return_dict["cnn_logits_trivial"] = self.classifying_trivial_cnn(vit_l_output)
+
+ 
+        return to_return_dict

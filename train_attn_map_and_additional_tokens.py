@@ -43,8 +43,12 @@ import timm
 from optparse import OptionParser
 from torchvision import transforms
 from Explicd.dataset.isic_dataset import SkinDataset
-from Explicd.model import ExpLICD_ViT_L, ExpLICD, ExpLICD_ViT_L_Multiple_Prompts, ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens, PatchSelectorCNNConscise, ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_SuperPixels
-from Explicd.concept_dataset import explicid_isic_dict, explicid_isic_dict_mine, explicid_idrid_dict, explicid_idrid_edema_dict, explicid_busi_dict, explicid_busi_soft_smooth_dict, explicid_isic_minimal_dict
+from Explicd.model import (ExpLICD_ViT_L, ExpLICD, ExpLICD_ViT_L_Multiple_Prompts, ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens, PatchSelectorCNNConscise, 
+                           ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_SuperPixels, ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_Representation_Learning, 
+                           ExpLICD_ViT_L_Classic, ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Branching, ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Cascade,
+                           ExpLICD_ViT_L_Classic_with_Spatial_Bias)
+from Explicd.concept_dataset import (explicid_isic_dict, explicid_isic_dict_mine, explicid_idrid_dict, explicid_idrid_edema_dict, explicid_busi_dict, explicid_busi_soft_smooth_dict, 
+                                     explicid_isic_minimal_dict, explicid_isic_binary_dict)
 import Explicd.utils as utils
 from sklearn.metrics import f1_score
 import random
@@ -140,11 +144,29 @@ CONCEPT_LABEL_MAP_BUSI_SOFT_SMOOTH = [
     [[0.8, 0.2, 0.0], [1.0, 0.0, 0.0, 0.0], [0.2, 0.1, 0.7, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0], [1.0, 0.0]],  
 ]
 
+CONCEPT_LABEL_MAP_ISIC_SOFT_SMOOTH = [
+    # Actinic Keratoses
+    [[0.7 , 0.3], [0.6, 0.4], [0.5, 0.5], [0.1, 0.9], [0.7, 0.3] , [0.7, 0.3]],
+    # Basal Cell Carcinoma
+    [[0.5, 0.5], [0.4, 0.6], [0.6, 0.4], [0.2, 0.8], [0.3, 0.7] , [0.3, 0.7]],  
+    # Benign Keratosis-like Lesions
+    [[0.8, 0.2], [0.7, 0.3], [0.6, 0.4], [0.2, 0.8], [0.8, 0.2] , [0.8, 0.2]], 
+    # Dermatofibroma
+    [[0.8, 0.2], [0.7, 0.3], [0.7, 0.3], [0.4, 0.6], [0.6, 0.4] , [0.6, 0.4]],
+    # Melanoma
+    [[0.1, 0.9], [0.1, 0.9], [0.1, 0.9], [0.3, 0.7], [0.5, 0.5] , [0.4, 0.6]],  
+    # Melanocytic Nevus
+    [[0.7, 0.3], [0.7, 0.3], [0.6, 0.4], [0.8, 0.2], [0.8, 0.2] , [0.2, 0.8]],
+    # Vascular Lesions
+    [[0.8, 0.2], [0.7, 0.3], [0.7, 0.3], [0.6, 0.4], [0.1, 0.9] , [0.6, 0.4]]
+]
+
 
 CONCEPT_LABEL_MAP_DICT = {
     'ISIC': CONCEPT_LABEL_MAP_ISIC,
     'ISIC_MINE': CONCEPT_LABEL_MAP_ISIC_MINE,
     'ISIC_MINIMAL':CONCEPT_LABEL_MAP_ISIC_MINIMAL,
+    'ISIC_SOFT':CONCEPT_LABEL_MAP_ISIC_SOFT_SMOOTH,
 
     'IDRID': CONCEPT_LABEL_MAP_IDRID,
     'IDRID_EDEMA': CONCEPT_LABEL_MAP_IDRID_EDEMA,
@@ -154,14 +176,15 @@ CONCEPT_LABEL_MAP_DICT = {
     
 }
 
-LIST_OF_TASKS = ['ISIC', 'ISIC_MINE', 'ISIC_MINIMAL', 'IDRID', 'IDRID_EDEMA', 'BUSI', 'BUSI_SOFT']
+LIST_OF_TASKS = ['ISIC', 'ISIC_MINE', 'ISIC_MINIMAL', 'ISIC_SOFT', 'IDRID', 'IDRID_EDEMA', 'BUSI', 'BUSI_SOFT']
 
-TASK='ISIC_MINIMAL'
+TASK='ISIC'
 
 NUM_OF_CLASSES= {
     'ISIC': 7,
     'ISIC_MINE':7,
     'ISIC_MINIMAL':7,
+    'ISIC_SOFT':7,
 
     'IDRID': 5,
     'IDRID_EDEMA':3,
@@ -174,6 +197,7 @@ CONCEPTS= {
     'ISIC': explicid_isic_dict,
     'ISIC_MINE': explicid_isic_dict_mine,
     'ISIC_MINIMAL':explicid_isic_minimal_dict,
+    'ISIC_SOFT':explicid_isic_binary_dict,
 
     'IDRID': explicid_idrid_dict,
     'IDRID_EDEMA': explicid_idrid_edema_dict,
@@ -186,11 +210,11 @@ CONCEPT_HARDNESS_LIST_OPTIONS=["hard","soft_equal","soft_smarter"]
 DO_MUDDLE_CHECK=False
 ADD_GAUSSIAN_NOISE=False
 DO_LOGITS_SIMILARITY=False
-CONCEPT_HARDNESS="hard"
+CONCEPT_HARDNESS="soft_equal"
 DO_CONTR_LOSS = False
 noise_levels = [0, 5, 10, 15, 20]
 
-SAVING_BASED_ON_STEP=True
+SAVING_BASED_ON_STEP=False
 SAVING_BASED_ON_SCORE=False
 
 do_val_check=True
@@ -261,11 +285,16 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0):
             labels = y
 
             imgs_for_explicid=prepare__imgs_for_explicid(raw_image, exp_val_transforms).to("cuda")
-            patches, patches_colored, cls_logits, cls_minimal_logits, _, _, agg_visual_tokens, _, _, _, _, _, _, agg_critical_visual_tokens, agg_trivial_visual_tokens, cnn_logits_critical, _, _, _= explicd(imgs_for_explicid)
+            explicd_return_dict = explicd(imgs_for_explicid)
+            cls_logits = explicd_return_dict["cls_logits"]
+            agg_critical_visual_tokens = explicd_return_dict["agg_critical_visual_tokens"]
+            agg_trivial_visual_tokens = explicd_return_dict["agg_trivial_visual_tokens"]
+            #cnn_logits_critical = explicd_return_dict["cnn_logits_critical"]
+            cnn_logits_critical = explicd_return_dict["cnn_logits_critical"]
             longer_visual_tokens = torch.cat([agg_critical_visual_tokens, agg_trivial_visual_tokens], dim=1)
             agg_visual_tokens_list.append(longer_visual_tokens)
 
-            _, exp_label_pred = torch.max(cls_minimal_logits, dim=1)
+            _, exp_label_pred = torch.max(cls_logits, dim=1)
             _, exp_cnn_critical_label = torch.max(cnn_logits_critical, dim=1)
             exp_pred_list = np.concatenate((exp_pred_list, exp_label_pred.cpu().numpy().astype(np.uint8)), axis=0)
             exp_cnn_critical_pred_list = np.concatenate((exp_cnn_critical_pred_list, exp_cnn_critical_label.cpu().numpy().astype(np.uint8)), axis=0)
@@ -542,7 +571,12 @@ def main(args):
     conf.do_logits_similarity=DO_LOGITS_SIMILARITY
 
     #explicid = ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
-    explicid = ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_SuperPixels(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
+    #explicid = ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_SuperPixels(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
+    #explicid = ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_Representation_Learning(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
+    #explicid = ExpLICD_ViT_L_Classic(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
+    explicid = ExpLICD_ViT_L_Classic_with_Spatial_Bias(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)  
+    #explicid = ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Cascade(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
+    #explicid = ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Branching(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
     #explicid.load_state_dict(torch.load("checkoints_fr_val_score_based/ISIC/Explicd_only/Explicd_additional_tokens_for_sit_starter_better.pt")["explicid"])
     #explicid.cnn = PatchSelectorCNNConscise()
     #explicid.load_state_dict(torch.load("checkoints_fr_val_score_based/ISIC/Explicd_only/Explicd_additional_tokens_for_sit_starter_refined_further_maybe.pt")["explicid"])
@@ -566,7 +600,7 @@ def main(args):
     explicid_train_transforms.transforms.insert(0, transforms.Resize(size=(224,224), interpolation=utils.get_interpolation_mode('bicubic'), max_size=None, antialias=True))    
     explicid_train_transforms.transforms.insert(0, transforms.ToPILImage())
 
-    explicid_train_transforms.transforms.pop(4)
+    #explicid_train_transforms.transforms.pop(4)
     print("explicid_train_transforms ============",explicid_train_transforms)
 
     exp_val_transforms = copy.deepcopy(conf.preprocess)
@@ -575,7 +609,7 @@ def main(args):
     exp_val_transforms.transforms.insert(0, transforms.ToPILImage())
     exp_val_transforms.transforms.pop(1)
     exp_val_transforms.transforms.insert(1, transforms.Resize(size=(224,224), interpolation=utils.get_interpolation_mode('bicubic'), max_size=None, antialias=True))
-    exp_val_transforms.transforms.pop(4)
+    #exp_val_transforms.transforms.pop(4)
     print("exp_val_transforms ============",exp_val_transforms)
     
 
@@ -623,7 +657,7 @@ def main(args):
     ])
 
 
-    if TASK=='ISIC' or TASK=='ISIC_MINE' or TASK=='ISIC_MINIMAL':
+    if TASK=='ISIC' or TASK=='ISIC_MINE' or TASK=='ISIC_MINIMAL' or TASK=='ISIC_SOFT':
         if DO_MUDDLE_CHECK:
             train_dataset = CustomDataset(args.data_dir, transform= dual_transform, mode='test')
             val_dataset = CustomDataset(args.data_dir, transform= dual_val_transform, mode='val')
@@ -677,7 +711,8 @@ def main(args):
     )
     val_dataloader = DataLoader(
         val_dataset,
-        batch_size=local_batch_size,
+        #batch_size=local_batch_size,
+        batch_size=50,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
@@ -761,7 +796,7 @@ def main(args):
     )
 
     # Labels to condition the model with (feel free to change):
-    sample_batch_size = 16 // accelerator.num_processes
+    sample_batch_size = 36 // accelerator.num_processes
     (_, gt_xs), _ = next(iter(val_dataloader))
     gt_xs = gt_xs[:sample_batch_size]
     gt_xs = sample_posterior(
@@ -982,27 +1017,39 @@ def main(args):
                         list_of_images.append(color_jitter_transform(imgs_for_explicid))
                         list_of_images.append(blur_transform(imgs_for_explicid))
 
-                    processing_loss, loss, proj_loss, explicid_loss, loss_cls, logits_similarity_loss, _, _, _, _, _, _, attn_explicd_loss, attn_map_loss_sit_total, _, cnn_loss_cls= loss_fn(model, latent, latent, model_kwargs, zs=zs, 
-                                                                        labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch,  explicd_only=0, do_sit=True, do_pretraining_the_patchifyer=False, patchifyer_model=patchifyer_model)
+                    # processing_loss, loss, proj_loss, explicid_loss, loss_cls, logits_similarity_loss, _, _, _, _, _, _, attn_explicd_loss, attn_sit_loss, _, cnn_loss_cls= loss_fn(model, latent, latent, model_kwargs, zs=zs, 
+                    #                                                     labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch,  explicd_only=0, do_sit=True, do_pretraining_the_patchifyer=False, patchifyer_model=patchifyer_model)
+                    loss_return_dict = loss_fn(model, latent, latent, model_kwargs, zs=zs, labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch,  explicd_only=0, do_sit=True, do_pretraining_the_patchifyer=False, patchifyer_model=patchifyer_model)
+                    
+                    processing_loss = loss_return_dict["processing_loss"]
+                    loss = loss_return_dict["denoising_loss"]
+                    proj_loss = loss_return_dict["proj_loss"]
+                    explicid_loss = loss_return_dict["explicid_loss"]
+                    loss_cls = loss_return_dict["loss_cls"]
+                    logits_similarity_loss = loss_return_dict["logits_similarity_loss"]
+                    attn_explicd_loss = loss_return_dict["attn_explicd_loss"]
+                    attn_sit_loss = loss_return_dict["attn_sit_loss"]
+                    cnn_loss_cls = loss_return_dict["cnn_loss"]
+
                     processing_loss_mean = processing_loss.mean()
                     loss_mean = loss.mean()
                     proj_loss_mean = proj_loss.mean()* args.proj_coeff
-                    explicid_loss_mean = explicid_loss.mean()
+                    explicid_loss_mean = 0*explicid_loss.mean()
                     #explicid_loss_mean = loss_cls.mean()
                     #print("train logits_similarity_loss ", logits_similarity_loss)
                     logits_similarity_loss_mean= 0*logits_similarity_loss.mean()
-                    attn_explicd_loss_mean = attn_explicd_loss.mean()
-                    attn_map_loss_sit_total_mean = attn_map_loss_sit_total.mean()
+                    attn_explicd_loss_mean = 0*attn_explicd_loss.mean() # 10e5
+                    attn_map_loss_sit_total_mean = 0*attn_sit_loss.mean()
                     cnn_loss_cls_mean = 0*cnn_loss_cls.mean()
 
-                    if explicid_loss_mean>0.3:
-                        loss_mean*=0
-                        attn_explicd_loss_mean*=0
-                        attn_map_loss_sit_total_mean*=0
+                    # if explicid_loss_mean>0.8:
+                    #     loss_mean*=0
+                        # attn_explicd_loss_mean*=0
+                        # attn_map_loss_sit_total_mean*=0
 
-                    if attn_explicd_loss_mean>0.3:
-                        loss_mean*=0
-                        attn_map_loss_sit_total_mean*=0
+                    # if attn_explicd_loss_mean>0.3:
+                    #     loss_mean*=0
+                    #     attn_map_loss_sit_total_mean*=0
 
                     total_loss_magnitude = processing_loss_mean+loss_mean + proj_loss_mean  + explicid_loss_mean + logits_similarity_loss_mean+attn_explicd_loss_mean+attn_map_loss_sit_total_mean+cnn_loss_cls_mean
 
@@ -1043,13 +1090,18 @@ def main(args):
                         list_of_images.append(color_jitter_transform(imgs_for_explicid))
                         list_of_images.append(blur_transform(imgs_for_explicid))
 
-                    patches, patches_colored, _, _, _, explicid_loss, _, logits_similarity_loss, _, _, _, _, attn_explicd_loss, _, _, cnn_loss_cls = loss_fn(None, x, model_kwargs, zs=zs, 
-                                                                        labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch, explicd_only=1)
-
+                    # _, _, _, explicid_loss, _, logits_similarity_loss, _, _, _, _, attn_explicd_loss, _, _, cnn_loss_cls = loss_fn(None, latent, latent, model_kwargs, zs=zs, 
+                    #                                                     labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch, explicd_only=1, do_sit=False, do_pretraining_the_patchifyer=False, patchifyer_model=patchifyer_model)
+                    loss_return_dict = loss_fn(None, latent, latent, model_kwargs, zs=zs, labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch, explicd_only=1, do_sit=False, do_pretraining_the_patchifyer=False, patchifyer_model=patchifyer_model)
+                    explicid_loss = loss_return_dict["explicid_loss"]
+                    logits_similarity_loss = loss_return_dict["logits_similarity_loss"]
+                    attn_explicd_loss = loss_return_dict["attn_explicd_loss"]
+                    cnn_loss_cls = loss_return_dict["cnn_loss"]
+                    
                     explicid_loss_mean = explicid_loss.mean()
-                    logits_similarity_loss_mean= logits_similarity_loss.mean()
+                    logits_similarity_loss_mean= 0*logits_similarity_loss.mean()
                     attn_explicd_loss_mean = attn_explicd_loss.mean()
-                    cnn_loss_cls_mean = cnn_loss_cls.mean()
+                    cnn_loss_cls_mean = 0*cnn_loss_cls.mean()
                     accelerator.backward(explicid_loss_mean+logits_similarity_loss_mean+attn_explicd_loss_mean+cnn_loss_cls_mean)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -1092,9 +1144,27 @@ def main(args):
                     latent=vae.encode(torch.stack(imgs_normalized_for_vae, dim=0).to(device))["latent_dist"].mean
                     #latents_patchified=patchifyer_model(latent)
                     imgs_for_explicid=prepare__imgs_for_explicid(imgs_for_sampling, exp_val_transforms).to(device)
-                    #print(imgs_for_explicid.shape)
-                    patches, patches_colored, cls_logits, cls_minimal_logits, _, _, agg_visual_tokens, _, _, _,  attn_criticial_weights, attn_trivial_weights, vit_l_output, agg_critical_visual_tokens, agg_trivial_visual_tokens, _, _ , critical_mask, trivial_mask  = explicid(imgs_for_explicid)
+
+                    explicd_return_dict = explicid(imgs_for_explicid)
+                    patches = explicd_return_dict["patches"]
+                    #patches_colored = explicd_return_dict["patches_colored"]
+                    cls_logits = explicd_return_dict["cls_logits"]
+
+                    agg_critical_tokens = explicd_return_dict["agg_critical_visual_tokens_for_SiT"]
+                    agg_trivial_tokens = explicd_return_dict["agg_trivial_visual_tokens_for_SiT"]
+                    agg_visual_tokens = torch.cat((agg_critical_tokens, agg_trivial_tokens), dim=1)
+
+                    attn_critical_weights = explicd_return_dict["attn_critical_weights"]
+                    attn_trivial_weights = explicd_return_dict["attn_trivial_weights"]
+
+                    vit_l_output = explicd_return_dict["vit_l_output"]
+
+                    agg_critical_visual_tokens = explicd_return_dict["agg_critical_visual_tokens"]
+                    agg_trivial_visual_tokens = explicd_return_dict["agg_trivial_visual_tokens"]
                     longer_visual_tokens = torch.cat([agg_critical_visual_tokens, agg_trivial_visual_tokens], dim=1)
+
+                    critical_mask = explicd_return_dict["critical_mask"]
+                    trivial_mask = explicd_return_dict["trivial_mask"]
 
                     # num_patches=256
                     # patch_size=14
@@ -1109,8 +1179,8 @@ def main(args):
                     images_from_patches = patches_to_images(patches, patch_size=14)
                     images_from_patches = accelerator.gather(images_from_patches.to(torch.float32))
 
-                    images_from_patches_colored = patches_to_images(patches_colored, patch_size=14)
-                    images_from_patches_colored = accelerator.gather(images_from_patches_colored.to(torch.float32))
+                    #images_from_patches_colored = patches_to_images(patches_colored, patch_size=14)
+                    #images_from_patches_colored = accelerator.gather(images_from_patches_colored.to(torch.float32))
 
                     gt_samples = vae.decode(latent)["sample"]
                     gt_samples = (gt_samples + 1) / 2.
@@ -1129,14 +1199,14 @@ def main(args):
                             xT, 
                             torch.stack(labels_for_sampling, dim=0).to(device),
                             agg_visual_tokens,
-                            cls_minimal_logits,
+                            cls_logits,
                             num_steps=50, 
                             cfg_scale=0.0,
                             guidance_low=0.,
                             guidance_high=1.,
                             path_type=args.path_type,
                             heun=False,
-                            attn_critical_weights=attn_criticial_weights, 
+                            attn_critical_weights=attn_critical_weights, 
                             attn_trivial_weights=attn_trivial_weights,
                             longer_visual_tokens = longer_visual_tokens_tampered,
                             vit_l_output=vit_l_output,
@@ -1145,8 +1215,8 @@ def main(args):
                             patchifyer_model=patchifyer_model,
                             highlight_the_critical_mask=True
                         )
-                        # samples_tampered = vae.decode((samples_tampered -  latents_bias) / latents_scale).sample
-                        # samples_tampered = (samples_tampered + 1) / 2.
+                        samples_tampered = vae.decode((samples_tampered -  latents_bias) / latents_scale).sample
+                        samples_tampered = (samples_tampered + 1) / 2.
 
                         # patches_output = patches_output.view(sample_batch_size, num_patches, 3, patch_size, patch_size)
                         # patches_output = patches_output.view(sample_batch_size, grid_size, grid_size, 3, patch_size, patch_size)
@@ -1157,8 +1227,8 @@ def main(args):
                         out_samples_tampered = accelerator.gather(samples_tampered.to(torch.float32))
                         samples_tampered_list.append(out_samples_tampered)
 
-                        out_images_from_patches_tampered = patches_to_images(patches_output, patch_size=14)
-                        patches_tampered_list.append(accelerator.gather(out_images_from_patches_tampered.to(torch.float32)))
+                        #out_images_from_patches_tampered = patches_to_images(patches_output, patch_size=14)
+                        #patches_tampered_list.append(accelerator.gather(out_images_from_patches_tampered.to(torch.float32)))
 
                         # out_patches_tampered = accelerator.gather(patches_output.to(torch.float32))
                         # patches_tampered_list.append(out_patches_tampered)
@@ -1167,19 +1237,19 @@ def main(args):
 
                     accelerator.log({f"samples full package": wandb.Image(array2grid(samples_tampered_list[0])),
                                 "gt_samples": wandb.Image(array2grid(gt_samples)),
-                                f"patches full package": wandb.Image(array2grid(patches_tampered_list[0])),
-                                f"patches ground truth": wandb.Image(array2grid(images_from_patches)),
-                                f"patches colored": wandb.Image(array2grid(images_from_patches_colored)),
-                                f"patches first zeroed out": wandb.Image(array2grid(patches_tampered_list[1])),
-                                f"patches second zeroed out": wandb.Image(array2grid(patches_tampered_list[2])),
-                                f"patches third zeroed out": wandb.Image(array2grid(patches_tampered_list[3])),
-                                f"patches fourth zeroed out": wandb.Image(array2grid(patches_tampered_list[4])),
-                                f"patches fifth zeroed out": wandb.Image(array2grid(patches_tampered_list[5])),
-                                f"patches sixth zeroed out": wandb.Image(array2grid(patches_tampered_list[6])),
-                                f"patches seventh zeroed out": wandb.Image(array2grid(patches_tampered_list[7]))
+                                #f"patches full package": wandb.Image(array2grid(patches_tampered_list[0])),
+                                #f"patches ground truth": wandb.Image(array2grid(images_from_patches)),
+                                #f"patches colored": wandb.Image(array2grid(images_from_patches_colored)),
+                                # f"patches first zeroed out": wandb.Image(array2grid(patches_tampered_list[1])),
+                                # f"patches second zeroed out": wandb.Image(array2grid(patches_tampered_list[2])),
+                                # f"patches third zeroed out": wandb.Image(array2grid(patches_tampered_list[3])),
+                                # f"patches fourth zeroed out": wandb.Image(array2grid(patches_tampered_list[4])),
+                                # f"patches fifth zeroed out": wandb.Image(array2grid(patches_tampered_list[5])),
+                                # f"patches sixth zeroed out": wandb.Image(array2grid(patches_tampered_list[6])),
+                                # f"patches seventh zeroed out": wandb.Image(array2grid(patches_tampered_list[7]))
 
-                                #f"samples first zeroed out": wandb.Image(array2grid(samples_tampered_list[1])),
-                                #f"samples second zeroed out": wandb.Image(array2grid(samples_tampered_list[2])),
+                                f"samples first zeroed out": wandb.Image(array2grid(samples_tampered_list[1])),
+                                f"samples second zeroed out": wandb.Image(array2grid(samples_tampered_list[2])),
                                 #f"samples third zeroed out": wandb.Image(array2grid(samples_tampered_list[3])),
                                 #f"samples fourth zeroed out": wandb.Image(array2grid(samples_tampered_list[4])),
                                 #f"samples fifth zeroed out": wandb.Image(array2grid(samples_tampered_list[5])),
@@ -1241,16 +1311,62 @@ def main(args):
                 torch.cuda.empty_cache()
 
                 imgs_for_explicid=prepare__imgs_for_explicid(raw_image, exp_val_transforms).to(device)
-                patches, patches_colored, cls_logits, cls_minimal_logits, _, _, agg_visual_tokens, _, _, _, _, _, _, _, _,  cnn_logits_critical, _, critical_mask, _ = explicid(imgs_for_explicid)
-                _, label_pred = torch.max(cls_minimal_logits, dim=1)
+                explicd_return_dict = explicid(imgs_for_explicid)
+                cls_logits = explicd_return_dict["cls_logits"]
+                critical_mask = explicd_return_dict["critical_mask"]
+                attention_weights = explicd_return_dict["attn_critical_weights"]
+                #cnn_logits_critical = explicd_return_dict["cnn_logits_critical"]
+                cnn_logits_critical = explicd_return_dict["cnn_logits_critical"]
+  
+                _, label_pred = torch.max(cls_logits, dim=1)
                 _, exp_cnn_critical_label = torch.max(cnn_logits_critical, dim=1)
-                critical_mask_sums.append(critical_mask.sum(dim=(-2,-1)).mean())
+                if critical_mask is not None:
+                    critical_mask_sums.append(critical_mask.sum(dim=(-2,-1)).mean())
                 exp_pred_list = np.concatenate((exp_pred_list, label_pred.cpu().numpy().astype(np.uint8)), axis=0)
                 exp_cnn_critical_pred_list = np.concatenate((exp_cnn_critical_pred_list, exp_cnn_critical_label.cpu().numpy().astype(np.uint8)), axis=0)
                 gt_list = np.concatenate((gt_list, labels.cpu().numpy().astype(np.uint8)), axis=0)
 
+            imgs_for_explicid = accelerator.gather(imgs_for_explicid.to(torch.float32))
+            #print(f"imgs_for_explicid shape {imgs_for_explicid.shape}")
+            accelerator.log({f"imgs_for_explicid": wandb.Image(array2grid(imgs_for_explicid))})
 
+            ###################################
+            B, C, H, W = imgs_for_explicid.shape
+            num_tokens, num_patches = attention_weights.shape[1], attention_weights.shape[2]
             
+            # Assuming the image has been split into non-overlapping patches of size patch_size
+            grid_size = int(np.sqrt(num_patches))  # Assuming square grid of patches
+            
+            # Reshape the attention weights to (B, num_tokens, grid_size, grid_size)
+            attention_weights = attention_weights.view(B, num_tokens, grid_size, grid_size)
+
+            # Scale attention weights to the image grid (224x224)
+            attention_weights_resized = F.interpolate(attention_weights.unsqueeze(1), size=(num_tokens, H, W), mode='bilinear', align_corners=False).squeeze(1)
+            
+            # The attention weights are now of shape (B, num_tokens, H, W)
+            # Normalize the attention weights to [0, 1]
+            attention_weights_resized = torch.clamp(attention_weights_resized, 0, 1)
+            
+            # Now apply the attention weights to the images
+            # Repeat the attention map for each channel (RGB)
+            #imgs_with_attention = imgs_for_explicid.clone()  # Make a copy to modify
+            
+            # Multiply each channel of the image with the attention weights (apply it per pixel)
+            for t in range(num_tokens):
+                # Select attention map for current token, it's of shape (B, H, W)
+                att_map = attention_weights_resized[:, t]  # (B, H, W)
+                
+                # Repeat the attention map for each channel (to apply it to RGB channels)
+                att_map_expanded = att_map.unsqueeze(1)  # Shape: (B, 1, H, W)
+                
+                # Apply the attention map to the image channels
+                imgs_with_attention_token = imgs_for_explicid * (1 - att_map_expanded) + att_map_expanded * 255
+
+                imgs_with_attention_token = accelerator.gather(imgs_with_attention_token.to(torch.float32))
+                #print(f"imgs_for_explicid shape {imgs_for_explicid.shape}")
+                accelerator.log({f"imgs_for_explicid token {t} highlighted": wandb.Image(array2grid(imgs_with_attention_token))})
+
+            ###################################
             exp_val_BMAC = balanced_accuracy_score(gt_list, exp_pred_list)
             exp_val_correct = np.sum(gt_list == exp_pred_list)
             exp_val_acc = 100 * exp_val_correct / len(exp_pred_list)
@@ -1258,7 +1374,8 @@ def main(args):
             exp_cnn_critical_val_f1 = f1_score(gt_list, exp_cnn_critical_pred_list, average='macro')
 
             print(f"Val f1 score {exp_val_f1}")
-            print(f"Critical_mask_sums {critical_mask_sums}")
+            if critical_mask is not None:
+                print(f"Critical_mask_sums {critical_mask_sums}")
             print(f"Val f1 CNN critical {exp_cnn_critical_val_f1}")
 
             if args.explicd_only==1:
@@ -1329,7 +1446,7 @@ def main(args):
                     if args.resume_step == 0 and SAVING_BASED_ON_SCORE:
                         torch.save(checkpoint_val, checkpoint_path)
                     ####################################################################
-                    if max_exp_val_f1>0.89:
+                    if max_exp_val_f1>0.94:
                         val_score_deserves_sampling=True
                     explicid.zero_grad(set_to_none=True)
                     model.eval()

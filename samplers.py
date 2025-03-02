@@ -129,7 +129,7 @@ def euler_sampler(
             #text_embed=torch.randn(256, 512).to(device)
             #img_embed=torch.randn(256, 512).to(device)
 
-            patches_output, d_cur, _, d_cur_critical_removed = model(
+            patches_output, d_cur, d_cur_pure, d_cur_critical_removed = model(
                 model_input.to(dtype=_dtype), latents, None, time_input.to(dtype=_dtype), **kwargs,  # if need be will fill in model_pure and model_target
                 concept_label=concept_label_input, 
                 image_embeddings=imgs_tokens_input,
@@ -144,7 +144,7 @@ def euler_sampler(
                 highlight_the_critical_mask=highlight_the_critical_mask
                 )
             #.to(torch.float64)
-            return patches_output, d_cur.to(torch.float32), None, d_cur_critical_removed.to(torch.float32)
+            return patches_output, d_cur.to(torch.float32), d_cur_pure.to(torch.float32), d_cur_critical_removed.to(torch.float32)
             if cfg_scale > 1. and t_cur <= guidance_high and t_cur >= guidance_low:
                 d_cur_cond, d_cur_uncond = d_cur.chunk(2)
                 d_cur = d_cur_uncond + cfg_scale * (d_cur_cond - d_cur_uncond)                

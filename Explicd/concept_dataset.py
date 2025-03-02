@@ -9,6 +9,16 @@ explicid_isic_dict = {
 
 }
 
+explicid_isic_binary_dict = {
+    'asymmetry': ['symmetrical', 'asymmetrical'],
+    'border': ['regular', 'abnormal'],
+    'color': ['uniform', 'miscellaneous'],
+    'surface texture': ['smooth', 'rough/ulcerated'],
+    'vascular patterns': ['failed to find', 'there are visible '],
+    'elevation': ['flat', 'raised']
+
+}
+
 explicid_isic_minimal_dict = {
     'color': ['typical for Actinic Keratoses', 'typical for Basal Cell Carcinoma', 'typical for Benign Keratosis-like Lesions', 'typical for Dermatofibroma', 'typical for Melanoma', 'typical for Melanocytic Nevus', 'typical for Vascular Lesions'],
     'shape': ['typical for Actinic Keratoses', 'typical for Basal Cell Carcinoma', 'typical for Benign Keratosis-like Lesions', 'typical for Dermatofibroma', 'typical for Melanoma', 'typical for Melanocytic Nevus', 'typical for Vascular Lesions'],
