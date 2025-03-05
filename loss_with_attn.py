@@ -292,9 +292,10 @@ class SILoss:
             trivial_mask = explicd_return_dict["trivial_mask"]
             if explicd_only==0:
                 ##################  Option use trivial tokens too
-                #agg_visual_tokens = torch.cat((agg_critical_tokens, agg_trivial_tokens), dim=1)
+                agg_visual_tokens = torch.cat((agg_critical_tokens, agg_trivial_tokens), dim=1)
                 ##################  Option use critical tokens only
-                agg_visual_tokens = agg_critical_tokens
+                #agg_visual_tokens = agg_critical_tokens
+                ##################
                 longer_visual_tokens = torch.cat((agg_critical_visual_tokens, agg_trivial_visual_tokens), dim=1)
                 vit_l_output_input = vit_l_output
 

@@ -279,6 +279,70 @@ def gpt4_0_second_attention_loss(attn_critical, attn_non_critical,  cluster_sigm
         "coverage_loss": coverage_loss.item()
     }
 
+def gpt4_0_second_attention_loss_mine(attn_critical, attn_non_critical):
+    """
+    Computes attention loss to enforce structured attention behavior.
+    
+    Parameters:
+    - attn_critical: (B, 7, 256) Attention maps of critical tokens.
+    - attn_non_critical: (B, 14, 256) Attention maps of non-critical tokens.
+    - lambda1, lambda2, lambda3: Hyperparameters for loss terms.
+    """
+    
+    _, _, num_patches = attn_critical.shape
+
+    # --- Clustering Loss (Encouraging smooth & compact attention for critical tokens) ---
+    variance = torch.var(attn_critical, dim=-1).mean()  # Variance across spatial dimension
+    cluster_loss = variance  # Lower variance = more compact focus
+    
+    # --- Orthogonality Loss (Ensuring non-critical tokens avoid critical regions) ---
+    attn_critical_norm = F.normalize(attn_critical, p=2, dim=-1)
+    attn_non_critical_norm = F.normalize(attn_non_critical, p=2, dim=-1)
+    orthog_loss = (attn_critical_norm @ attn_non_critical_norm.transpose(1, 2)).pow(2).mean()
+
+    #orthog_loss = (attn_critical @ attn_non_critical.transpose(1, 2)).pow(2).mean()
+    ################################### Option normalize by diving by max value
+    attn_critical = attn_critical / (attn_critical.max(dim=-1, keepdim=True).values)
+    attn_non_critical = attn_non_critical / (attn_non_critical.max(dim=-1, keepdim=True).values)
+    total_attention = attn_critical + attn_non_critical  # (B, 7, 256)
+    coverage_loss = F.mse_loss(total_attention, torch.ones_like(total_attention))
+    ################################### Option sum um halfs
+    # --- Coverage Loss (Ensuring all areas are attended to) ---
+    # total_attention = attn_critical/2 + attn_non_critical/2  # (B, 7, 256)
+    # #total_attention = total_attention / total_attention.max(dim=-1, keepdim=True)[0]  # Normalize
+    # coverage_loss = F.mse_loss(total_attention, torch.ones_like(total_attention)/num_patches)
+    ###################################
+
+    cluster_scale = 0
+    orthogonal_scale = 1.5
+    coverage_scale = 1.5
+
+
+    total_loss = (
+        cluster_scale * cluster_loss  +
+        orthogonal_scale * orthog_loss  +
+        coverage_scale * coverage_loss
+    )
+    # You can assign weights to prioritize certain losses (optional)
+    # w1, w2, w3 = 0.5, 1.0, 1.0  # Example weights for each loss term
+
+    # # Combine the losses with the weights and scaled values
+    # total_loss = (
+    #     w1 * cluster_loss + 
+    #     w2 * orthog_loss + 
+    #     w3 * coverage_loss
+    # )
+
+    # print(f"cluster loss {inverse_scaled_loss1}")
+    # print(f"orthog_loss loss {inverse_scaled_loss2}")
+    # print(f"coverage_loss loss {inverse_scaled_loss3}")
+
+    return total_loss, {
+        "cluster_loss": cluster_loss.item(),
+        "orthog_loss": orthog_loss.item(),
+        "coverage_loss": coverage_loss.item()
+    }
+
 class AdaptiveCriticalPatchLoss(nn.Module):
     def __init__(self, alpha=1.0):
         """
@@ -411,6 +475,201 @@ class SpatialAwarePatchLoss(nn.Module):
         total_loss = loss_within + loss_between
         return total_loss
 
+class SpatialAwarePatchLoss_mine(nn.Module):
+    def __init__(self, gamma=5.0, sigma=1):
+        """
+        Args:
+            gamma (float): Controls how strongly distance affects penalties.
+            sigma (float): Controls the sharpness of spatial weighting.
+        """
+        super().__init__()
+        self.gamma = gamma
+        self.sigma = sigma
+
+    def compute_distance_matrix(self, H, W, device, sigma=1):
+        """Compute normalized spatial distance matrix for a grid (H, W)."""
+        coords = torch.stack(torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij"), dim=-1)  # (H, W, 2)
+        coords = coords.reshape(-1, 2).to(device)  # (256, 2) for a 16x16 grid
+
+        # Compute pairwise Euclidean distance
+        dist_matrix = torch.cdist(coords.float(), coords.float(), p=2)  # (256, 256)
+
+        # Normalize to [0,1] using the largest distance in the grid
+        #dist_matrix /= dist_matrix.max()
+        return dist_matrix  # (256, 256)
+
+    def compute_self_similarity(self, feats):
+        """
+        Compute cosine similarity between all spatial patches.
+        feats: (B, C, 16, 16) -> Flatten to (B, C, 256)
+        Returns: Similarity matrix (B, 256, 256)
+        """
+        B, C, H, W = feats.shape
+        feats = feats.view(B, C, H * W)  # (B, C, 256)
+        feats = F.normalize(feats, dim=1)  # Normalize along feature dim
+        sim_matrix = torch.bmm(feats.transpose(1, 2), feats)  # (B, 256, 256)
+        return sim_matrix
+
+    def weighted_kl_div(self, attn_sim, feat_sim, W_spatial):
+        """
+        Compute KL divergence weighted by spatial similarity.
+        """
+        B, N, N = attn_sim.shape  # (B, 256, 256)
+        
+        #attn_sim = F.normalize(attn_sim, p=1, dim=-1)  # Normalize rows to sum to 1
+        #feat_sim = F.normalize(feat_sim, p=1, dim=-1)  # Normalize rows to sum to 1
+        
+        kl_div = F.kl_div(attn_sim.log(), feat_sim, reduction='none')  # (B, 256, 256)
+        # print(kl_div)
+        # print(W_spatial)
+        
+        # Weight by spatial proximity
+        weighted_kl = kl_div * W_spatial.unsqueeze(0).to(attn_sim.device)  # (B, 256, 256)
+        weighted_kl = torch.nan_to_num(weighted_kl).to(attn_sim.device)
+        #print(weighted_kl.mean())
+        
+        return 100*weighted_kl.mean()  # Scalar loss
+    
+    def fuzzy_hue_similarity(self, h1, h2, sigma=15):
+        """
+        Computes fuzzy similarity for hue (handles wrap-around at 0/360 degrees).
+        """
+        diff = torch.abs(h1 - h2)
+        diff = torch.minimum(diff, 360 - diff)  # Handle hue wrap-around
+        return torch.exp(-diff ** 2 / (2 * sigma ** 2))  # Gaussian membership
+    
+    def fuzzy_saturation_similarity(self, s1, s2, sigma=0.2):
+        return torch.exp(-torch.abs(s1 - s2) / sigma)
+
+    def fuzzy_value_similarity(self, v1, v2, sigma=0.2):
+        return torch.exp(-torch.abs(v1 - v2) / sigma)
+
+    def fuzzy_patch_similarity(self, h1, s1, v1, h2, s2, v2):
+        """
+        Compute fuzzy similarity between patches using HSV features.
+        """
+        hue_sim = self.fuzzy_hue_similarity(h1, h2)
+        sat_sim = self.fuzzy_saturation_similarity(s1, s2)
+        val_sim = self.fuzzy_value_similarity(v1, v2)
+        
+        # Combine fuzzy rules (weighted sum)
+        return 0.5 * hue_sim + 0.3 * sat_sim + 0.2 * val_sim
+
+    def forward(self, image_feats, attn_critical, attn_non_critical):
+        """
+        Args:
+            image_feats (torch.Tensor): Image features (B, 1024, 16, 16).
+            mask (torch.Tensor): Binary segmentation mask (B, 1, 16, 16).
+
+        Returns:
+            torch.Tensor: Spatially aware loss.
+        """
+        B, C, H, W = image_feats.shape
+        _, num_critical, _ = attn_critical.shape
+        _, num_trivial, _ = attn_non_critical.shape
+        num_patches = H * W
+        device = image_feats.device
+
+        # Compute feature similarity
+        feat_sim = self.compute_self_similarity(image_feats)
+
+        # Flatten patches (B, 1024, 256) and mask (B, 1, 256)
+        image_feats = image_feats.view(B, C, num_patches)
+        attn_critical = attn_critical.view(B, num_critical, num_patches)
+        attn_non_critical = attn_non_critical.view(B, num_trivial, num_patches)
+        #mask_coverage = mask.mean(dim=2, keepdim=True)  # (B, 1, 1)
+
+        #lambda_within = torch.exp(-self.gamma * mask_coverage)
+        #lambda_between = torch.exp(self.gamma * mask_coverage)
+        lambda_within = 1
+        lambda_between = 1
+
+        # Compute spatial distance matrix (256, 256)
+        D = self.compute_distance_matrix(H, W, device).to(device)  # (256, 256)
+
+        # Convert distance into weight (closer patches get higher weights)
+        #spatial_weight = torch.exp(-self.gamma * D)  # (256, 256)
+        spatial_weight = torch.exp(- (D ** 2) / (2 * self.sigma ** 2))
+        feat_sim = feat_sim * spatial_weight[None, :, :].to(device)  # Shape: (B, 256, 256)
+        feat_sim = F.normalize(feat_sim, p=1, dim=-1) + 1e-6
+        total_loss=0
+
+        ############################################# Option use fuzzy similarity
+        # Compute pairwise fuzzy similarity
+        feat_sim = torch.zeros(B, 256, 256, device=device)
+        h1 = image_feats[:, 0, :].unsqueeze(2)  # (B, 256, 1)
+        h2 = image_feats[:, 0, :].unsqueeze(1)  # (B, 1, 256)
+        diff = torch.abs(h1 - h2)  # (B, 256, 256)
+        diff = torch.minimum(diff, 360 - diff)  # Handle hue wrap-around
+        hue_sim = torch.exp(-diff ** 2 / (2 * 15 ** 2))  # (B, 256, 256)
+        s1, s2 = image_feats[:, 1, :].unsqueeze(2), image_feats[:, 1, :].unsqueeze(1)
+        v1, v2 = image_feats[:, 2, :].unsqueeze(2), image_feats[:, 2, :].unsqueeze(1)
+
+        sat_sim = torch.exp(-torch.abs(s1 - s2) / 0.2)  # (B, 256, 256)
+        val_sim = torch.exp(-torch.abs(v1 - v2) / 0.2)  # (B, 256, 256)
+        feat_sim = 0.7 * hue_sim + 0.2 * sat_sim + 0.1 * val_sim  # (B, 256, 256)
+        feat_sim = feat_sim * spatial_weight[None, :, :].to(device)  # Shape: (B, 256, 256)  Option to use spatial weights
+        # feat_sim = feat_sim + 1e-6  # Prevent log(0)
+        # feat_sim = feat_sim / feat_sim.sum(dim=-1, keepdim=True)  # Normalize
+
+        #############################################
+                
+        for i in range(num_critical):
+            ########################################## Option use both types of attention weights
+            # # Extract critical and trivial patches
+            # critical_patches = image_feats * attn_critical[:,i, :].unsqueeze(1)  # (B, 1024, 256) * (B, 1, 256)
+            # trivial_patches = image_feats * attn_non_critical[:,i, :].unsqueeze(1)  # (B, 1024, 256) * (B, 1, 256)
+
+            # # Normalize features for cosine similarity
+            # critical_patches = F.normalize(critical_patches, p=2, dim=1)
+            # trivial_patches = F.normalize(trivial_patches, p=2, dim=1)
+
+            # # Compute similarity matrices
+            # similarity_critical = torch.bmm(critical_patches.transpose(1, 2), critical_patches)  # (B, 256, 256)
+            # similarity_between = torch.bmm(critical_patches.transpose(1, 2), trivial_patches)  # (B, 256, 256)
+
+            # # Loss 1: Critical patches should be similar if spatially close
+            # loss_within = (((similarity_critical - 1) ** 2 * spatial_weight)*lambda_within).mean()
+
+            # # Loss 2: Trivial patches should be dissimilar to nearby critical patches
+            # loss_between = ((similarity_between ** 2 * spatial_weight)*lambda_between).mean()
+
+            # # Total loss
+            # total_loss += loss_within + loss_between
+            ########################################## Option to use only the critical weights
+            attn_sim_crit = torch.bmm(attn_critical[:,i, :].unsqueeze(2), attn_critical[:,i, :].unsqueeze(1))  # (B, 256, 256)
+            #attn_sim_crit = attn_sim_crit / (attn_sim_crit.max(dim=-1, keepdim=True).values)  # Normalize scale
+            #attn_sim_crit = F.normalize(attn_sim_crit, p=1, dim=-1) + 1e-6
+
+            attn_sim_trivial = torch.bmm(attn_non_critical[:,i, :].unsqueeze(2), attn_non_critical[:,i, :].unsqueeze(1))  # (B, 256, 256)
+            #attn_sim_trivial = attn_sim_trivial / (attn_sim_trivial.max(dim=-1, keepdim=True).values)  # Normalize scale
+            # Self-similarity loss
+            loss_sim = F.mse_loss(attn_sim_crit, feat_sim)
+            #loss_sim = F.mse_loss(attn_sim_crit, feat_sim) + F.mse_loss(attn_sim_trivial, feat_sim)
+            #loss_sim = torch.mean(spatial_weight * F.mse_loss(attn_sim_crit, feat_sim))
+            
+            
+            #loss_sim = F.kl_div(attn_sim_crit.log(), feat_sim, reduction='batchmean')
+            #loss_sim = self.weighted_kl_div(attn_sim_crit, feat_sim, spatial_weight)
+            #loss_sim = torch.mean(spatial_weight * F.cosine_similarity(attn_sim_crit, feat_sim, dim=-1))
+            ########################################### Option use Huber Loss
+            # diff = attn_sim_crit - feat_sim  # Difference matrix (B, 256, 256)
+            # delta=0.1
+            # abs_diff = torch.abs(diff)
+            # loss = torch.where(abs_diff < delta,  # Huber loss formulation
+            #                 0.5 * abs_diff ** 2,
+            #                 delta * (abs_diff - 0.5 * delta))
+            
+            # # Weight by spatial similarity
+            # weighted_loss = loss * spatial_weight[None, :, :].to(attn_sim_crit.device)
+            # loss_sim = weighted_loss.mean()  # Final loss scalar
+            ###########################################
+            # Smoothness loss
+            #loss_smooth = torch.mean(spatial_weight * (attn_critical[:,i, :].unsqueeze(2) - attn_critical[:,i, :].unsqueeze(1)) ** 2)
+            #total_loss += loss_sim + loss_smooth
+            total_loss += 10*loss_sim
+
+        return total_loss
 # class SpatialAwarePatchAttentionLoss(nn.Module):
 #     def __init__(self, H=16, W=16, sigma=2.0):
 #         super().__init__()
@@ -4631,7 +4890,12 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
             config.preprocess = preprocess
 
             self.model_visual_ViT_L = clip.load(f"ViT-L/14")[0].visual
-
+            ######################### Option use additional ViT
+            self.model_visual_ViT_L_hsv = clip.load(f"ViT-L/14")[0].visual
+            for param in self.model_visual_ViT_L_hsv.parameters():
+                param.data = param.data.to(torch.float32)
+            self.model_visual_ViT_L_hsv.cuda()
+            #########################
             #self.model_visual_custom = VisionTransformer7x7()
 
             #Convert specific layers or parameters to float32
@@ -4669,10 +4933,16 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
             ################
         
         self.visual_features = []
+        self.visual_features_hsv = []
         self.hook_list = []
+        self.hook_list_hsv = []
 
         def hook_fn(module, input, output):
             self.visual_features.append(output) # detach to aboid saving computation graph
+                                                 # might need to remove if finetune the full model
+            
+        def hook_fn_hsv(module, input, output):
+            self.visual_features_hsv.append(output) # detach to aboid saving computation graph
                                                  # might need to remove if finetune the full model
         
         ################# Option BioMedclip
@@ -4684,12 +4954,15 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         #     param.requires_grad = True
         ################# Option Clip L
         layers = [self.model_visual_ViT_L.transformer.resblocks[23]]
+        layers_hsv = [self.model_visual_ViT_L_hsv.transformer.resblocks[5]]
         #################
 
         for layer in layers:
             self.hook_list.append(layer.register_forward_hook(hook_fn))
 
-        
+        for layer in layers_hsv:
+            self.hook_list_hsv.append(layer.register_forward_hook(hook_fn_hsv))
+
         hidden_size = 1024
         num_heads = 16
         self.critical_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
@@ -4742,6 +5015,8 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         for param in self.model_visual_ViT_L.parameters():
             param.requires_grad = True
 
+        for param in self.model_visual_ViT_L_hsv.parameters():
+            param.requires_grad = True
 
         self.critical_visual_tokens.requires_grad = True
         self.trivial_visual_tokens.requires_grad = True
@@ -4810,8 +5085,20 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
             cls_logits_refined = self.cls_head(image_logits_refined)
             return cls_logits_refined
 
-        self.visual_features.clear()
+        ###################################### Option to use vit twice
+        self.visual_features_hsv.clear()
+        imgs_in_hsv = rgb_to_hsv_torch(imgs)
+        hsv_patches = imgs_in_hsv.unfold(2, 14, 14).unfold(3, 14, 14)  # (B, 3, 16, 16, 14, 14)
+        hsv_patches = hsv_patches.mean(dim=(-1, -2))  # (B, 3, 16, 16)
+        _ = self.model_visual_ViT_L_hsv(imgs_in_hsv)
         patches = image_to_patches(imgs, patch_size=14)
+        #print(f"shape of self.visual_features_hsv[0] {self.visual_features_hsv[0].shape}")
+        #vit_l_output_hsv=self.visual_features_hsv[0][:, 1:, :]
+        vit_l_output_hsv=self.visual_features_hsv[0].permute(1, 0, 2)[:, 1:, :]
+        ######################################
+
+
+        #patches = image_to_patches(imgs_in_hsv, patch_size=14)
         B, T, D_patch = patches.shape  # B: batch size, T: num_patches (256), D: patch_dim (1024)
         #print(patches.shape)
         ################# Option BioMedclip
@@ -4819,9 +5106,10 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         # vit_l_output = self.visual_features[0][:, 1:, :]
         ################# Option Clip L
         ################# Option gradual
+        self.visual_features.clear()
         _ = self.model_visual_ViT_L(imgs)
         critical_mask, trivial_mask = self.cnn_kernel_14(imgs)  # Shape: (B, 1, 16, 16)
-        loss_fn = SpatialAwarePatchLoss()
+        #loss_fn = SpatialAwarePatchLoss()
         attn_explicd_loss = torch.tensor(0.0, device=self.device)
         #attn_explicd_loss += 10*loss_fn(patches.permute(0, 2, 1).view(B, D_patch, int(T ** 0.5), int(T ** 0.5)), critical_mask)
         
@@ -4833,6 +5121,7 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         #     vit_l_output = self.model_visual_ViT_L.transformer.resblocks[i](vit_l_output)  # First 7 transformer blocks
         #print(vit_l_output.shape)
         ################# Option instanentous
+        #print(f"shape of self.visual_features[0] {self.visual_features[0].shape}")
         vit_l_output=self.visual_features[0].permute(1, 0, 2)[:, 1:, :]
         #################
         B, T, D = vit_l_output.shape  # B: batch size, T: num_patches (256), D: patch_dim (1024)
@@ -4858,9 +5147,15 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         #critical_visual_tokens = self.self_attn_critical(critical_visual_tokens)
         #CAUTION The above line is for the case where the self-attention is used for the tokens
 
-        agg_critical_visual_tokens, attn_critical_weights = self.cross_attn_critical(critical_visual_tokens, vit_l_output, vit_l_output)
-        agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial(trivial_visual_tokens, vit_l_output, vit_l_output)
-        d_products = torch.matmul(agg_critical_visual_tokens, vit_l_output_for_critical.permute(0, 2, 1))/(D**0.5)
+        agg_critical_visual_tokens, attn_critical_weights = self.cross_attn_critical(critical_visual_tokens, vit_l_output_hsv, vit_l_output)
+        agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial(trivial_visual_tokens, vit_l_output_hsv, vit_l_output)
+        d_products = torch.matmul(critical_visual_tokens, vit_l_output_hsv.permute(0, 2, 1))/(D**0.5)
+
+        #attn_explicd_loss += 10*gpt4_0_second_attention_loss_mine(attn_critical_weights, attn_trivial_weights)[0]
+        loss_fn = SpatialAwarePatchLoss_mine()
+        #attn_explicd_loss += 1*loss_fn(patches.permute(0, 2, 1).view(B, D_patch, int(T ** 0.5), int(T ** 0.5)), attn_critical_weights, attn_trivial_weights)
+        #attn_explicd_loss += 1*loss_fn(patches.permute(0, 2, 1).view(B, D_patch, int(T ** 0.5), int(T ** 0.5)), d_products, attn_trivial_weights)
+        attn_explicd_loss += 1*loss_fn(hsv_patches, d_products, attn_trivial_weights)
         #print(f"d_products.shape {d_products.shape}")
         ############################################################################   Option use self-attention for the tokens
         #agg_critical_visual_tokens = self.self_attn_critical(agg_critical_visual_tokens)

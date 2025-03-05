@@ -88,13 +88,12 @@ def euler_sampler(
     _dtype = latents.dtype    
     t_steps = torch.linspace(1, 0, num_steps+1, dtype=torch.float64)
     #########################################################
-    #x_next = latents.to(torch.float64)
+    x_next = latents.to(torch.float64)
     #########################################################
-    time_input = torch.rand((y.shape[0], 1, 1, 1))
-    time_input = time_input.to(device=y.device, dtype=latents.dtype)
-    alpha_t, sigma_t, _, _ = interpolant(time_input)
+    #time_input = torch.rand((y.shape[0], 1, 1, 1))
+    #time_input = time_input.to(device=y.device, dtype=latents.dtype)
+    #alpha_t, sigma_t, _, _ = interpolant(time_input)
     #x_next = alpha_t * latents + sigma_t * torch.randn_like(latents)
-    x_next = latents
     #########################################################s
     device = x_next.device
     concept_label = torch.tensor([CONCEPT_LABEL_MAP[label] for label in y])
@@ -144,12 +143,16 @@ def euler_sampler(
                 highlight_the_critical_mask=highlight_the_critical_mask
                 )
             #.to(torch.float64)
-            return patches_output, d_cur.to(torch.float32), d_cur_pure.to(torch.float32), d_cur_critical_removed.to(torch.float32)
+            #patches_output = patches_output.to(torch.float64)
+            d_cur = d_cur.to(torch.float64)
+            d_cur_pure = d_cur_pure.to(torch.float64)
+            d_cur_critical_removed = d_cur_critical_removed.to(torch.float64)
+            
             if cfg_scale > 1. and t_cur <= guidance_high and t_cur >= guidance_low:
                 d_cur_cond, d_cur_uncond = d_cur.chunk(2)
                 d_cur = d_cur_uncond + cfg_scale * (d_cur_cond - d_cur_uncond)                
-            #x_next = x_cur + (t_next - t_cur) * d_cur
-            x_next = d_cur
+            x_next = x_cur + (t_next - t_cur) * d_cur
+            #x_next = d_cur
             
             #print("2")
             if heun and (i < num_steps - 1):
@@ -181,7 +184,8 @@ def euler_sampler(
                     d_prime = d_prime_uncond + cfg_scale * (d_prime_cond - d_prime_uncond)
                 x_next = x_cur + (t_next - t_cur) * (0.5 * d_cur + 0.5 * d_prime)
                 
-    return x_next
+    #return x_next
+    return patches_output, x_next.to(torch.float32), d_cur_pure.to(torch.float32), d_cur_critical_removed.to(torch.float32)
 
 
 def euler_maruyama_sampler(

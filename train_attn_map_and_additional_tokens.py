@@ -261,7 +261,7 @@ img_transform_function_dict = {
 
 #TRANSFORM_FUNCTIONS=["raw", "blurred", "rotated", "translated", "color_jittered"]
 TRANSFORM_FUNCTIONS=["raw"]
-def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0):
+def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0, accelerator=None):
     net = explicd
     if explicd_only==0:
         sit_model = model
@@ -290,6 +290,7 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0):
             agg_critical_visual_tokens = explicd_return_dict["agg_critical_visual_tokens"]
             agg_trivial_visual_tokens = explicd_return_dict["agg_trivial_visual_tokens"]
             #cnn_logits_critical = explicd_return_dict["cnn_logits_critical"]
+            attention_weights = explicd_return_dict["attn_critical_weights"]
             cnn_logits_critical = explicd_return_dict["cnn_logits_critical"]
             longer_visual_tokens = torch.cat([agg_critical_visual_tokens, agg_trivial_visual_tokens], dim=1)
             agg_visual_tokens_list.append(longer_visual_tokens)
@@ -301,6 +302,65 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0):
             gt_list = np.concatenate((gt_list, labels.cpu().numpy().astype(np.uint8)), axis=0)
         
 
+            
+
+        # imgs_for_explicid = accelerator.gather(imgs_for_explicid.to(torch.float32))
+        # #print(f"imgs_for_explicid shape {imgs_for_explicid.shape}")
+        # accelerator.log({f"imgs_for_explicid": wandb.Image(array2grid(imgs_for_explicid))})
+
+        # ###################################
+        B, C, H, W = imgs_for_explicid.shape
+        num_tokens, num_patches = attention_weights.shape[1], attention_weights.shape[2]
+        for t in range(num_tokens//2):
+            print(f"attention_weights token {t} {attention_weights[0, t, :]}")
+            print(f"attention_weights token {t} {attention_weights[0, t, :].sum()}")
+            print(f"attention_weights token {t} {attention_weights[1, t, :]}")
+        # Assuming the image has been split into non-overlapping patches of size patch_size
+        grid_size = int(np.sqrt(num_patches))  # Assuming square grid of patches
+        
+        # Reshape the attention weights to (B, num_tokens, grid_size, grid_size)
+        attention_weights = attention_weights.view(B, num_tokens, grid_size, grid_size)
+
+        # Scale attention weights to the image grid (224x224)
+        attention_weights_resized = F.interpolate(attention_weights, size=(H, W), mode='bilinear', align_corners=False)
+        
+        # The attention weights are now of shape (B, num_tokens, H, W)
+        # Normalize the attention weights to [0, 1]
+        attention_weights_resized = torch.clamp(attention_weights_resized, 0, 1)
+        
+        # Now apply the attention weights to the images
+        # Repeat the attention map for each channel (RGB)
+        #imgs_with_attention = imgs_for_explicid.clone()  # Make a copy to modify
+        imgs_with_attention_token_list=[]
+        
+        # Multiply each channel of the image with the attention weights (apply it per pixel)
+        for t in range(num_tokens):
+            # Select attention map for current token, it's of shape (B, H, W)
+            att_map = attention_weights_resized[:, t, :, :]  # (B, H, W)
+            
+            # Repeat the attention map for each channel (to apply it to RGB channels)
+            att_map_expanded = att_map.unsqueeze(1)  # Shape: (B, 1, H, W)
+            #print(att_map_expanded[0,0,:,:])
+            
+            # Apply the attention map to the image channels
+            imgs_with_attention_token =  att_map_expanded * 255
+
+            imgs_with_attention_token = accelerator.gather(imgs_with_attention_token.to(torch.float32))
+            imgs_with_attention_token_list.append(imgs_with_attention_token)
+            #print(f"imgs_for_explicid shape {imgs_for_explicid.shape}")
+                
+        accelerator.log({
+                        f"imgs_for_explicid": wandb.Image(array2grid(imgs_for_explicid)),
+                        f"imgs_for_explicid token {0} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[0])),
+                        f"imgs_for_explicid token {1} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[1])),
+                        f"imgs_for_explicid token {2} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[2])),
+                        f"imgs_for_explicid token {3} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[3])),
+                        f"imgs_for_explicid token {4} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[4])),
+                        f"imgs_for_explicid token {5} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[5])),
+                        f"imgs_for_explicid token {6} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[6]))
+                            })
+        
+        ###################################
         exp_BMAC = balanced_accuracy_score(gt_list, exp_pred_list)
         exp_correct = np.sum(gt_list == exp_pred_list)
         exp_acc = 100 * exp_correct / len(exp_pred_list)
@@ -817,7 +877,7 @@ def main(args):
         optimizer.eval()
         optimizer.zero_grad(set_to_none=True)
         explicid.eval()
-        expl_scores, _= validation(explicid, None, test_dataloader, exp_val_transforms, explicd_only=1)
+        expl_scores, _= validation(explicid, None, test_dataloader, exp_val_transforms, explicd_only=1, accelerator=accelerator)
         print('BMAC: %.5f, f1: %.5f'%(expl_scores["BMAC"], expl_scores["f1"]))
         optimizer.train()
         explicid.train()
@@ -1034,11 +1094,11 @@ def main(args):
                     processing_loss_mean = processing_loss.mean()
                     loss_mean = loss.mean()
                     proj_loss_mean = proj_loss.mean()* args.proj_coeff
-                    explicid_loss_mean = 0*explicid_loss.mean()
+                    explicid_loss_mean = explicid_loss.mean()
                     #explicid_loss_mean = loss_cls.mean()
                     #print("train logits_similarity_loss ", logits_similarity_loss)
                     logits_similarity_loss_mean= 0*logits_similarity_loss.mean()
-                    attn_explicd_loss_mean = 0*attn_explicd_loss.mean() # 10e5
+                    attn_explicd_loss_mean = attn_explicd_loss.mean() # 10e5
                     attn_map_loss_sit_total_mean = 0*attn_sit_loss.mean()
                     cnn_loss_cls_mean = 0*cnn_loss_cls.mean()
 
@@ -1328,43 +1388,55 @@ def main(args):
 
             imgs_for_explicid = accelerator.gather(imgs_for_explicid.to(torch.float32))
             #print(f"imgs_for_explicid shape {imgs_for_explicid.shape}")
-            accelerator.log({f"imgs_for_explicid": wandb.Image(array2grid(imgs_for_explicid))})
 
             ###################################
-            B, C, H, W = imgs_for_explicid.shape
-            num_tokens, num_patches = attention_weights.shape[1], attention_weights.shape[2]
+            # B, C, H, W = imgs_for_explicid.shape
+            # num_tokens, num_patches = attention_weights.shape[1], attention_weights.shape[2]
             
-            # Assuming the image has been split into non-overlapping patches of size patch_size
-            grid_size = int(np.sqrt(num_patches))  # Assuming square grid of patches
+            # # Assuming the image has been split into non-overlapping patches of size patch_size
+            # grid_size = int(np.sqrt(num_patches))  # Assuming square grid of patches
             
-            # Reshape the attention weights to (B, num_tokens, grid_size, grid_size)
-            attention_weights = attention_weights.view(B, num_tokens, grid_size, grid_size)
+            # # Reshape the attention weights to (B, num_tokens, grid_size, grid_size)
+            # attention_weights = attention_weights.view(B, num_tokens, grid_size, grid_size)
 
-            # Scale attention weights to the image grid (224x224)
-            attention_weights_resized = F.interpolate(attention_weights.unsqueeze(1), size=(num_tokens, H, W), mode='bilinear', align_corners=False).squeeze(1)
+            # # Scale attention weights to the image grid (224x224)
+            # attention_weights_resized = F.interpolate(attention_weights, size=(H, W), mode='bilinear', align_corners=False)
             
-            # The attention weights are now of shape (B, num_tokens, H, W)
-            # Normalize the attention weights to [0, 1]
-            attention_weights_resized = torch.clamp(attention_weights_resized, 0, 1)
+            # # The attention weights are now of shape (B, num_tokens, H, W)
+            # # Normalize the attention weights to [0, 1]
+            # attention_weights_resized = torch.clamp(attention_weights_resized, 0, 1)
             
-            # Now apply the attention weights to the images
-            # Repeat the attention map for each channel (RGB)
-            #imgs_with_attention = imgs_for_explicid.clone()  # Make a copy to modify
+            # # Now apply the attention weights to the images
+            # # Repeat the attention map for each channel (RGB)
+            # #imgs_with_attention = imgs_for_explicid.clone()  # Make a copy to modify
+            # imgs_with_attention_token_list=[]
             
-            # Multiply each channel of the image with the attention weights (apply it per pixel)
-            for t in range(num_tokens):
-                # Select attention map for current token, it's of shape (B, H, W)
-                att_map = attention_weights_resized[:, t]  # (B, H, W)
+            # # Multiply each channel of the image with the attention weights (apply it per pixel)
+            # for t in range(num_tokens):
+            #     # Select attention map for current token, it's of shape (B, H, W)
+            #     att_map = attention_weights_resized[:, t]  # (B, H, W)
                 
-                # Repeat the attention map for each channel (to apply it to RGB channels)
-                att_map_expanded = att_map.unsqueeze(1)  # Shape: (B, 1, H, W)
+            #     # Repeat the attention map for each channel (to apply it to RGB channels)
+            #     att_map_expanded = att_map.unsqueeze(1)  # Shape: (B, 1, H, W)
+            #     print(att_map_expanded[0,0,:,:])
                 
-                # Apply the attention map to the image channels
-                imgs_with_attention_token = imgs_for_explicid * (1 - att_map_expanded) + att_map_expanded * 255
+            #     # Apply the attention map to the image channels
+            #     imgs_with_attention_token = 0 * (1 - att_map_expanded) + att_map_expanded * 255
 
-                imgs_with_attention_token = accelerator.gather(imgs_with_attention_token.to(torch.float32))
-                #print(f"imgs_for_explicid shape {imgs_for_explicid.shape}")
-                accelerator.log({f"imgs_for_explicid token {t} highlighted": wandb.Image(array2grid(imgs_with_attention_token))})
+            #     imgs_with_attention_token = accelerator.gather(imgs_with_attention_token.to(torch.float32))
+            #     imgs_with_attention_token_list.append(imgs_with_attention_token)
+            #     #print(f"imgs_for_explicid shape {imgs_for_explicid.shape}")
+                
+            # accelerator.log({
+            #                 f"imgs_for_explicid": wandb.Image(array2grid(imgs_for_explicid)),
+            #                 f"imgs_for_explicid token {0} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[0])),
+            #                 f"imgs_for_explicid token {1} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[1])),
+            #                 f"imgs_for_explicid token {2} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[2])),
+            #                 f"imgs_for_explicid token {3} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[3])),
+            #                 f"imgs_for_explicid token {4} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[4])),
+            #                 f"imgs_for_explicid token {5} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[5])),
+            #                 f"imgs_for_explicid token {6} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[6]))
+            #                  })
 
             ###################################
             exp_val_BMAC = balanced_accuracy_score(gt_list, exp_pred_list)
@@ -1399,7 +1471,7 @@ def main(args):
                     explicid.eval()
                     explicid.zero_grad(set_to_none=True)
                     optimizer.eval()
-                    expl_scores, tokens_and_gt= validation(explicid, None, test_dataloader, exp_val_transforms, explicd_only=1)
+                    expl_scores, tokens_and_gt= validation(explicid, None, test_dataloader, exp_val_transforms, explicd_only=1, accelerator=accelerator)
                     print('Explicd Test f1', f'{expl_scores["f1"]:.3f}')
                     print('Explicd Test Acc', f'{expl_scores["Acc"]:.3f}')
                     print('Explicd Test Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
@@ -1411,7 +1483,7 @@ def main(args):
                         curve_of_f1.append(expl_scores["f1"])
                         curve_of_BMAC.append(expl_scores["BMAC"])
                         for muddle_severity_level in ['0_050','0_1','0_15','0_2']:
-                            expl_scores, tokens_and_gt = validation(explicid, None, train_muddled_dataloaders[muddle_severity_level], exp_val_transforms, explicd_only=1)
+                            expl_scores, tokens_and_gt = validation(explicid, None, train_muddled_dataloaders[muddle_severity_level], exp_val_transforms, explicd_only=1, accelerator=accelerator)
                             torch.save(tokens_and_gt,f"tokens_and_ground_truths/explicd_tokens_and_gts_{muddle_severity_level}")
                             print('Muddle_Severity_Level ', muddle_severity_level)
                             print('Explicd Muddled f1', f'{expl_scores["f1"]:.3f}')
@@ -1452,7 +1524,7 @@ def main(args):
                     model.eval()
                     model.zero_grad(set_to_none=True)
                     optimizer.eval()
-                    expl_scores, tokens_and_gt = validation(explicid, model, test_dataloader, exp_val_transforms, explicd_only=0)
+                    expl_scores, tokens_and_gt = validation(explicid, model, test_dataloader, exp_val_transforms, explicd_only=0, accelerator=accelerator)
                     print('Explicd Test f1', f'{expl_scores["f1"]:.3f}')
                     print('Explicd Test Acc', f'{expl_scores["Acc"]:.3f}')
                     print('Explicd Test Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
@@ -1465,7 +1537,7 @@ def main(args):
                         curve_of_BMAC.append(expl_scores["BMAC"])
                         # ['0_025','0_050','0_075','0_1']
                         for muddle_severity_level in ['0_050','0_1','0_15','0_2']:
-                            expl_scores, sit_scores, expl_refined_scores, tokens_and_gt = validation(explicid, model, train_muddled_dataloaders[muddle_severity_level], exp_val_transforms, explicd_only=0)
+                            expl_scores, sit_scores, expl_refined_scores, tokens_and_gt = validation(explicid, model, train_muddled_dataloaders[muddle_severity_level], exp_val_transforms, explicd_only=0, accelerator=accelerator)
                             torch.save(tokens_and_gt,f"tokens_and_ground_truths/sit_tokens_and_gts_{muddle_severity_level}")
                             print('Muddle_Severity_Level ', muddle_severity_level)
                             print('Explicd Muddled f1', f'{expl_scores["f1"]:.3f}')

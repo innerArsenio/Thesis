@@ -1003,20 +1003,42 @@ class SiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
         self.params = nn.ParameterList([nn.Parameter(torch.randn(1)) for _ in range(self.num_vis_tokens*2)])
+        self.lesion_token = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, hidden_size, dtype=torch.float32)))
 
 
 
     def forward(self, x, longer_visual_tokens, critical_mask, attn_critical_weights, attn_trivial_weights, vit_l_output, y):
-        
+        #print(f"y shape {y.shape}")
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(y).chunk(6, dim=-1)
         )
+        #print(f"shift_mlp shape {shift_mlp.shape}")
+        #print(f"gate_mlp shape {gate_mlp.shape}")
+        ############################################################ Option x is vit_output
+        T = x.shape[1] - self.num_vis_tokens
+        B = x.shape[0]
+        latent_tokens = x[:, :T, :]
+        visual_tokens_crit = x[:, T:T+self.num_vis_tokens, :]
+        #print(f"latent_tokens shape {latent_tokens.shape}")
+        #print(f"visual_tokens_crit shape {visual_tokens_crit.shape}")
 
+        latent_tokens = latent_tokens + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(latent_tokens), shift_mlp, scale_mlp))
+        visual_tokens_crit = visual_tokens_crit + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(visual_tokens_crit), shift_mlp, scale_mlp))
+
+        lesion_token = self.lesion_token.repeat(B, 1, 1)
+        lesion_token, _ = self.cross_attn(lesion_token, visual_tokens_crit, visual_tokens_crit)
+        #print(f"attn_critical_weights.mean(dim=1).unsqueeze(1) shape {attn_critical_weights.mean(dim=1).unsqueeze(1).shape}")
+        #print(f"lesion_token shape {lesion_token.shape}")
+        latent_tokens = latent_tokens + gate_msa.unsqueeze(1) * (lesion_token * attn_critical_weights.mean(dim=1).unsqueeze(1).permute(0, 2, 1))
+        
+        x = torch.cat([latent_tokens, visual_tokens_crit], dim=1)
+        return x
+        ############################################################
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         T = x.shape[1] - self.num_vis_tokens
         latent_tokens = x[:, :T, :]
         visual_tokens_crit = x[:, T:T+self.num_vis_tokens, :]
-
+        
         # Apply MLPs to each modality separately
         latent_tokens = latent_tokens + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(latent_tokens), shift_mlp, scale_mlp))
         visual_tokens_crit = visual_tokens_crit + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(visual_tokens_crit), shift_mlp, scale_mlp))
@@ -1169,7 +1191,7 @@ class SiT(nn.Module):
         depth=28,
         num_heads=16,
         mlp_ratio=4.0,
-        class_dropout_prob=0.1,
+        class_dropout_prob=0.0,
         num_classes=1000,
         use_cfg=False,
         z_dims=[768],
@@ -1224,6 +1246,9 @@ class SiT(nn.Module):
         self.explicd_attn_sigma = torch.nn.Parameter(torch.ones(1))
         self.denoising_sigma = torch.nn.Parameter(torch.ones(1))
         self.proj_sigma = torch.nn.Parameter(torch.ones(1))
+        self.y_learned_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, hidden_size, dtype=torch.float32)))
+        self.y_learned_tokens.requires_grad = True
+        self.cross_attn_y_tokens = nn.MultiheadAttention(embed_dim=768, num_heads=16, batch_first=True)
         self.sit_attn_sigma = torch.nn.Parameter(torch.ones(1))
         self.cross_attn_between_patches = nn.MultiheadAttention(embed_dim=768, num_heads=16, batch_first=True)
         self.cross_attn_in_patches = nn.MultiheadAttention(embed_dim=768, num_heads=16, batch_first=True)
@@ -1379,17 +1404,19 @@ class SiT(nn.Module):
         #x=x
         ########################################################
         # timestep and class embedding
-        #t_embed = self.t_embedder(t)                   # (N, D)
+        t_embed = self.t_embedder(t)                   # (N, D)
         #image_embed = self.norm(self.ffn(image_embeddings))
         y = self.y_embedder(y, self.training)    # (N, D)
         #y_noise = torch.rand_like(y)  # Generate Gaussian noise with the same shape as y
         #minus_embedded_concepts_plus_noise = image_embed
+        
+        
         #c = t_embed + y                                # (N, D)
         #c_concepts=t_embed.unsqueeze(1) + image_embed
         #combined_embeddings_try = torch.cat((x, image_embeddings), dim=1)
         attn_map_loss_sit_total=torch.tensor(0.0, device=x.device)
         #vit_l_output_for_denoising = vit_l_output.clone().detach()
-        #x = self.norm_vit_output(self.ffn_vit_output(vit_l_output))
+        x = self.norm_vit_output(self.ffn_vit_output(vit_l_output))
         #x = torch.rand_like(x)*0.1
         N, T, D = x.shape
         H = W = int(T ** 0.5)
@@ -1400,9 +1427,13 @@ class SiT(nn.Module):
         # attn_critical_weights = torch.sigmoid(attn_critical_weights / 0.005)
         # attn_trivial_weights = torch.sigmoid(attn_trivial_weights / 0.005)
         # attn_trivial_weights = 1 - attn_critical_weights
+        image_embeddings = image_embeddings[:, :self.num_vis_tokens, :]
         combined_embeddings_try = torch.cat((x, image_embeddings), dim=1)
         #print(f"combined_embeddings_try shape {combined_embeddings_try.shape}")
         #x = vit_l_output
+        y_learned_tokens = self.y_learned_tokens.repeat(N, 1, 1)
+        y_learned_tokens, _ = self.cross_attn_y_tokens(y_learned_tokens, image_embeddings, image_embeddings)
+        y = t_embed + y_learned_tokens.reshape(N, D)
         for i, block in enumerate(self.blocks):
             #combined_embeddings_try, attn_map_loss= block(combined_embeddings_try, c_concepts, attn_critical_weights, attn_trivial_weights)
             #x, attn_map_loss, vit_l_output, image_embeddings , longer_visual_tokens, explicid_imgs_sit_denoised = block(x, vit_l_output, image_embeddings, longer_visual_tokens, attn_critical_weights, attn_trivial_weights)
