@@ -78,7 +78,8 @@ def euler_sampler(
         critical_mask=None, 
         trivial_mask=None,
         patchifyer_model=None,
-        highlight_the_critical_mask=False
+        highlight_the_critical_mask=False,
+        use_actual_latent_of_the_images=1
         ):
     # setup conditioning
     if cfg_scale > 1.0:
@@ -89,6 +90,7 @@ def euler_sampler(
     t_steps = torch.linspace(1, 0, num_steps+1, dtype=torch.float64)
     #########################################################
     x_next = latents.to(torch.float64)
+    vit_l_output_next = vit_l_output
     #########################################################
     #time_input = torch.rand((y.shape[0], 1, 1, 1))
     #time_input = time_input.to(device=y.device, dtype=latents.dtype)
@@ -105,6 +107,7 @@ def euler_sampler(
         # return samples
         for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
             x_cur = x_next
+            vit_l_output_cur = vit_l_output_next
             #print("x next")
             if cfg_scale > 1.0 and t_cur <= guidance_high and t_cur >= guidance_low:
                 model_input = torch.cat([x_cur] * 2, dim=0)
@@ -117,6 +120,7 @@ def euler_sampler(
             else:
                 model_input = x_cur
                 y_cur = y
+                vit_l_output = vit_l_output_cur
                 imgs_tokens_input = visual_tokens
                 concept_label_input = concept_label
                 cls_logits_input = cls_logits
@@ -142,16 +146,20 @@ def euler_sampler(
                 patchifyer_model=patchifyer_model,
                 highlight_the_critical_mask=highlight_the_critical_mask
                 )
+            
+            if use_actual_latent_of_the_images==1:
+                return patches_output, d_cur.to(torch.float32), d_cur_pure.to(torch.float32), d_cur_critical_removed.to(torch.float32)
             #.to(torch.float64)
             #patches_output = patches_output.to(torch.float64)
-            d_cur = d_cur.to(torch.float64)
-            d_cur_pure = d_cur_pure.to(torch.float64)
-            d_cur_critical_removed = d_cur_critical_removed.to(torch.float64)
+            # d_cur = d_cur.to(torch.float64)
+            # d_cur_pure = d_cur_pure.to(torch.float64)
+            # d_cur_critical_removed = d_cur_critical_removed.to(torch.float64)
             
             if cfg_scale > 1. and t_cur <= guidance_high and t_cur >= guidance_low:
                 d_cur_cond, d_cur_uncond = d_cur.chunk(2)
                 d_cur = d_cur_uncond + cfg_scale * (d_cur_cond - d_cur_uncond)                
             x_next = x_cur + (t_next - t_cur) * d_cur
+            #vit_l_output_next = vit_l_output_cur + (t_next - t_cur) * x_vit_l_output
             #x_next = d_cur
             
             #print("2")

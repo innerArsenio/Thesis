@@ -236,7 +236,7 @@ class SILoss:
 
         return alpha_t, sigma_t, d_alpha_t, d_sigma_t
 
-    def __call__(self, model, images, latent_raw_image, model_kwargs=None, zs=None, labels=None, explicid=None, explicid_imgs_list= None, epoch=None,  explicd_only=0, do_sit=False, do_pretraining_the_patchifyer=False, patchifyer_model=None):
+    def __call__(self, model, images, latent_raw_image, model_kwargs=None, zs=None, labels=None, explicid=None, explicid_imgs_list= None, epoch=None,  explicd_only=0, do_sit=False, do_pretraining_the_patchifyer=False, patchifyer_model=None, denoise_patches=0, use_actual_latent_of_the_images=0):
         if model_kwargs == None:
             model_kwargs = {}
         # sample timesteps
@@ -252,9 +252,16 @@ class SILoss:
             elif self.path_type == "cosine":
                 time_input = 2 / np.pi * torch.atan(sigma)    
         time_input = time_input.to(device=images.device, dtype=images.dtype)
-        #model_input = images
-        model_input = torch.randn_like(images)
-        if self.prediction == 'v':
+        noises = torch.randn_like(images)
+        alpha_t, sigma_t, d_alpha_t, d_sigma_t = self.interpolant(time_input)
+        if use_actual_latent_of_the_images==0:
+            model_input = alpha_t * images + sigma_t * noises
+        elif use_actual_latent_of_the_images==1:
+            model_input = torch.randn_like(images)
+
+        if self.prediction == 'v' and use_actual_latent_of_the_images==0:
+            model_target = d_alpha_t * images + d_sigma_t * noises
+        elif self.prediction == 'v' and use_actual_latent_of_the_images==1:
             model_target = images
         else:
             raise NotImplementedError() # TODO: add x or eps prediction
@@ -327,7 +334,7 @@ class SILoss:
                     }
 
             loss_cls = self.cls_criterion(cls_logits, labels)
-            doing_cnn_critical=True
+            doing_cnn_critical=False
             doing_cnn_trivial=False
             cnn_critical_loss_cls, cnn_trivial_loss_cls, cnn_logits_similarity_loss = [torch.tensor(0.0, device=images.device)]*3
             if doing_cnn_critical:
@@ -384,8 +391,11 @@ class SILoss:
                     loss_concepts += (F.kl_div(predicted_probs,  concept_label_smooth_dict[key], reduction='none').mean(dim=-1)*torch.FloatTensor(CE_WEIGHTS[self.task]).cuda()[labels]).mean()*100  # Reduction is batchmean for proper scaling
                     idx += 1
 
-            if epoch>=2:
+            if epoch>=4:
+                #################################### Option use loss_cls and loss_concepts
                 explicid_loss += loss_cls + loss_concepts / idx
+                #################################### Option use loss_cls only
+                #explicid_loss += loss_cls
                 #print(explicid_loss)
             elif epoch>10 and self.do_logits_similarity:
                 explicid_loss += loss_cls + logits_similarity_loss+ loss_concepts / idx 
@@ -418,8 +428,10 @@ class SILoss:
                 if imgs_indx==0:
                     #processing_loss = mean_flat((model_input_pure_processed - model_target) ** 2)
                     processing_loss  = torch.tensor(0.0, device=images.device)
-                    denoising_loss = mean_flat((model_output - model_target) ** 2)
-                    #denoising_loss = mean_flat((patches_output - patches) ** 2)
+                    if denoise_patches==0:
+                        denoising_loss = mean_flat((model_output - model_target) ** 2)
+                    elif denoise_patches==1:
+                        denoising_loss = mean_flat((patches_output - patches) ** 2)
                     proj_loss_current = torch.tensor(0.0, device=images.device)
                     bsz = zs[0].shape[0]
                     for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
@@ -438,7 +450,8 @@ class SILoss:
 
             "attn_explicd_loss":attn_explicd_loss,
             "sigmas_for_losses":sigmas_for_losses,
-            "cnn_loss":cnn_loss
+            "cnn_loss":cnn_loss,
+            "overlap_loss":overlap_loss,
         }      
         if  explicd_only==0:
             loss_return_dict["processing_loss"]=processing_loss

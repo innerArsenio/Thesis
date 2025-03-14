@@ -176,6 +176,19 @@ CONCEPT_LABEL_MAP_DICT = {
     
 }
 
+NUM_OF_CRITERIA = {
+    'ISIC': 7,
+    'ISIC_MINE': 6,
+    'ISIC_MINIMAL': 7,
+    'ISIC_SOFT': 6,
+
+    'IDRID': 5,
+    'IDRID_EDEMA': 6,
+
+    'BUSI': 6,
+    'BUSI_SOFT': 6
+}
+
 LIST_OF_TASKS = ['ISIC', 'ISIC_MINE', 'ISIC_MINIMAL', 'ISIC_SOFT', 'IDRID', 'IDRID_EDEMA', 'BUSI', 'BUSI_SOFT']
 
 TASK='ISIC'
@@ -356,8 +369,8 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0, a
                         f"imgs_for_explicid token {2} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[2])),
                         f"imgs_for_explicid token {3} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[3])),
                         f"imgs_for_explicid token {4} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[4])),
-                        f"imgs_for_explicid token {5} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[5])),
-                        f"imgs_for_explicid token {6} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[6]))
+                        #f"imgs_for_explicid token {5} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[5])),
+                        #f"imgs_for_explicid token {6} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[6]))
                             })
         
         ###################################
@@ -609,6 +622,8 @@ def main(args):
             z_dims = z_dims,
             encoder_depth=args.encoder_depth,
             task = TASK,
+            denoise_patches=args.denoise_patches,
+            use_actual_latent_of_the_images=args.use_actual_latent,
             **block_kwargs
         )
 
@@ -629,6 +644,7 @@ def main(args):
     conf.batch_size = 128
     conf.flag = 2
     conf.do_logits_similarity=DO_LOGITS_SIMILARITY
+    conf.new_explicd = args.new_explicd
 
     #explicid = ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
     #explicid = ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_SuperPixels(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
@@ -749,7 +765,7 @@ def main(args):
             test_dataset = CustomDataset(args.data_dir,transform= None, mode='test')
     elif TASK=='IDRID':
         train_dataset = CustomDataset(args.data_dir, transform= dual_transform, mode='idrid_train')
-        val_dataset = CustomDataset(args.data_dir, mode='idrid_val')
+        val_dataset = CustomDataset(args.data_dir, transform= dual_val_transform, mode='idrid_val')
         test_dataset = CustomDataset(args.data_dir,transform= None, mode='idrid_test')
     elif TASK=='IDRID_EDEMA':
         train_dataset = CustomDataset(args.data_dir, transform= dual_transform, mode='idrid_edema_train')
@@ -771,8 +787,7 @@ def main(args):
     )
     val_dataloader = DataLoader(
         val_dataset,
-        #batch_size=local_batch_size,
-        batch_size=50,
+        batch_size=local_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
@@ -781,7 +796,8 @@ def main(args):
 
     test_dataloader = DataLoader(
         test_dataset,
-        batch_size=local_batch_size,
+        #batch_size=local_batch_size,
+        batch_size=22,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
@@ -892,8 +908,18 @@ def main(args):
         optimizer.train()
         explicid.train()
         model.train()
+
+    print(f"new explicd {args.new_explicd}")
+
+    print(f"denoise patches {args.denoise_patches}")
+
+    print(f"use actual latent of the images {args.use_actual_latent}")
+
+    if args.denoise_patches==1 and args.use_actual_latent==0:
+        print("this is wrong. you have to chose either denoise patches or use actual latent of the images")
+        exit()
     
-    
+    #torch.autograd.set_detect_anomaly(True)  # Enable anomaly detection
     for epoch in range(args.epochs):
         set_seed_mine(42)
         print('Starting epoch {}/{}'.format(epoch+1, args.epochs))
@@ -1022,6 +1048,13 @@ def main(args):
             y = y.to(device)
             z = None
             with torch.no_grad():
+                # raw_image = raw_image.to(torch.float32)/ 255.0  # Convert to [0, 1]
+                # for i in range(3):  # Normalize each channel based on ImageNet mean and std
+                #     raw_image[..., i] = (raw_image[..., i] - CLIP_DEFAULT_MEAN[i]) / CLIP_DEFAULT_STD[i]
+
+                # # Now scale the image back to [0, 255] but with the distortion already applied
+                # raw_image = torch.clip(raw_image * 255, 0, 255)
+
                 imgs_normalized_for_vae =  raw_image.to(torch.float32) / 127.5 - 1
                 #imgs_normalized_for_vae.append(img_normalized_for_vae)
                 latent=vae.encode(imgs_normalized_for_vae.to(device))["latent_dist"].mean
@@ -1079,7 +1112,9 @@ def main(args):
 
                     # processing_loss, loss, proj_loss, explicid_loss, loss_cls, logits_similarity_loss, _, _, _, _, _, _, attn_explicd_loss, attn_sit_loss, _, cnn_loss_cls= loss_fn(model, latent, latent, model_kwargs, zs=zs, 
                     #                                                     labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch,  explicd_only=0, do_sit=True, do_pretraining_the_patchifyer=False, patchifyer_model=patchifyer_model)
-                    loss_return_dict = loss_fn(model, latent, latent, model_kwargs, zs=zs, labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch,  explicd_only=0, do_sit=True, do_pretraining_the_patchifyer=False, patchifyer_model=patchifyer_model)
+                    loss_return_dict = loss_fn(model, x, latent, model_kwargs, zs=zs, labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, 
+                                               epoch=epoch,  explicd_only=0, do_sit=True, do_pretraining_the_patchifyer=False, patchifyer_model=patchifyer_model, 
+                                               denoise_patches=args.denoise_patches, use_actual_latent_of_the_images=args.use_actual_latent)
                     
                     processing_loss = loss_return_dict["processing_loss"]
                     loss = loss_return_dict["denoising_loss"]
@@ -1090,6 +1125,7 @@ def main(args):
                     attn_explicd_loss = loss_return_dict["attn_explicd_loss"]
                     attn_sit_loss = loss_return_dict["attn_sit_loss"]
                     cnn_loss_cls = loss_return_dict["cnn_loss"]
+                    overlap_loss = loss_return_dict["overlap_loss"]
 
                     processing_loss_mean = processing_loss.mean()
                     loss_mean = loss.mean()
@@ -1097,8 +1133,12 @@ def main(args):
                     explicid_loss_mean = explicid_loss.mean()
                     #explicid_loss_mean = loss_cls.mean()
                     #print("train logits_similarity_loss ", logits_similarity_loss)
+                    overlap_loss_mean = 0*overlap_loss.mean()
                     logits_similarity_loss_mean= 0*logits_similarity_loss.mean()
-                    attn_explicd_loss_mean = attn_explicd_loss.mean() # 10e5
+                    if args.new_explicd==0:
+                        attn_explicd_loss_mean = 0*attn_explicd_loss.mean() # 10e5
+                    elif args.new_explicd==1:
+                        attn_explicd_loss_mean = attn_explicd_loss.mean()
                     attn_map_loss_sit_total_mean = 0*attn_sit_loss.mean()
                     cnn_loss_cls_mean = 0*cnn_loss_cls.mean()
 
@@ -1111,7 +1151,7 @@ def main(args):
                     #     loss_mean*=0
                     #     attn_map_loss_sit_total_mean*=0
 
-                    total_loss_magnitude = processing_loss_mean+loss_mean + proj_loss_mean  + explicid_loss_mean + logits_similarity_loss_mean+attn_explicd_loss_mean+attn_map_loss_sit_total_mean+cnn_loss_cls_mean
+                    total_loss_magnitude = processing_loss_mean+loss_mean + proj_loss_mean  + explicid_loss_mean + logits_similarity_loss_mean+attn_explicd_loss_mean+attn_map_loss_sit_total_mean+cnn_loss_cls_mean+overlap_loss_mean
 
                     processing_weight = processing_loss_mean/total_loss_magnitude
                     loss_weight = loss_mean / total_loss_magnitude
@@ -1157,12 +1197,17 @@ def main(args):
                     logits_similarity_loss = loss_return_dict["logits_similarity_loss"]
                     attn_explicd_loss = loss_return_dict["attn_explicd_loss"]
                     cnn_loss_cls = loss_return_dict["cnn_loss"]
+                    overlap_loss = loss_return_dict["overlap_loss"]
                     
                     explicid_loss_mean = explicid_loss.mean()
                     logits_similarity_loss_mean= 0*logits_similarity_loss.mean()
-                    attn_explicd_loss_mean = attn_explicd_loss.mean()
+                    if args.new_explicd==0:
+                        attn_explicd_loss_mean = 0*attn_explicd_loss.mean() # 10e5
+                    elif args.new_explicd==1:
+                        attn_explicd_loss_mean = attn_explicd_loss.mean()
+                    overlap_loss_mean = overlap_loss.mean()
                     cnn_loss_cls_mean = 0*cnn_loss_cls.mean()
-                    accelerator.backward(explicid_loss_mean+logits_similarity_loss_mean+attn_explicd_loss_mean+cnn_loss_cls_mean)
+                    accelerator.backward(explicid_loss_mean+logits_similarity_loss_mean+attn_explicd_loss_mean+cnn_loss_cls_mean+overlap_loss_mean)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
             
@@ -1186,7 +1231,7 @@ def main(args):
                         torch.save(checkpoint, checkpoint_path)
                         logger.info(f"Saved checkpoint to {checkpoint_path}")
 
-            if (global_step == 1 or (global_step % args.sampling_steps == 0 and global_step > 0)) and args.explicd_only==0 or val_score_deserves_sampling==True:
+            if (global_step == 1000000 or (global_step % args.sampling_steps == 0 and global_step > 0)) and args.explicd_only==0 or val_score_deserves_sampling==True:
                 from samplers import euler_sampler
                 with torch.no_grad():
                     # Selected elements to be stored
@@ -1242,13 +1287,16 @@ def main(args):
                     #images_from_patches_colored = patches_to_images(patches_colored, patch_size=14)
                     #images_from_patches_colored = accelerator.gather(images_from_patches_colored.to(torch.float32))
 
-                    gt_samples = vae.decode(latent)["sample"]
+                    if args.use_actual_latent==0:
+                        gt_samples = vae.decode((gt_xs - latents_bias) / latents_scale).sample
+                    elif args.use_actual_latent==1:
+                        gt_samples = vae.decode(latent)["sample"]
                     gt_samples = (gt_samples + 1) / 2.
                     gt_samples = accelerator.gather(gt_samples.to(torch.float32))
                     ############################################################################### Option Tampering with tokens
                     samples_tampered_list=[]
                     patches_tampered_list=[]
-                    for i in range(8):
+                    for i in range(NUM_OF_CRITERIA[TASK]+1):
                         if i==0:
                             longer_visual_tokens_tampered=longer_visual_tokens
                         else:
@@ -1273,9 +1321,14 @@ def main(args):
                             critical_mask=critical_mask, 
                             trivial_mask=trivial_mask,
                             patchifyer_model=patchifyer_model,
-                            highlight_the_critical_mask=True
+                            highlight_the_critical_mask=True,
+                            use_actual_latent_of_the_images=args.use_actual_latent
                         )
-                        samples_tampered = vae.decode((samples_tampered -  latents_bias) / latents_scale).sample
+                        if args.use_actual_latent==0:
+                            samples_tampered = vae.decode((samples_tampered -  latents_bias) / latents_scale).sample
+                            #samples_tampered = vae.decode(samples_tampered)["sample"]
+                        elif args.use_actual_latent==1:
+                            samples_tampered = vae.decode(samples_tampered)["sample"]
                         samples_tampered = (samples_tampered + 1) / 2.
 
                         # patches_output = patches_output.view(sample_batch_size, num_patches, 3, patch_size, patch_size)
@@ -1284,52 +1337,57 @@ def main(args):
                         # patches_output = patches_output.contiguous().view(sample_batch_size, 3, image_size, image_size)
                         # patches_output = accelerator.gather(patches_output.to(torch.float32))
                         
-                        out_samples_tampered = accelerator.gather(samples_tampered.to(torch.float32))
-                        samples_tampered_list.append(out_samples_tampered)
+                        if args.denoise_patches==0:
+                            out_samples_tampered = accelerator.gather(samples_tampered.to(torch.float32))
+                            samples_tampered_list.append(out_samples_tampered)
 
-                        #out_images_from_patches_tampered = patches_to_images(patches_output, patch_size=14)
-                        #patches_tampered_list.append(accelerator.gather(out_images_from_patches_tampered.to(torch.float32)))
+                        if args.denoise_patches==1:
+                            out_images_from_patches_tampered = patches_to_images(patches_output, patch_size=14)
+                            patches_tampered_list.append(accelerator.gather(out_images_from_patches_tampered.to(torch.float32)))
 
                         # out_patches_tampered = accelerator.gather(patches_output.to(torch.float32))
                         # patches_tampered_list.append(out_patches_tampered)
 
 
-
-                    accelerator.log({f"samples full package": wandb.Image(array2grid(samples_tampered_list[0])),
-                                "gt_samples": wandb.Image(array2grid(gt_samples)),
-                                #f"patches full package": wandb.Image(array2grid(patches_tampered_list[0])),
-                                #f"patches ground truth": wandb.Image(array2grid(images_from_patches)),
-                                #f"patches colored": wandb.Image(array2grid(images_from_patches_colored)),
-                                # f"patches first zeroed out": wandb.Image(array2grid(patches_tampered_list[1])),
-                                # f"patches second zeroed out": wandb.Image(array2grid(patches_tampered_list[2])),
-                                # f"patches third zeroed out": wandb.Image(array2grid(patches_tampered_list[3])),
-                                # f"patches fourth zeroed out": wandb.Image(array2grid(patches_tampered_list[4])),
-                                # f"patches fifth zeroed out": wandb.Image(array2grid(patches_tampered_list[5])),
-                                # f"patches sixth zeroed out": wandb.Image(array2grid(patches_tampered_list[6])),
-                                # f"patches seventh zeroed out": wandb.Image(array2grid(patches_tampered_list[7]))
-
-                                f"samples first zeroed out": wandb.Image(array2grid(samples_tampered_list[1])),
-                                f"samples second zeroed out": wandb.Image(array2grid(samples_tampered_list[2])),
-                                #f"samples third zeroed out": wandb.Image(array2grid(samples_tampered_list[3])),
-                                #f"samples fourth zeroed out": wandb.Image(array2grid(samples_tampered_list[4])),
-                                #f"samples fifth zeroed out": wandb.Image(array2grid(samples_tampered_list[5])),
-                                #f"samples sixth zeroed out": wandb.Image(array2grid(samples_tampered_list[6])),
-                                #f"samples seventh zeroed out": wandb.Image(array2grid(samples_tampered_list[7]))
-                                })
+                    if args.denoise_patches==0:
+                        accelerator.log({f"samples full package": wandb.Image(array2grid(samples_tampered_list[0])),
+                                    "gt_samples": wandb.Image(array2grid(gt_samples)),
+                                    f"samples first zeroed out": wandb.Image(array2grid(samples_tampered_list[1])),
+                                    f"samples second zeroed out": wandb.Image(array2grid(samples_tampered_list[2])),
+                                    #f"samples third zeroed out": wandb.Image(array2grid(samples_tampered_list[3])),
+                                    #f"samples fourth zeroed out": wandb.Image(array2grid(samples_tampered_list[4])),
+                                    #f"samples fifth zeroed out": wandb.Image(array2grid(samples_tampered_list[5])),
+                                    #f"samples sixth zeroed out": wandb.Image(array2grid(samples_tampered_list[6])),
+                                    #f"samples seventh zeroed out": wandb.Image(array2grid(samples_tampered_list[7]))
+                                    })
+                    elif args.denoise_patches==1:
+                        accelerator.log({
+                                    f"patches full package": wandb.Image(array2grid(patches_tampered_list[0])),
+                                    f"patches ground truth": wandb.Image(array2grid(images_from_patches)),
+                                    #f"patches colored": wandb.Image(array2grid(images_from_patches_colored)),
+                                    # f"patches first zeroed out": wandb.Image(array2grid(patches_tampered_list[1])),
+                                    # f"patches second zeroed out": wandb.Image(array2grid(patches_tampered_list[2])),
+                                    # f"patches third zeroed out": wandb.Image(array2grid(patches_tampered_list[3])),
+                                    # f"patches fourth zeroed out": wandb.Image(array2grid(patches_tampered_list[4])),
+                                    # f"patches fifth zeroed out": wandb.Image(array2grid(patches_tampered_list[5])),
+                                    # f"patches sixth zeroed out": wandb.Image(array2grid(patches_tampered_list[6])),
+                                    # f"patches seventh zeroed out": wandb.Image(array2grid(patches_tampered_list[7]))
+                                    })
                     logging.info("Generating EMA samples done.")
                     if val_score_deserves_sampling:
                         return
             if args.explicd_only==0:
                 logs = {
-                    "proc_loss": accelerator.gather(processing_loss_mean).mean().detach().item(),
+                    #"proc_loss": accelerator.gather(processing_loss_mean).mean().detach().item(),
                     "loss": accelerator.gather(loss_mean).mean().detach().item(), 
                     "proj_loss": accelerator.gather(proj_loss_mean).mean().detach().item(),
                     "grad_norm": accelerator.gather(grad_norm).mean().detach().item(),
                     "expl_loss": accelerator.gather(explicid_loss_mean).mean().detach().item(),
                     #"lgs_sim": accelerator.gather(logits_similarity_loss_mean).mean().detach().item(),
                     "attn_exp": accelerator.gather(attn_explicd_loss_mean).mean().detach().item(),
-                    "attn_sit": accelerator.gather(attn_map_loss_sit_total_mean).mean().detach().item(),
-                    "cnn_cls": accelerator.gather(cnn_loss_cls_mean).mean().detach().item(),
+                    #"attn_sit": accelerator.gather(attn_map_loss_sit_total_mean).mean().detach().item(),
+                    #"cnn_cls": accelerator.gather(cnn_loss_cls_mean).mean().detach().item(),
+                    "overlap_loss": accelerator.gather(overlap_loss_mean).mean().detach().item()
                 }
 
             else:
@@ -1338,6 +1396,7 @@ def main(args):
                     "attn_exp": accelerator.gather(attn_explicd_loss_mean).mean().detach().item(),
                     "cnn_cls": accelerator.gather(cnn_loss_cls_mean).mean().detach().item(),
                     "lgs_sim": accelerator.gather(logits_similarity_loss_mean).mean().detach().item(),
+                    "overlap_loss": accelerator.gather(overlap_loss_mean).mean().detach().item()
                 }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
@@ -1569,7 +1628,7 @@ def parse_args(input_args=None):
     parser.add_argument("--exp-name", type=str, required=True)
     parser.add_argument("--logging-dir", type=str, default="logs")
     parser.add_argument("--report-to", type=str, default="wandb")
-    parser.add_argument("--sampling-steps", type=int, default=1500)
+    parser.add_argument("--sampling-steps", type=int, default=10000)
     parser.add_argument("--resume-step", type=int, default=0)
 
     # model
@@ -1608,6 +1667,15 @@ def parse_args(input_args=None):
 
     # explicd only
     parser.add_argument("--explicd-only", type=int, default=0)
+
+    # use new explicd method
+    parser.add_argument("--new-explicd", type=int, default=1)
+
+    # denoise patches
+    parser.add_argument("--denoise-patches", type=int, default=0)
+
+    # use the actual latent of the image
+    parser.add_argument("--use-actual-latent", type=int, default=1)
 
     # loss
     parser.add_argument("--path-type", type=str, default="linear", choices=["linear", "cosine"])
