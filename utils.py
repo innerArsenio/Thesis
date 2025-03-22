@@ -111,6 +111,27 @@ def load_encoders(enc_type, device):
             from models.clip_vit import UpdatedVisionTransformer
             print(f"the model is ViT-{model_config}/14")
             encoder_ = clip.load(f"ViT-{model_config}/14", device='cpu')[0].visual
+            #################
+            old_pos_emb = encoder_.positional_embedding  # (257, 1024) including CLS token
+            cls_emb, grid_emb = old_pos_emb[:1], old_pos_emb[1:]  # Split CLS token
+
+            # Reshape the grid positional embeddings into (16, 16, embedding_dim)
+            embedding_dim = grid_emb.shape[1]
+            grid_emb = grid_emb.reshape(16, 16, embedding_dim).permute(2, 0, 1)  # (1024, 16, 16)
+
+            # Interpolate to (32, 32)
+            new_size = (32, 32)
+            new_grid_emb = torch.nn.functional.interpolate(grid_emb.unsqueeze(0), size=new_size, mode="bilinear", align_corners=False).squeeze(0)
+
+            # Reshape back to (1024, 32×32)
+            new_grid_emb = new_grid_emb.permute(1, 2, 0).reshape(-1, embedding_dim)
+
+            # Concatenate CLS token back
+            new_pos_emb = torch.cat([cls_emb, new_grid_emb], dim=0)  # (1025, 1024)
+
+            # Update model's positional embeddings
+            encoder_.positional_embedding = torch.nn.Parameter(new_pos_emb)
+            #################
             #encoder_.load_state_dict(torch.load("./Explicd/model/weights/Clip_Vit_L_15.pth"))
             #encoder = create_model_from_pretrained('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')[0].visual.trunk
             encoder = UpdatedVisionTransformer(encoder_).to(device)

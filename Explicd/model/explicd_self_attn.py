@@ -29,6 +29,7 @@ import torchvision.transforms as T
 from skimage.util import img_as_float
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 import copy
+import entropy_lens as te
 
 NUM_OF_CRITERIA = {
     'ISIC': 7,
@@ -784,8 +785,8 @@ class SpatialAwarePatchLoss_mine_spatial(nn.Module):
 
         #weighted_feat_sim = feat_sim * spatial_weight  # Reduce long-range false matches
         #weighted_feat_sim = feat_sim * spatial_weight[None, :, :].to(device)  # Shape: (B, 256, 256)  Option to use spatial weights
-        normalized_D = 1 / (1 + D)  # (256, 256), closer patches have higher weight
-        normalized_D = normalized_D / normalized_D.max()  # Normalize to [0,1] for stability
+        #normalized_D = 1 / (1 + D)  # (256, 256), closer patches have higher weight
+        #normalized_D = normalized_D / normalized_D.max()  # Normalize to [0,1] for stability
 
         ############################## Option soft normalization not used right now
         normalized_D = D / (1 + D)  # (256, 256), closer patches have higher weight
@@ -811,10 +812,10 @@ class SpatialAwarePatchLoss_mine_spatial(nn.Module):
 
         # return total_loss
 
-        #weighted_feat_sim = feat_sim*normalized_D[None, :, :].to(device)
+        weighted_feat_sim = feat_sim*normalized_D[None, :, :].to(device)
         
         #weighted_feat_sim = feat_sim*D[None, :, :].to(device)
-        weighted_feat_sim = feat_sim
+        #weighted_feat_sim = feat_sim
         alpha=0.0
         # Compute attention similarity and loss
         for i in range(num_critical):
@@ -840,7 +841,84 @@ class SpatialAwarePatchLoss_mine_spatial(nn.Module):
 
         return total_loss
 
+def retinal_loss_function(attention_map, crit_dot, triv_dot, hsv_patches, lambda1=0.5, lambda2=1.0, lambda3=0.1):
+    """
+    Computes the loss enforcing:
+    1) Critical and trivial tokens should have minimal overlap in their dot products with feature embeddings.
+    2) Certain critical tokens should activate on specific color-based patches.
+    3) Trivial tokens should be automatically reduced if unnecessary.
+    
+    Parameters:
+        T_crit: Tensor of shape (7, 1024) - Critical tokens
+        T_triv: Tensor of shape (n_t, 1024) - Trivial tokens
+        F_vit: Tensor of shape (256, 1024) - Vision Transformer feature embeddings
+        hsv_patches: Tensor of shape (256, 3) - HSV values of each patch
+        lambda1, lambda2, lambda3: Weighting factors for each loss term
+    """
+    hue = hsv_patches[:, 0, :]  # Shape (B, 256)
+    saturation = hsv_patches[:, 1, :]  # Shape (B, 256)
+    value = hsv_patches[:, 2, :]  # Shape (B, 256)
 
+    # Compute dot products (before softmax)
+    # crit_dot = torch.matmul(T_crit, F_vit.T)  # (7, 256)
+    # triv_dot = torch.matmul(T_triv, F_vit.T)  # (n_t, 256)
+    # Extract the saturation (S) and value (V) channels (channels 1 and 2 in HSV format)
+    doing_loss_against_crit_on_black = True
+
+    attn_loss_dict = {}
+    if doing_loss_against_crit_on_black:
+        threshold=1e-3
+        
+        # Identify black patches (both S and V are below the threshold)
+        black_patch_mask = (saturation < threshold) & (value < threshold)  # Shape (B, 256)
+        
+        # Now, we want to penalize high attention values where the patch is black
+        # Expand black_patch_mask to shape (B, N, 256) to match the attention map's shape
+        black_patch_mask_expanded = black_patch_mask.unsqueeze(1).expand(-1, attention_map.shape[1], -1)  # Shape (B, N, 256)
+        
+        # Apply the mask to the attention map and calculate the loss
+        # The loss will be the sum of attention values for black patches
+        masked_attention = attention_map * black_patch_mask_expanded.float() # Apply mask
+        
+        # Loss is the sum of masked attention values
+        black_crit_loss = masked_attention.sum()  # Sum over all patches and batches
+        attn_loss_dict["black_crit_loss"] = black_crit_loss
+
+    
+    # 1) Critical-Trivial Overlap Loss (Minimize dot product similarity)
+    L_overlap = torch.sum(torch.matmul(crit_dot, triv_dot.permute(0, 2, 1))) / (crit_dot.shape[0] * crit_dot.shape[1] * triv_dot.shape[1])  # Normalize by token count
+    attn_loss_dict["overlap_loss"] = L_overlap
+    if L_overlap<-800:
+        L_overlap*=0
+    # 2) Color-Based Activation Loss
+    # H, S, V = hsv_patches[:, 0, :], hsv_patches[:, 1, :], hsv_patches[:, 2, :]  # Extract HSV channels
+    
+    # Define binary masks based on HSV conditions (1 = should activate, 0 = should not)
+    M_exudates = ((hue >= 30) & (hue <= 60)).float()  # Yellow regions
+    M_hemorrhages = (((hue <= 10) | (hue >= 350)) & (value < 0.5)).float()  # Dark red regions
+    M_microaneurysms = ((hue <= 10) & (saturation > 0.6)).float()
+    M_neovascularization = torch.ones_like(hue)  # Placeholder (should use SSIM-based mask)
+    M_edema = ((saturation < 0.3) & (value < 0.5)).float()  # Dark & low saturation
+    
+    # Stack masks in expected critical token order
+    M = torch.stack([M_microaneurysms, M_hemorrhages, M_exudates, M_neovascularization, M_edema], dim=1)
+    #print(M.shape)
+    #print(crit_dot.shape)
+    
+    # Enforce that critical tokens match expected color patches
+    L_color = F.mse_loss(crit_dot[:,:crit_dot.shape[1],:], M, reduction="none")  # Compare first 5 critical tokens to their expected maps
+    #print(f"L color shape {L_color.shape}")
+    attn_loss_dict["color_loss"] = L_color
+    #L_color = 1 - F.cosine_similarity(crit_dot[:,:crit_dot.shape[1],:], M, dim=-1).mean()
+    
+    # 3) Automatic Trivial Token Reduction (Minimize their dot products)
+    L_sparsity = torch.mean(torch.abs(triv_dot))
+    attn_loss_dict["sparsity_loss"] = L_sparsity
+    
+    # Final loss
+   # loss = lambda1 * L_overlap + lambda2 * L_color + lambda3 * L_sparsity
+    
+    return attn_loss_dict
 
 # class SpatialAwarePatchAttentionLoss(nn.Module):
 #     def __init__(self, H=16, W=16, sigma=2.0):
@@ -5050,6 +5128,7 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         self.num_of_criteria = NUM_OF_CRITERIA[config.dataset]
         self.device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.new_explicd = config.new_explicd
+        self.trivial_ratio = config.trivial_ratio
        
         if self.model_name in ['biomedclip', 'openclip']:
             if self.model_name == 'biomedclip':
@@ -5063,11 +5142,35 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
             config.preprocess = preprocess
 
             self.model_visual_ViT_L = clip.load(f"ViT-L/14")[0].visual
+
+            #################
+            old_pos_emb = self.model_visual_ViT_L.positional_embedding  # (257, 1024) including CLS token
+            cls_emb, grid_emb = old_pos_emb[:1], old_pos_emb[1:]  # Split CLS token
+
+            # Reshape the grid positional embeddings into (16, 16, embedding_dim)
+            embedding_dim = grid_emb.shape[1]
+            grid_emb = grid_emb.reshape(16, 16, embedding_dim).permute(2, 0, 1)  # (1024, 16, 16)
+
+            # Interpolate to (32, 32)
+            new_size = (32, 32)
+            new_grid_emb = torch.nn.functional.interpolate(grid_emb.unsqueeze(0), size=new_size, mode="bilinear", align_corners=False).squeeze(0)
+
+            # Reshape back to (1024, 32×32)
+            new_grid_emb = new_grid_emb.permute(1, 2, 0).reshape(-1, embedding_dim)
+
+            # Concatenate CLS token back
+            new_pos_emb = torch.cat([cls_emb, new_grid_emb], dim=0)  # (1025, 1024)
+
+            # Update model's positional embeddings
+            self.model_visual_ViT_L.positional_embedding = torch.nn.Parameter(new_pos_emb)
+            #################
+            
             ######################### Option use additional ViT
-            self.model_visual_ViT_L_hsv = clip.load(f"ViT-L/14")[0].visual
-            for param in self.model_visual_ViT_L_hsv.parameters():
-                param.data = param.data.to(torch.float32)
-            self.model_visual_ViT_L_hsv.cuda()
+            if self.new_explicd==1:
+                self.model_visual_ViT_L_hsv = clip.load(f"ViT-L/14")[0].visual
+                for param in self.model_visual_ViT_L_hsv.parameters():
+                    param.data = param.data.to(torch.float32)
+                self.model_visual_ViT_L_hsv.cuda()
             #########################
             #self.model_visual_custom = VisionTransformer7x7()
 
@@ -5106,9 +5209,11 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
             ################
         
         self.visual_features = []
-        self.visual_features_hsv = []
+        if self.new_explicd==1:
+            self.visual_features_hsv = []
         self.hook_list = []
-        self.hook_list_hsv = []
+        if self.new_explicd==1:
+            self.hook_list_hsv = []
 
         def hook_fn(module, input, output):
             self.visual_features.append(output) # detach to aboid saving computation graph
@@ -5127,19 +5232,21 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         #     param.requires_grad = True
         ################# Option Clip L
         layers = [self.model_visual_ViT_L.transformer.resblocks[23]]
-        layers_hsv = [self.model_visual_ViT_L_hsv.transformer.resblocks[5]]
+        if self.new_explicd==1:
+            layers_hsv = [self.model_visual_ViT_L_hsv.transformer.resblocks[23]]
         #################
 
         for layer in layers:
             self.hook_list.append(layer.register_forward_hook(hook_fn))
 
-        for layer in layers_hsv:
-            self.hook_list_hsv.append(layer.register_forward_hook(hook_fn_hsv))
+        if self.new_explicd==1:
+            for layer in layers_hsv:
+                self.hook_list_hsv.append(layer.register_forward_hook(hook_fn_hsv))
 
         hidden_size = 1024
         num_heads = 16
         self.critical_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
-        self.trivial_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
+        self.trivial_visual_tokens = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(int(self.num_of_criteria*self.trivial_ratio), hidden_size, dtype=torch.float32)))
 
         self.critical_visual_tokens_smaller = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
         self.trivial_visual_tokens_smaller  = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(self.num_of_criteria, hidden_size, dtype=torch.float32)))
@@ -5181,6 +5288,12 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         #                                     17 for BUSI
         self.cls_head = nn.Linear(in_features=NUM_OF_SIMILARITIES[self.config.dataset], out_features=config.num_class)
         self.minimal_cls_head = nn.Linear(in_features=hidden_size*7, out_features=config.num_class)
+        self.cls_wiht_te =  nn.Sequential(te.nn.EntropyLinear(NUM_OF_SIMILARITIES[self.config.dataset], NUM_OF_SIMILARITIES[self.config.dataset]*5, n_classes=config.num_class),
+                            torch.nn.LeakyReLU(),
+                            torch.nn.Linear(NUM_OF_SIMILARITIES[self.config.dataset]*5, config.num_class*4),
+                            torch.nn.LeakyReLU(),
+                            torch.nn.Linear(config.num_class*4, 1)
+                            )
 
         self.cluster_sigma = torch.nn.Parameter(torch.ones(1))
         self.orthogonal_sigma = torch.nn.Parameter(torch.ones(1))
@@ -5189,8 +5302,9 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         for param in self.model_visual_ViT_L.parameters():
             param.requires_grad = True
 
-        for param in self.model_visual_ViT_L_hsv.parameters():
-            param.requires_grad = True
+        if self.new_explicd==1:
+            for param in self.model_visual_ViT_L_hsv.parameters():
+                param.requires_grad = True
 
         self.critical_visual_tokens.requires_grad = True
         self.trivial_visual_tokens.requires_grad = True
@@ -5260,15 +5374,19 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
             return cls_logits_refined
 
         ###################################### Option to use vit twice
-        self.visual_features_hsv.clear()
+        if self.new_explicd==1:
+            self.visual_features_hsv.clear()
         imgs_in_hsv = rgb_to_hsv_torch(imgs)
         hsv_patches = imgs_in_hsv.unfold(2, 14, 14).unfold(3, 14, 14)  # (B, 3, 16, 16, 14, 14)
         hsv_patches = hsv_patches.mean(dim=(-1, -2))  # (B, 3, 16, 16)
-        _ = self.model_visual_ViT_L_hsv(imgs_in_hsv)
+        if self.new_explicd==1:
+            _ = self.model_visual_ViT_L_hsv(imgs_in_hsv)
         patches = image_to_patches(imgs, patch_size=14)
         #print(f"shape of self.visual_features_hsv[0] {self.visual_features_hsv[0].shape}")
         #vit_l_output_hsv=self.visual_features_hsv[0][:, 1:, :]
-        vit_l_output_hsv=self.visual_features_hsv[0].permute(1, 0, 2)[:, 1:, :]
+        if self.new_explicd==1:
+            vit_l_output_hsv=self.visual_features_hsv[0].permute(1, 0, 2)[:, 1:, :]
+        #vit_l_output_hsv = 
         ######################################
 
 
@@ -5282,7 +5400,7 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         ################# Option gradual
         self.visual_features.clear()
         _ = self.model_visual_ViT_L(imgs)
-        critical_mask, trivial_mask = self.cnn_kernel_14(imgs)  # Shape: (B, 1, 16, 16)
+        #critical_mask, trivial_mask = self.cnn_kernel_14(imgs)  # Shape: (B, 1, 16, 16)
         #loss_fn = SpatialAwarePatchLoss()
         attn_explicd_loss = torch.tensor(0.0, device=self.device)
         #attn_explicd_loss += 10*loss_fn(patches.permute(0, 2, 1).view(B, D_patch, int(T ** 0.5), int(T ** 0.5)), critical_mask)
@@ -5297,6 +5415,8 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         ################# Option instanentous
         #print(f"shape of self.visual_features[0] {self.visual_features[0].shape}")
         vit_l_output=self.visual_features[0].permute(1, 0, 2)[:, 1:, :]
+        if self.new_explicd==0:
+            vit_l_output_hsv = vit_l_output
         #################
         B, T, D = vit_l_output.shape  # B: batch size, T: num_patches (256), D: patch_dim (1024)
         H = W = int(T ** 0.5)  # Assuming T is a perfect square, H = W = 16
@@ -5306,7 +5426,7 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         #vit_output_unflattened_for_exlusive =vit_output_unflattened
         #critical_mask, trivial_mask = self.cnn(vit_output_unflattened)  # Shape: (B, 1, 16, 16)
         #trivial_mask = 1-critical_mask
-        critical_mask, trivial_mask = torch.zeros(B, 1, 16, 16).cuda(), torch.zeros(B, 1, 16, 16).cuda()
+        critical_mask, trivial_mask = torch.zeros(B, 1, H, W).cuda(), torch.zeros(B, 1, H, W).cuda()
         vit_l_output_for_critical = (vit_output_unflattened * critical_mask).permute(0, 2, 3, 1).view(B, T, D)  # Shape: (B, 256, 1024)
         vit_l_output_for_trivial = (vit_output_unflattened * trivial_mask).permute(0, 2, 3, 1).view(B, T, D)
         #CAUTION: The above line is for the case where the attention loss is used for the tokens
@@ -5328,12 +5448,23 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
             agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial(trivial_visual_tokens, vit_l_output, vit_l_output)
         d_products = torch.matmul(critical_visual_tokens, vit_l_output_hsv.permute(0, 2, 1))/(D**0.5)
 
+          # Compute dot products (before softmax)
+        crit_dot = torch.matmul(critical_visual_tokens, vit_l_output_hsv.permute(0, 2, 1))/(D**0.5)  # (7, 256)
+        triv_dot = torch.matmul(trivial_visual_tokens, vit_l_output_hsv.permute(0, 2, 1))/(D**0.5)  # (n_t, 256)
+
+        attn_explicd_loss_dict = {}
+        if self.config.dataset == 'IDRID':
+            attn_explicd_loss_dict=retinal_loss_function(attn_critical_weights, crit_dot, triv_dot, hsv_patches.view(B, 3, T))
+
         #attn_explicd_loss += 10*gpt4_0_second_attention_loss_mine(attn_critical_weights, attn_trivial_weights)[0]
         #loss_fn = SpatialAwarePatchLoss_mine()
         loss_fn = SpatialAwarePatchLoss_mine_spatial()
         #attn_explicd_loss += 1*loss_fn(patches.permute(0, 2, 1).view(B, D_patch, int(T ** 0.5), int(T ** 0.5)), attn_critical_weights, attn_trivial_weights)
         #attn_explicd_loss += 1*loss_fn(patches.permute(0, 2, 1).view(B, D_patch, int(T ** 0.5), int(T ** 0.5)), d_products, attn_trivial_weights)
-        attn_explicd_loss += 1*loss_fn(hsv_patches, d_products, attn_trivial_weights)
+
+        # I've been using this one for skin lesions
+        #attn_explicd_loss += 1*loss_fn(hsv_patches, d_products, attn_trivial_weights)
+
         #attn_explicd_loss += 10000 * torch.mean(attn_critical_weights * attn_trivial_weights)
         #print(f"d_products.shape {d_products.shape}")
         ############################################################################   Option use self-attention for the tokens
@@ -5375,6 +5506,8 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         image_logits = torch.cat(image_logits_list, dim=-1)
         cls_logits = self.cls_head(image_logits)
 
+        cls_with_te_logits = self.cls_wiht_te(image_logits)
+
         #vit_l_output_for_sit = self.proj_vit_output(self.norm_vit_output(self.ffn_vit_output(vit_l_output)))
         
         to_return_dict = {
@@ -5386,7 +5519,7 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
             "image_logits_dict":image_logits_dict,
             "agg_critical_visual_tokens_for_SiT":F.normalize(agg_critical_visual_tokens_for_SiT, dim=-1),
             "agg_trivial_visual_tokens_for_SiT":F.normalize(agg_trivial_visual_tokens_for_SiT, dim=-1),
-            "attn_explicd_loss":attn_explicd_loss,
+            "attn_explicd_loss_dict":attn_explicd_loss_dict,
             "overlap_loss":overlap_loss,
             "attn_critical_weights":attn_critical_weights,
             "attn_trivial_weights":attn_trivial_weights,
@@ -5409,5 +5542,6 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         if doing_cnn_trivial:
             to_return_dict["cnn_logits_trivial"] = self.classifying_trivial_cnn(vit_l_output)
 
- 
+        to_return_dict["cls_with_te_logits"] = cls_with_te_logits.squeeze(-1)
+        to_return_dict["te_loss"] = 0.00001 * te.nn.functional.entropy_logic_loss(self.cls_wiht_te)
         return to_return_dict

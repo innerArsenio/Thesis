@@ -136,15 +136,50 @@ CE_WEIGHTS = {
 
 
 explicid_isic_dict_weights = {
-    'color': [ 0.111, 0.669, 0.051, 0.033, 0.11, 0.011, 0.014],
-    'shape': [ 0.195, 0.682, 0.11, 0.014],
-    'border': [ 0.144, 0.806, 0.051],
-    'dermoscopic patterns': [ 0.111, 0.669, 0.051, 0.033, 0.11, 0.011, 0.014],
-    'texture': [ 0.111, 0.684, 0.051, 0.033, 0.11, 0.011],
-    'symmetry': [ 0.195, 0.791, 0.014],
-    'elevation': [ 0.807, 0.051, 0.033, 0.11],
+    'color': [ 0.04, 0.007, 0.086, 0.135, 0.04, 0.383, 0.31],
+    'shape': [ 0.059, 0.017, 0.106, 0.818],
+    'border': [ 0.251, 0.045, 0.704],
+    'dermoscopic patterns': [ 0.04, 0.007, 0.086, 0.135, 0.04, 0.383, 0.31],
+    'texture': [ 0.057, 0.009, 0.124, 0.195, 0.058, 0.556],
+    'symmetry': [ 0.067, 0.016, 0.917],
+    'elevation': [ 0.021, 0.322,0.507, 0.151],
 
 }
+
+explicid_idrid_dict_weights = {
+    'microaneurysms': [0.102, 0.685, 0.101, 0.111],
+    'hemorrhages': [0.102, 0.685, 0.101, 0.111],
+    'exudates': [0.102, 0.685, 0.101, 0.111],
+    'neovascularization': [0.119, 0.881],
+    'macular edema': [0.136, 0.154, 0.283, 0.427],
+}
+
+explicid_idrid_edema_dict_weights = {
+    'hard exudates': [0.161, 0.694, 0.146],
+    'retinal thickening': [0.571, 0.429],
+    'microaneurysms': [0.571,  0.429],
+    'hemorrhages': [0.161, 0.694, 0.146],
+    'cotton wool spots': [0.472, 0.528],
+    'vascular abnormalities': [0.161, 0.694, 0.146]
+}
+
+explicid_busi_dict_weights = {
+    'shape': [0.516, 0.157, 0.327],
+    'margin': [0.516, 0.157, 0.327],
+    'echo': [0.516, 0.157, 0.327],
+    'posterior': [0.516, 0.157, 0.327],
+    'calcifications': [0.516, 0.157, 0.327],
+    'orientation': [0.269, 0.731]
+}
+
+
+CONCEPT_CE_WEIGHTS = {
+    'ISIC': explicid_isic_dict_weights,
+    'IDRID': explicid_idrid_dict_weights,
+    'IDRID_EDEMA': explicid_idrid_edema_dict_weights,
+    'BUSI': explicid_busi_dict_weights
+}
+
 
 def mean_flat(x):
     """
@@ -201,7 +236,8 @@ class SILoss:
             latents_bias=None,
             task = None,
             do_logits_similarity=True,
-            concept_hardness="soft_equal"
+            concept_hardness="soft_equal",
+            cls_loss_epoch=0
             ):
         self.prediction = prediction
         self.weighting = weighting
@@ -218,6 +254,7 @@ class SILoss:
         self.concept_label_map = CONCEPT_LABEL_MAP_DICT[task]
         self.do_logits_similarity=do_logits_similarity
         self.concept_hardness=concept_hardness
+        self.cls_loss_epoch=cls_loss_epoch
         
 
     def interpolant(self, t):
@@ -254,39 +291,44 @@ class SILoss:
         time_input = time_input.to(device=images.device, dtype=images.dtype)
         noises = torch.randn_like(images)
         alpha_t, sigma_t, d_alpha_t, d_sigma_t = self.interpolant(time_input)
-        if use_actual_latent_of_the_images==0:
-            model_input = alpha_t * images + sigma_t * noises
-        elif use_actual_latent_of_the_images==1:
-            model_input = torch.randn_like(images)
+        #print(f"images shape: {images.shape}")
+        # if use_actual_latent_of_the_images==0:
+        #     model_input = alpha_t * images + sigma_t * noises
+        # elif use_actual_latent_of_the_images==1:
+        #     model_input = torch.randn_like(images)
 
-        if self.prediction == 'v' and use_actual_latent_of_the_images==0:
-            model_target = d_alpha_t * images + d_sigma_t * noises
-        elif self.prediction == 'v' and use_actual_latent_of_the_images==1:
-            model_target = images
-        else:
-            raise NotImplementedError() # TODO: add x or eps prediction
+        # if self.prediction == 'v' and use_actual_latent_of_the_images==0:
+        #     model_target = d_alpha_t * images + d_sigma_t * noises
+        # elif self.prediction == 'v' and use_actual_latent_of_the_images==1:
+        #     model_target = images
+        # else:
+        #     raise NotImplementedError() # TODO: add x or eps prediction
 
-        denoising_loss, proj_loss, explicid_loss, cosine_loss, sit_cls_loss, logits_similarity_loss, attn_map_loss_sit_total = [torch.tensor(0.0, device=images.device)]*7
+        denoising_loss, proj_loss, explicid_loss, cosine_loss, sit_cls_loss, logits_similarity_loss, attn_map_loss_sit_total = [torch.tensor(0.0, device=images.device) for _ in range(7)] 
         contr_loss= torch.tensor(0.0, device=images.device)
         attn_explicd_loss=torch.tensor(0.0, device=images.device)
         loss_cls_criteria_only = torch.tensor(0.0, device=images.device)
         loss_cls_refined = torch.tensor(0.0, device=images.device)
         sit_cls_loss = torch.tensor(0.0, device=images.device)
+        loss_cls_with_te = torch.tensor(0.0, device=images.device)
+        te_loss = torch.tensor(0.0, device=images.device)
         sigmas_for_losses = {}
         for imgs_indx, explicid_imgs in enumerate(explicid_imgs_list):
-            if do_pretraining_the_patchifyer:
-                model_output = model(model_input)
-                processing_loss = mean_flat((model_output - model_target) ** 2)
-                return processing_loss, [torch.tensor(0.0, device=images.device)]*15
+            # if do_pretraining_the_patchifyer:
+            #     model_output = model(model_input)
+            #     processing_loss = mean_flat((model_output - model_target) ** 2)
+            #     return processing_loss, [torch.tensor(0.0, device=images.device)]*15
             with torch.no_grad():
                 explicid_imgs_latents=patchifyer_model.patchify_the_latent(latent_raw_image)
             explicd_return_dict = explicid(explicid_imgs, explicid_imgs_latents=explicid_imgs_latents)
             patches = explicd_return_dict["patches"]
             cls_logits = explicd_return_dict["cls_logits"]
+            cls_with_te_logits = explicd_return_dict["cls_with_te_logits"]
+            te_loss = explicd_return_dict["te_loss"]
             image_logits_dict = explicd_return_dict["image_logits_dict"]
             agg_critical_tokens = explicd_return_dict["agg_critical_visual_tokens_for_SiT"]
             agg_trivial_tokens = explicd_return_dict["agg_trivial_visual_tokens_for_SiT"]
-            attn_explicd_loss = explicd_return_dict["attn_explicd_loss"]
+            attn_explicd_loss_dict = explicd_return_dict["attn_explicd_loss_dict"]
             overlap_loss = explicd_return_dict["overlap_loss"]
             attn_critical_weights = explicd_return_dict["attn_critical_weights"]
             attn_trivial_weights = explicd_return_dict["attn_trivial_weights"]
@@ -297,6 +339,40 @@ class SILoss:
             cnn_logits_trivial = explicd_return_dict["cnn_logits_trivial"]
             critical_mask = explicd_return_dict["critical_mask"]
             trivial_mask = explicd_return_dict["trivial_mask"]
+
+            normalized_attention = attn_critical_weights / attn_critical_weights.max(dim=1, keepdim=True).values
+            summed_attention = normalized_attention.sum(dim=1)
+            clipped_attention = torch.clamp(summed_attention, min=0.0, max=1.0)
+            B, T, D = vit_l_output.shape  # B: batch size, T: num_patches (256), D: patch_dim (1024)
+            H = W = int(T ** 0.5)  # Assuming T is a perfect square, H = W = 16
+            clipped_attention = clipped_attention.view(B, H, W)
+            clipped_attention = clipped_attention.unsqueeze(1)
+
+            images = images*clipped_attention
+
+
+            if use_actual_latent_of_the_images==0:
+                model_input = alpha_t * images + sigma_t * noises
+            elif use_actual_latent_of_the_images==1:
+                model_input = torch.randn_like(images)
+
+            if self.prediction == 'v' and use_actual_latent_of_the_images==0:
+                model_target = d_alpha_t * images + d_sigma_t * noises
+            elif self.prediction == 'v' and use_actual_latent_of_the_images==1:
+                model_target = images
+            else:
+                raise NotImplementedError() # TODO: add x or eps prediction
+
+            if self.task =="IDRID":
+                attn_explicd_loss+=attn_explicd_loss_dict["black_crit_loss"]
+                #print(f"labels shape: {labels.shape}")
+                # Check if each element is in {2, 3, 4}
+                # mask = torch.isin(labels, torch.tensor([2, 3, 4],device=images.device))
+                # # Set the values to 1 if in {2, 3, 4}, else set to 0
+                # tensor_viable = mask.int().to(device=images.device).unsqueeze(1).unsqueeze(2)
+                # #print(f"tensor_viable shape: {tensor_viable.shape}")
+                # #print(f"attn_explicd_loss_dict['color_loss'] shape: {attn_explicd_loss_dict["color_loss"].shape}")
+                # pppp = torch.mean(tensor_viable*attn_explicd_loss_dict["color_loss"])
             if explicd_only==0:
                 ##################  Option use trivial tokens too
                 agg_visual_tokens = torch.cat((agg_critical_tokens, agg_trivial_tokens), dim=1)
@@ -334,6 +410,9 @@ class SILoss:
                     }
 
             loss_cls = self.cls_criterion(cls_logits, labels)
+            #print(f"cls_logits shape: {cls_logits.shape}")
+            #print(f"cls_with_te_logits shape: {cls_with_te_logits.shape}")
+            #loss_cls_with_te = self.cls_criterion(cls_with_te_logits, labels)
             doing_cnn_critical=False
             doing_cnn_trivial=False
             cnn_critical_loss_cls, cnn_trivial_loss_cls, cnn_logits_similarity_loss = [torch.tensor(0.0, device=images.device)]*3
@@ -357,9 +436,9 @@ class SILoss:
                 #print("hard concept hardness is used")
                 for key in explicid.concept_token_dict.keys():
                     ###################################### Option simple CE
-                    image_concept_loss = F.cross_entropy(image_logits_dict[key], concept_label[:, idx])
+                    #image_concept_loss = F.cross_entropy(image_logits_dict[key], concept_label[:, idx])
                     ###################################### Option weighted CE
-                    #image_concept_loss = F.cross_entropy(image_logits_dict[key], concept_label[:, idx], weight=torch.FloatTensor(explicid_isic_dict_weights[key]).cuda())
+                    image_concept_loss = F.cross_entropy(image_logits_dict[key], concept_label[:, idx], weight=torch.FloatTensor(CONCEPT_CE_WEIGHTS[self.task][key]).cuda())
                     ######################################
                     loss_concepts += image_concept_loss
                     idx += 1
@@ -371,6 +450,11 @@ class SILoss:
                     one_hot_labels.scatter_(1, concept_label[:, idx].unsqueeze(1), 1)  # Create one-hot encoding
                     soft_labels = label_smoothing(one_hot_labels, epsilon=0.1)
                     image_concept_loss = F.kl_div(torch.log(predicted_probs), soft_labels, reduction='batchmean')
+
+                    ###############   Option use CE
+                    #log_probs = F.log_softmax(image_logits_dict[key], dim=1)  # Compute log probabilities
+                    #image_concept_loss = torch.sum(-soft_labels * log_probs, dim=1).mean()  # Average over batch
+                    ###############
                     if image_concept_loss<0:
                         print(soft_labels)
                         print()
@@ -390,8 +474,7 @@ class SILoss:
                     #print(torch.FloatTensor(CE_WEIGHTS[self.task]).cuda()[labels])
                     loss_concepts += (F.kl_div(predicted_probs,  concept_label_smooth_dict[key], reduction='none').mean(dim=-1)*torch.FloatTensor(CE_WEIGHTS[self.task]).cuda()[labels]).mean()*100  # Reduction is batchmean for proper scaling
                     idx += 1
-
-            if epoch>=4:
+            if epoch>=self.cls_loss_epoch:
                 #################################### Option use loss_cls and loss_concepts
                 explicid_loss += loss_cls + loss_concepts / idx
                 #################################### Option use loss_cls only
@@ -409,7 +492,6 @@ class SILoss:
             #     logits_similarity_loss*=0
             #     #print("logits_similarity_loss ", logits_similarity_loss)
             #     cnn_loss_cls*=0
-
             if explicd_only==0 and do_sit:
                 patches_output,model_output, model_input_pure_processed, zs_tilde, attn_sit_loss, sigmas_for_losses  = model(model_input, images, None,time_input.flatten(), **model_kwargs, 
                                                                         concept_label=None, 
@@ -447,6 +529,9 @@ class SILoss:
             "explicid_loss":explicid_loss,
             "loss_cls":loss_cls,
             "logits_similarity_loss":logits_similarity_loss,
+
+            "loss_cls_with_te":loss_cls_with_te,
+            "te_loss":te_loss,
 
             "attn_explicd_loss":attn_explicd_loss,
             "sigmas_for_losses":sigmas_for_losses,

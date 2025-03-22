@@ -191,7 +191,7 @@ NUM_OF_CRITERIA = {
 
 LIST_OF_TASKS = ['ISIC', 'ISIC_MINE', 'ISIC_MINIMAL', 'ISIC_SOFT', 'IDRID', 'IDRID_EDEMA', 'BUSI', 'BUSI_SOFT']
 
-TASK='ISIC'
+#TASK='IDRID_EDEMA'
 
 NUM_OF_CLASSES= {
     'ISIC': 7,
@@ -220,10 +220,10 @@ CONCEPTS= {
 }
 CONCEPT_HARDNESS_LIST_OPTIONS=["hard","soft_equal","soft_smarter"]
 
-DO_MUDDLE_CHECK=False
-ADD_GAUSSIAN_NOISE=False
+#DO_MUDDLE_CHECK=True
+#ADD_GAUSSIAN_NOISE=False
 DO_LOGITS_SIMILARITY=False
-CONCEPT_HARDNESS="soft_equal"
+#CONCEPT_HARDNESS="soft_equal"
 DO_CONTR_LOSS = False
 noise_levels = [0, 5, 10, 15, 20]
 
@@ -243,7 +243,7 @@ def create_muddled_dataloader(dataset, batch_size, num_workers):
         drop_last=False
     )
 
-CONCEPT_LABEL_MAP = CONCEPT_LABEL_MAP_DICT[TASK]
+#CONCEPT_LABEL_MAP = CONCEPT_LABEL_MAP_DICT[TASK]
 
 DEBUG = False
 
@@ -299,6 +299,8 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0, a
 
             imgs_for_explicid=prepare__imgs_for_explicid(raw_image, exp_val_transforms).to("cuda")
             explicd_return_dict = explicd(imgs_for_explicid)
+            # cls_with_te_logits = explicd_return_dict["cls_with_te_logits"]
+            # cls_logits = explicd_return_dict["cls_logits"]
             cls_logits = explicd_return_dict["cls_logits"]
             agg_critical_visual_tokens = explicd_return_dict["agg_critical_visual_tokens"]
             agg_trivial_visual_tokens = explicd_return_dict["agg_trivial_visual_tokens"]
@@ -451,7 +453,7 @@ def preprocess_raw_image(x, enc_type):
         #print("clip frozen encoder is used")
         x = x / 255.
         ##x = torch.nn.functional.interpolate(x, 224 * (resolution // 256), mode='bicubic')
-        x = torch.nn.functional.interpolate(x, 224, mode='bicubic')
+        x = torch.nn.functional.interpolate(x, 448, mode='bicubic')
         x = Normalize(CLIP_DEFAULT_MEAN, CLIP_DEFAULT_STD)(x)
     elif 'mocov3' in enc_type or 'mae' in enc_type:
         x = x / 255.
@@ -567,6 +569,10 @@ def main(args):
         log_with=args.report_to,
         project_config=accelerator_project_config,
     )
+    # ['ISIC', 'ISIC_MINE', 'ISIC_MINIMAL', 'ISIC_SOFT', 'IDRID', 'IDRID_EDEMA', 'BUSI', 'BUSI_SOFT']
+    TASK = args.task
+    DO_MUDDLE_CHECK = args.muddle_check
+    ADD_GAUSSIAN_NOISE = args.add_gaussian
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
@@ -624,6 +630,7 @@ def main(args):
             task = TASK,
             denoise_patches=args.denoise_patches,
             use_actual_latent_of_the_images=args.use_actual_latent,
+            trivial_ratio=args.trivial_ratio,
             **block_kwargs
         )
 
@@ -645,6 +652,7 @@ def main(args):
     conf.flag = 2
     conf.do_logits_similarity=DO_LOGITS_SIMILARITY
     conf.new_explicd = args.new_explicd
+    conf.trivial_ratio = args.trivial_ratio
 
     #explicid = ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
     #explicid = ExpLICD_ViT_L_with_Attn_Map_and_Additional_Tokens_Plus_SuperPixels(concept_list=concept_list, model_name='biomedclip', config=conf).to(device)
@@ -672,8 +680,13 @@ def main(args):
     explicid_train_transforms.transforms.pop(1)
     if explicid.model_name != 'clip':
         explicid_train_transforms.transforms.pop(0)
-    explicid_train_transforms.transforms.insert(0, transforms.CenterCrop(size=(224, 224)))
-    explicid_train_transforms.transforms.insert(0, transforms.Resize(size=(224,224), interpolation=utils.get_interpolation_mode('bicubic'), max_size=None, antialias=True))    
+    
+    # (224, 224)
+    # (448, 448)
+        
+    img_size = 448
+    #explicid_train_transforms.transforms.insert(0, transforms.CenterCrop(size=(img_size, img_size)))
+    explicid_train_transforms.transforms.insert(0, transforms.Resize(size=(img_size,img_size), interpolation=utils.get_interpolation_mode('bicubic'), max_size=None, antialias=True))    
     explicid_train_transforms.transforms.insert(0, transforms.ToPILImage())
 
     #explicid_train_transforms.transforms.pop(4)
@@ -684,7 +697,8 @@ def main(args):
     exp_val_transforms.transforms.pop(2)
     exp_val_transforms.transforms.insert(0, transforms.ToPILImage())
     exp_val_transforms.transforms.pop(1)
-    exp_val_transforms.transforms.insert(1, transforms.Resize(size=(224,224), interpolation=utils.get_interpolation_mode('bicubic'), max_size=None, antialias=True))
+    exp_val_transforms.transforms.insert(1, transforms.Resize(size=(img_size,img_size), interpolation=utils.get_interpolation_mode('bicubic'), max_size=None, antialias=True))
+    exp_val_transforms.transforms.pop(2)
     #exp_val_transforms.transforms.pop(4)
     print("exp_val_transforms ============",exp_val_transforms)
     
@@ -707,7 +721,8 @@ def main(args):
         weighting=args.weighting,
         task=TASK,
         do_logits_similarity=DO_LOGITS_SIMILARITY,
-        concept_hardness=CONCEPT_HARDNESS
+        concept_hardness=args.concept_hardness,
+        cls_loss_epoch=args.cls_loss_epoch,
     )
     if args.explicd_only==0:
         if accelerator.is_main_process:
@@ -888,7 +903,7 @@ def main(args):
     curve_of_f1 = []
     curve_of_BMAC = []
     val_score_deserves_sampling = False
-    if args.explicd_only==1:
+    if args.explicd_only==1 and not DO_MUDDLE_CHECK:
         print("explicd only")
         optimizer.eval()
         optimizer.zero_grad(set_to_none=True)
@@ -897,7 +912,7 @@ def main(args):
         print('BMAC: %.5f, f1: %.5f'%(expl_scores["BMAC"], expl_scores["f1"]))
         optimizer.train()
         explicid.train()
-    else:
+    elif not DO_MUDDLE_CHECK:
         print("whole pipeline")
         optimizer.eval()
         optimizer.zero_grad(set_to_none=True)
@@ -1126,17 +1141,23 @@ def main(args):
                     attn_sit_loss = loss_return_dict["attn_sit_loss"]
                     cnn_loss_cls = loss_return_dict["cnn_loss"]
                     overlap_loss = loss_return_dict["overlap_loss"]
+                    loss_cls_with_te = 0*loss_return_dict["loss_cls_with_te"]
+                    te_loss = loss_return_dict["te_loss"]
 
                     processing_loss_mean = processing_loss.mean()
                     loss_mean = loss.mean()
                     proj_loss_mean = proj_loss.mean()* args.proj_coeff
                     explicid_loss_mean = explicid_loss.mean()
+
+                    loss_cls_with_te_mean = loss_cls_with_te.mean()
+                    te_loss_mean = te_loss.mean()
+
                     #explicid_loss_mean = loss_cls.mean()
                     #print("train logits_similarity_loss ", logits_similarity_loss)
                     overlap_loss_mean = 0*overlap_loss.mean()
                     logits_similarity_loss_mean= 0*logits_similarity_loss.mean()
                     if args.new_explicd==0:
-                        attn_explicd_loss_mean = 0*attn_explicd_loss.mean() # 10e5
+                        attn_explicd_loss_mean = attn_explicd_loss.mean() # 10e5
                     elif args.new_explicd==1:
                         attn_explicd_loss_mean = attn_explicd_loss.mean()
                     attn_map_loss_sit_total_mean = 0*attn_sit_loss.mean()
@@ -1151,7 +1172,8 @@ def main(args):
                     #     loss_mean*=0
                     #     attn_map_loss_sit_total_mean*=0
 
-                    total_loss_magnitude = processing_loss_mean+loss_mean + proj_loss_mean  + explicid_loss_mean + logits_similarity_loss_mean+attn_explicd_loss_mean+attn_map_loss_sit_total_mean+cnn_loss_cls_mean+overlap_loss_mean
+                    total_loss_magnitude = (processing_loss_mean+loss_mean + proj_loss_mean  + explicid_loss_mean + logits_similarity_loss_mean+
+                                            attn_explicd_loss_mean+attn_map_loss_sit_total_mean+cnn_loss_cls_mean+overlap_loss_mean+loss_cls_with_te_mean+te_loss_mean)
 
                     processing_weight = processing_loss_mean/total_loss_magnitude
                     loss_weight = loss_mean / total_loss_magnitude
@@ -1162,9 +1184,12 @@ def main(args):
                     attn_sit_weight= attn_map_loss_sit_total_mean/total_loss_magnitude
                     cnn_loss_weight = cnn_loss_cls_mean/total_loss_magnitude
 
+                    loss_cls_with_te_mean_weight = loss_cls_with_te_mean/total_loss_magnitude
+                    te_loss_mean_weight = te_loss_mean/total_loss_magnitude
+
                     total_loss = ((processing_weight*processing_loss_mean)+(loss_weight*loss_mean) + (proj_weight*proj_loss_mean) + (explicid_weight*explicid_loss_mean)
                                 + (lgs_sim_weight*logits_similarity_loss_mean) + (attn_explicd_weight*logits_similarity_loss_mean) + (attn_sit_weight*attn_map_loss_sit_total_mean)
-                                + (cnn_loss_weight*cnn_loss_cls_mean)) 
+                                + (cnn_loss_weight*cnn_loss_cls_mean) + (loss_cls_with_te_mean_weight*loss_cls_with_te_mean)+(te_loss_mean_weight*te_loss_mean)) 
 
                     ## optimization
                     ######################################## Option simple summation of losses
@@ -1198,8 +1223,12 @@ def main(args):
                     attn_explicd_loss = loss_return_dict["attn_explicd_loss"]
                     cnn_loss_cls = loss_return_dict["cnn_loss"]
                     overlap_loss = loss_return_dict["overlap_loss"]
+                    loss_cls_with_te = loss_return_dict["loss_cls_with_te"]
+                    te_loss = 0*loss_return_dict["te_loss"]
                     
                     explicid_loss_mean = explicid_loss.mean()
+                    loss_cls_with_te_mean = loss_cls_with_te.mean()
+                    te_loss_mean = te_loss.mean()
                     logits_similarity_loss_mean= 0*logits_similarity_loss.mean()
                     if args.new_explicd==0:
                         attn_explicd_loss_mean = 0*attn_explicd_loss.mean() # 10e5
@@ -1207,7 +1236,7 @@ def main(args):
                         attn_explicd_loss_mean = attn_explicd_loss.mean()
                     overlap_loss_mean = overlap_loss.mean()
                     cnn_loss_cls_mean = 0*cnn_loss_cls.mean()
-                    accelerator.backward(explicid_loss_mean+logits_similarity_loss_mean+attn_explicd_loss_mean+cnn_loss_cls_mean+overlap_loss_mean)
+                    accelerator.backward(explicid_loss_mean+logits_similarity_loss_mean+attn_explicd_loss_mean+cnn_loss_cls_mean+overlap_loss_mean+loss_cls_with_te_mean+te_loss_mean)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
             
@@ -1253,6 +1282,8 @@ def main(args):
                     explicd_return_dict = explicid(imgs_for_explicid)
                     patches = explicd_return_dict["patches"]
                     #patches_colored = explicd_return_dict["patches_colored"]
+                    # cls_with_te_logits = explicd_return_dict["cls_with_te_logits"]
+                    # cls_logits = explicd_return_dict["cls_logits"]
                     cls_logits = explicd_return_dict["cls_logits"]
 
                     agg_critical_tokens = explicd_return_dict["agg_critical_visual_tokens_for_SiT"]
@@ -1325,8 +1356,8 @@ def main(args):
                             use_actual_latent_of_the_images=args.use_actual_latent
                         )
                         if args.use_actual_latent==0:
-                            samples_tampered = vae.decode((samples_tampered -  latents_bias) / latents_scale).sample
-                            #samples_tampered = vae.decode(samples_tampered)["sample"]
+                            #samples_tampered = vae.decode((samples_tampered -  latents_bias) / latents_scale).sample
+                            samples_tampered = vae.decode(samples_tampered)["sample"]
                         elif args.use_actual_latent==1:
                             samples_tampered = vae.decode(samples_tampered)["sample"]
                         samples_tampered = (samples_tampered + 1) / 2.
@@ -1354,8 +1385,8 @@ def main(args):
                                     "gt_samples": wandb.Image(array2grid(gt_samples)),
                                     f"samples first zeroed out": wandb.Image(array2grid(samples_tampered_list[1])),
                                     f"samples second zeroed out": wandb.Image(array2grid(samples_tampered_list[2])),
-                                    #f"samples third zeroed out": wandb.Image(array2grid(samples_tampered_list[3])),
-                                    #f"samples fourth zeroed out": wandb.Image(array2grid(samples_tampered_list[4])),
+                                    f"samples third zeroed out": wandb.Image(array2grid(samples_tampered_list[3])),
+                                    f"samples fourth zeroed out": wandb.Image(array2grid(samples_tampered_list[4])),
                                     #f"samples fifth zeroed out": wandb.Image(array2grid(samples_tampered_list[5])),
                                     #f"samples sixth zeroed out": wandb.Image(array2grid(samples_tampered_list[6])),
                                     #f"samples seventh zeroed out": wandb.Image(array2grid(samples_tampered_list[7]))
@@ -1387,7 +1418,9 @@ def main(args):
                     "attn_exp": accelerator.gather(attn_explicd_loss_mean).mean().detach().item(),
                     #"attn_sit": accelerator.gather(attn_map_loss_sit_total_mean).mean().detach().item(),
                     #"cnn_cls": accelerator.gather(cnn_loss_cls_mean).mean().detach().item(),
-                    "overlap_loss": accelerator.gather(overlap_loss_mean).mean().detach().item()
+                    "overlap_loss": accelerator.gather(overlap_loss_mean).mean().detach().item(),
+                    "loss_cls_with_te": accelerator.gather(loss_cls_with_te_mean).mean().detach().item(),
+                    "te_loss": accelerator.gather(te_loss_mean).mean().detach().item()
                 }
 
             else:
@@ -1396,7 +1429,9 @@ def main(args):
                     "attn_exp": accelerator.gather(attn_explicd_loss_mean).mean().detach().item(),
                     "cnn_cls": accelerator.gather(cnn_loss_cls_mean).mean().detach().item(),
                     "lgs_sim": accelerator.gather(logits_similarity_loss_mean).mean().detach().item(),
-                    "overlap_loss": accelerator.gather(overlap_loss_mean).mean().detach().item()
+                    "overlap_loss": accelerator.gather(overlap_loss_mean).mean().detach().item(),
+                    "loss_cls_with_te": accelerator.gather(loss_cls_with_te_mean).mean().detach().item(),
+                    "te_loss": accelerator.gather(te_loss_mean).mean().detach().item()
                 }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
@@ -1431,6 +1466,8 @@ def main(args):
 
                 imgs_for_explicid=prepare__imgs_for_explicid(raw_image, exp_val_transforms).to(device)
                 explicd_return_dict = explicid(imgs_for_explicid)
+                # cls_with_te_logits = explicd_return_dict["cls_with_te_logits"]
+                # cls_logits = explicd_return_dict["cls_logits"]
                 cls_logits = explicd_return_dict["cls_logits"]
                 critical_mask = explicd_return_dict["critical_mask"]
                 attention_weights = explicd_return_dict["attn_critical_weights"]
@@ -1525,8 +1562,8 @@ def main(args):
                             checkpoint_path = f"{checkpoint_dir_val_score_based}/Explicd_only/Muddled/Explicd_hilimsya_muddled.pt"
                         else:
                             checkpoint_path = f"{checkpoint_dir_val_score_based}/Explicd_only/Explicd_hilimsya.pt"
-                        if args.resume_step == 0:
-                            torch.save(checkpoint_val, checkpoint_path)
+                        # if args.resume_step == 0:
+                        #     torch.save(checkpoint_val, checkpoint_path)
                     explicid.eval()
                     explicid.zero_grad(set_to_none=True)
                     optimizer.eval()
@@ -1535,15 +1572,15 @@ def main(args):
                     print('Explicd Test Acc', f'{expl_scores["Acc"]:.3f}')
                     print('Explicd Test Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
                     print('Test f1 CNN critical', f'{expl_scores["cnn critical f1"]:.3f}')
-                    if epoch>7 and DO_MUDDLE_CHECK: 
-                        torch.save(tokens_and_gt,"tokens_and_ground_truths/explicd_tokens_and_gts_0")
+                    if epoch>7 and DO_MUDDLE_CHECK and epoch>args.cls_loss_epoch: 
+                        #torch.save(tokens_and_gt,"tokens_and_ground_truths/explicd_tokens_and_gts_0")
                         curve_of_f1.clear()
                         curve_of_BMAC.clear()
                         curve_of_f1.append(expl_scores["f1"])
                         curve_of_BMAC.append(expl_scores["BMAC"])
                         for muddle_severity_level in ['0_050','0_1','0_15','0_2']:
                             expl_scores, tokens_and_gt = validation(explicid, None, train_muddled_dataloaders[muddle_severity_level], exp_val_transforms, explicd_only=1, accelerator=accelerator)
-                            torch.save(tokens_and_gt,f"tokens_and_ground_truths/explicd_tokens_and_gts_{muddle_severity_level}")
+                            #torch.save(tokens_and_gt,f"tokens_and_ground_truths/explicd_tokens_and_gts_{muddle_severity_level}")
                             print('Muddle_Severity_Level ', muddle_severity_level)
                             print('Explicd Muddled f1', f'{expl_scores["f1"]:.3f}')
                             print('Explicd Muddled Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
@@ -1588,16 +1625,16 @@ def main(args):
                     print('Explicd Test Acc', f'{expl_scores["Acc"]:.3f}')
                     print('Explicd Test Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
                     print('Test f1 CNN critical', f'{expl_scores["cnn critical f1"]:.3f}')
-                    if epoch>7 and DO_MUDDLE_CHECK:  
-                        torch.save(tokens_and_gt,"tokens_and_ground_truths/sit_tokens_and_gts_0")
+                    if epoch>7 and DO_MUDDLE_CHECK and epoch>args.cls_loss_epoch:  
+                        #torch.save(tokens_and_gt,"tokens_and_ground_truths/sit_tokens_and_gts_0")
                         curve_of_f1.clear()
                         curve_of_BMAC.clear()
                         curve_of_f1.append(expl_scores["f1"])
                         curve_of_BMAC.append(expl_scores["BMAC"])
                         # ['0_025','0_050','0_075','0_1']
                         for muddle_severity_level in ['0_050','0_1','0_15','0_2']:
-                            expl_scores, sit_scores, expl_refined_scores, tokens_and_gt = validation(explicid, model, train_muddled_dataloaders[muddle_severity_level], exp_val_transforms, explicd_only=0, accelerator=accelerator)
-                            torch.save(tokens_and_gt,f"tokens_and_ground_truths/sit_tokens_and_gts_{muddle_severity_level}")
+                            expl_scores, tokens_and_gt = validation(explicid, model, train_muddled_dataloaders[muddle_severity_level], exp_val_transforms, explicd_only=0, accelerator=accelerator)
+                            #torch.save(tokens_and_gt,f"tokens_and_ground_truths/sit_tokens_and_gts_{muddle_severity_level}")
                             print('Muddle_Severity_Level ', muddle_severity_level)
                             print('Explicd Muddled f1', f'{expl_scores["f1"]:.3f}')
                             print('Explicd Muddled Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
@@ -1628,7 +1665,7 @@ def parse_args(input_args=None):
     parser.add_argument("--exp-name", type=str, required=True)
     parser.add_argument("--logging-dir", type=str, default="logs")
     parser.add_argument("--report-to", type=str, default="wandb")
-    parser.add_argument("--sampling-steps", type=int, default=10000)
+    parser.add_argument("--sampling-steps", type=int, default=80000)
     parser.add_argument("--resume-step", type=int, default=0)
 
     # model
@@ -1676,6 +1713,24 @@ def parse_args(input_args=None):
 
     # use the actual latent of the image
     parser.add_argument("--use-actual-latent", type=int, default=1)
+
+    # task
+    parser.add_argument("--task", type=str, choices=['ISIC', 'ISIC_MINE', 'ISIC_MINIMAL', 'ISIC_SOFT', 'IDRID', 'IDRID_EDEMA', 'BUSI', 'BUSI_SOFT'])
+
+    # concept hardness
+    parser.add_argument("--concept-hardness", type=str,  choices=["hard","soft_equal","soft_smarter"])
+
+    # cls loss not used intil
+    parser.add_argument("--cls-loss_epoch", type=int, default=7)
+
+    # ratio of trivial to critical tokens
+    parser.add_argument("--trivial-ratio", type=float, default=1.0)
+
+    # muddle check
+    parser.add_argument("--muddle-check", action="store_true")
+
+    # add gaussian noise to transform
+    parser.add_argument("--add-gaussian", action="store_true")
 
     # loss
     parser.add_argument("--path-type", type=str, default="linear", choices=["linear", "cosine"])

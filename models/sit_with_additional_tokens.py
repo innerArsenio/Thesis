@@ -380,7 +380,7 @@ class SiTBlock(nn.Module):
     """
     A SiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, task=None, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, task=None, trivial_ratio=0.5, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
 
@@ -442,14 +442,21 @@ class SiTBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 4 * hidden_size, bias=True)
         )
-        self.params = [nn.Parameter(torch.randn(1)) for _ in range(self.num_vis_tokens*2)]
+
+        self.trivial_ratio = trivial_ratio
+        self.params = [nn.Parameter(torch.randn(1)) for _ in range(self.num_vis_tokens+int(self.num_vis_tokens*self.trivial_ratio))]
         
         self.lesion_token = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, hidden_size, dtype=torch.float32)))
         self.dregs_token = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, hidden_size, dtype=torch.float32)))
 
-        self.latent_shift_msa = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
-        self.latent_scale_msa = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
-        self.latent_gate_msa = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
+        self.latent_shift = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
+        self.latent_scale = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
+
+        self.crit_shift = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
+        self.crit_scale = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
+
+        self.triv_shift = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
+        self.triv_scale = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
 
 
 
@@ -459,18 +466,18 @@ class SiTBlock(nn.Module):
         # )
 
         # x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        # T = x.shape[1] - self.num_vis_tokens*2
+        # T = x.shape[1] - self.num_vis_tokens
         # latent_tokens = x[:, :T, :]
         # visual_tokens_crit = x[:, T:T+self.num_vis_tokens, :]
-        # visual_tokens_trivial = x[:, T+self.num_vis_tokens:, :]
+        # #visual_tokens_trivial = x[:, T+self.num_vis_tokens:, :]
 
         # latent_tokens = latent_tokens + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm1(latent_tokens), shift_mlp, scale_mlp))
         # visual_tokens_crit = visual_tokens_crit + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(visual_tokens_crit), shift_mlp, scale_mlp))
-        # visual_tokens_trivial = visual_tokens_trivial + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm3(visual_tokens_trivial), shift_mlp, scale_mlp))
+        # #visual_tokens_trivial = visual_tokens_trivial + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm3(visual_tokens_trivial), shift_mlp, scale_mlp))
 
-        # #x = torch.cat([latent_tokens, visual_tokens_crit], dim=1)
-        # x = torch.cat([latent_tokens, visual_tokens_crit, visual_tokens_trivial], dim=1)
-
+        # x = torch.cat([latent_tokens, visual_tokens_crit], dim=1)
+        # #x = torch.cat([latent_tokens, visual_tokens_crit, visual_tokens_trivial], dim=1)
+        # return x
         ###########################################
 
         B = x.shape[0]
@@ -478,7 +485,7 @@ class SiTBlock(nn.Module):
         visual_tokens_crit = longer_visual_tokens[:, :self.num_vis_tokens, :]
         visual_tokens_trivial = longer_visual_tokens[:, self.num_vis_tokens:, :]
 
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+        shift_latent, scale_latent, shift_crit, scale_crit, shift_triv, scale_triv = (
             self.adaLN_modulation(y).chunk(6, dim=-1)
         )
 
@@ -486,17 +493,30 @@ class SiTBlock(nn.Module):
         visual_tokens_crit = self.proj_tokens(self.norm_crit(self.ffn_crit(visual_tokens_crit)))
         visual_tokens_trivial = self.proj_tokens(self.norm_trivial(self.ffn_trivial(visual_tokens_trivial)))
 
+        visual_tokens_crit =  modulate(self.norm2(visual_tokens_crit), shift_crit, scale_crit)
+        visual_tokens_trivial =  modulate(self.norm3(visual_tokens_trivial), shift_triv, scale_triv)
+
+        attn_critical_weights = attn_critical_weights/torch.max(attn_critical_weights, dim=-1, keepdim=True).values
+        attn_trivial_weights = attn_trivial_weights/torch.max(attn_trivial_weights, dim=-1, keepdim=True).values
+
         params_critical = torch.stack(self.params[:self.num_vis_tokens]).view(1, self.num_vis_tokens, 1).to(device=x.device)  # Shape (1, 7, 1)
-        params_trivial = torch.stack(self.params[self.num_vis_tokens:]).view(1, self.num_vis_tokens, 1).to(device=x.device)   # Shape (1, 7, 1)
+        params_trivial = torch.stack(self.params[self.num_vis_tokens:]).view(1, int(self.num_vis_tokens*self.trivial_ratio), 1).to(device=x.device)   # Shape (1, 7, 1)
     
         critical_contributions = (visual_tokens_crit.unsqueeze(2) * attn_critical_weights.unsqueeze(-1) * params_critical.unsqueeze(-1)).mean(dim=1)
         trivial_contributions = (visual_tokens_trivial.unsqueeze(2) * attn_trivial_weights.unsqueeze(-1) * params_trivial.unsqueeze(-1)).mean(dim=1)
 
-        latent_scale_msa = self.latent_scale_msa.repeat(B, 1)
-        latent_shift_msa = self.latent_shift_msa.repeat(B, 1)
+        # shift_latent = self.latent_shift.repeat(B, 1)
+        # scale_latent = self.latent_scale.repeat(B, 1)
 
-        latent_tokens = latent_scale_msa.unsqueeze(1)*latent_tokens + latent_shift_msa.unsqueeze(1) + critical_contributions + trivial_contributions
-        #latent_tokens = modulate(self.norm1(latent_tokens), shift_msa, scale_msa) + critical_contributions + trivial_contributions
+        # shift_crit = self.crit_shift.repeat(B, 1)
+        # scale_crit = self.crit_scale.repeat(B, 1)
+
+        # shift_triv = self.triv_shift.repeat(B, 1)
+        # scale_triv = self.triv_scale.repeat(B, 1)
+
+        #latent_tokens = shift_latent.unsqueeze(1)*latent_tokens + latent_shift_msa.unsqueeze(1) + critical_contributions + trivial_contributions
+        latent_tokens =  modulate(self.norm1(latent_tokens), shift_latent, scale_latent) +  critical_contributions + trivial_contributions
+        #latent_tokens = modulate(self.norm1(latent_tokens), shift_latent, scale_latent) + modulate(self.norm2(critical_contributions), shift_crit, scale_crit) + modulate(self.norm3(trivial_contributions), shift_triv, scale_triv) 
         x=latent_tokens
         return x
 
@@ -545,6 +565,7 @@ class SiT(nn.Module):
         task=None,
         denoise_patches=0,
         use_actual_latent_of_the_images=1,
+        trivial_ratio=0.5,
         **block_kwargs # fused_attn
     ):
         super().__init__()
@@ -561,6 +582,7 @@ class SiT(nn.Module):
         self.num_vis_tokens = NUM_OF_CRITERIA[self.task]
         self.denoise_patches = denoise_patches
         self.use_actual_latent_of_the_images = use_actual_latent_of_the_images
+        self.trivial_ratio = trivial_ratio
 
         self.x_embedder = PatchEmbed(
             input_size, patch_size, in_channels, hidden_size, bias=True
@@ -578,7 +600,7 @@ class SiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, task=self.task, **block_kwargs) for _ in range(depth)
+            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, task=self.task, trivial_ratio = self.trivial_ratio, **block_kwargs) for _ in range(depth)
         ])
         self.projectors = nn.ModuleList([
             build_mlp(hidden_size, projector_dim, z_dim) for z_dim in z_dims
@@ -725,6 +747,7 @@ class SiT(nn.Module):
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
 
         if highlight_the_critical_mask:
+            # fix thi
             x_critical_removed = x_pure*(torch.ones_like(x_pure)-critical_mask.view(N, T, 1)) + 0.001*torch.rand_like(x_pure)*critical_mask.view(N, T, 1)
             x_critical_removed = patchifyer_model.unpatchify_the_latent(x_critical_removed)
 
@@ -973,7 +996,7 @@ def SiT_L_8(**kwargs):
     return SiT(depth=24, hidden_size=1024, decoder_hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
 
 def SiT_B_2(**kwargs):
-    return SiT(depth=12, hidden_size=768, decoder_hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+    return SiT(depth=6, hidden_size=768, decoder_hidden_size=768, patch_size=1, num_heads=12, **kwargs)
 
 def SiT_B_2_patches(**kwargs):
     return SiT(depth=12, hidden_size=588, decoder_hidden_size=588, patch_size=2, num_heads=12, **kwargs)
