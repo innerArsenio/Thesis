@@ -59,21 +59,70 @@ CONCEPT_LABEL_MAP_ISIC_MINIMAL = [
             [6, 6, 6, 6, 6, 6, 6], # VASC
         ]
 
+# Actinic Keratoses, Basal Cell Carcinoma, Benign Keratosis-like Lesions, Dermatofibroma, Melanoma, Melanocytic Nevus, Vascular Lesions
 CONCEPT_LABEL_MAP_ISIC_SOFT_SMOOTH = [
     # Actinic Keratoses
-    [[0.7 , 0.3], [0.6, 0.4], [0.5, 0.5], [0.1, 0.9], [0.7, 0.3] , [0.7, 0.3]],
+    [[0.0, 0.0, 0.0, 0.85, 0.0, 0.15, 0.0],  # color: red, pink, or brown, often with a scale
+     [0.85, 0.1, 0.05, 0.0],  # shape: irregular
+     [0.75, 0.15, 0.1],  # border: often blurry and irregular
+     [0.0, 0.0, 0.0, 0.75, 0.15, 0.1, 0.0],  # dermoscopic patterns: strawberry pattern, glomerular vessels, scale
+     [0.0, 0.0, 0.0, 0.85, 0.15, 0.0],  # texture: rough, scaly
+     [0.85, 0.1, 0.05],  # symmetry: asymmetrical
+     [0.05, 0.1, 0.85, 0.0]],  # elevation: slightly raised, maybe thick
+
     # Basal Cell Carcinoma
-    [[0.5, 0.5], [0.4, 0.6], [0.6, 0.4], [0.2, 0.8], [0.3, 0.7] , [0.3, 0.7]],  
+    [[0.0, 0.0, 0.75, 0.15, 0.0, 0.0, 0.1],  # color: translucent, pearly white, sometimes with blue, brown, or black areas
+     [0.0, 0.85, 0.15, 0.0],  # shape: round
+     [0.05, 0.1, 0.85],  # border: rolled edges, often indistinct
+     [0.0, 0.0, 0.8, 0.15, 0.05, 0.0, 0.0],  # dermoscopic patterns: arborizing vessels, leaf-like areas, blue-gray nests
+     [0.0, 0.1, 0.85, 0.05, 0.0, 0.0],  # texture: smooth, possibly with telangiectasias
+     [0.05, 0.85, 0.1],  # symmetry: symmetrical
+     [0.05, 0.85, 0.1, 0.0]],  # elevation: raised with possible central ulceration
+
     # Benign Keratosis-like Lesions
-    [[0.8, 0.2], [0.7, 0.3], [0.6, 0.4], [0.2, 0.8], [0.8, 0.2] , [0.8, 0.2]],
+    [[0.0, 0.0, 0.0, 0.0, 0.9, 0.1, 0.0],  # color: light brown to black
+     [0.0, 0.3, 0.7, 0.0],  # shape: round to irregular
+     [0.05, 0.9, 0.05],  # border: sharp and well-defined
+     [0.0, 0.0, 0.0, 0.0, 0.85, 0.15, 0.0],  # dermoscopic patterns: cerebriform pattern, milia-like cysts, comedo-like openings
+     [0.0, 0.0, 0.0, 0.85, 0.15, 0.0],  # texture: warty or greasy surface
+     [0.05, 0.9, 0.05],  # symmetry: symmetrical
+     [0.05, 0.1, 0.85, 0.0]],  # elevation: slightly raised
+
     # Dermatofibroma
-    [[0.8, 0.2], [0.7, 0.3], [0.7, 0.3], [0.4, 0.6], [0.6, 0.4] , [0.6, 0.4]],
+    [[0.0, 0.0, 0.0, 0.0, 0.0, 0.9, 0.1],  # color: pink, brown, or red
+     [0.05, 0.1, 0.85, 0.0],  # shape: variable
+     [0.05, 0.85, 0.1],  # border: sharp and well-defined
+     [0.0, 0.0, 0.0, 0.0, 0.0, 0.85, 0.15],  # dermoscopic patterns: central white patch, peripheral pigment network
+     [0.0, 0.0, 0.0, 0.0, 0.0, 0.85],  # texture: firm, may dimple when pinched
+     [0.05, 0.05, 0.9],  # symmetry: can be symmetrical or asymmetrical
+     [0.05, 0.05, 0.9, 0.0]],  # elevation: slightly raised
+
     # Melanoma
-    [[0.1, 0.9], [0.1, 0.9], [0.1, 0.9], [0.3, 0.7], [0.5, 0.5] , [0.4, 0.6]], 
+    [[0.9, 0.05, 0.0, 0.05, 0.0, 0.0, 0.0],  # color: highly variable, often with multiple colors
+     [0.9, 0.05, 0.05, 0.0],  # shape: irregular
+     [0.9, 0.05, 0.05],  # border: often blurry and irregular
+     [0.9, 0.05, 0.05, 0.0, 0.0, 0.0, 0.0],  # dermoscopic patterns: atypical pigment network, irregular streaks, blue-whitish veil
+     [0.9, 0.05, 0.05, 0.0, 0.0, 0.0],  # texture: a raised or ulcerated surface
+     [0.9, 0.05, 0.05],  # symmetry: asymmetrical
+     [0.9, 0.05, 0.05, 0.0]],  # elevation: flat to raised
+
     # Melanocytic Nevus
-    [[0.7, 0.3], [0.7, 0.3], [0.6, 0.4], [0.8, 0.2], [0.8, 0.2] , [0.2, 0.8]],
+    [[0.0, 0.85, 0.0, 0.0, 0.1, 0.05, 0.0],  # color: uniformly tan, brown, or black
+     [0.05, 0.9, 0.05, 0.0],  # shape: round
+     [0.05, 0.9, 0.05],  # border: sharp and well-defined
+     [0.0, 0.85, 0.1, 0.05, 0.0, 0.0, 0.0],  # dermoscopic patterns: regular pigment network, symmetric dots and globules
+     [0.0, 0.9, 0.1, 0.0, 0.0, 0.0],  # texture: smooth
+     [0.1, 0.85, 0.05],  # symmetry: symmetrical
+     [0.05, 0.1, 0.85, 0.0]],  # elevation: slightly raised
+
     # Vascular Lesions
-    [[0.8, 0.2], [0.7, 0.3], [0.7, 0.3], [0.6, 0.4], [0.1, 0.9] , [0.6, 0.4]]
+    [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],  # color: red, purple, or blue
+     [0.05, 0.1, 0.85, 0.0],  # shape: variable
+     [0.05, 0.9, 0.05],  # border: sharp and well-defined
+     [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],  # dermoscopic patterns: depends on type (e.g., cherry angiomas have red lacunae)
+     [0.0, 0.9, 0.1, 0.0, 0.0, 0.0],  # texture: smooth
+     [0.05, 0.9, 0.05],  # symmetry: symmetrical
+     [0.05, 0.1, 0.85, 0.0]],  # elevation: slightly raised
 ]
 
 CONCEPT_LABEL_MAP_BUSI_SOFT_SMOOTH = [
@@ -237,7 +286,8 @@ class SILoss:
             task = None,
             do_logits_similarity=True,
             concept_hardness="soft_equal",
-            cls_loss_epoch=0
+            cls_loss_epoch=0,
+            noise_to_crit_map_only = False
             ):
         self.prediction = prediction
         self.weighting = weighting
@@ -255,6 +305,7 @@ class SILoss:
         self.do_logits_similarity=do_logits_similarity
         self.concept_hardness=concept_hardness
         self.cls_loss_epoch=cls_loss_epoch
+        self.noise_to_crit_map_only = noise_to_crit_map_only
         
 
     def interpolant(self, t):
@@ -273,7 +324,7 @@ class SILoss:
 
         return alpha_t, sigma_t, d_alpha_t, d_sigma_t
 
-    def __call__(self, model, images, latent_raw_image, model_kwargs=None, zs=None, labels=None, explicid=None, explicid_imgs_list= None, epoch=None,  explicd_only=0, do_sit=False, do_pretraining_the_patchifyer=False, patchifyer_model=None, denoise_patches=0, use_actual_latent_of_the_images=0):
+    def __call__(self, model, images, latent_raw_image, model_kwargs=None, zs=None, labels=None, explicid=None, explicid_imgs_list= None, epoch=None,  explicd_only=0, do_sit=False, do_pretraining_the_patchifyer=False, patchifyer_model=None, denoise_patches=0, use_actual_latent_of_the_images=0, explicid_imgs_wo_norm_list=None):
         if model_kwargs == None:
             model_kwargs = {}
         # sample timesteps
@@ -291,6 +342,7 @@ class SILoss:
         time_input = time_input.to(device=images.device, dtype=images.dtype)
         noises = torch.randn_like(images)
         alpha_t, sigma_t, d_alpha_t, d_sigma_t = self.interpolant(time_input)
+        use_te_loss=False
         #print(f"images shape: {images.shape}")
         # if use_actual_latent_of_the_images==0:
         #     model_input = alpha_t * images + sigma_t * noises
@@ -313,18 +365,18 @@ class SILoss:
         loss_cls_with_te = torch.tensor(0.0, device=images.device)
         te_loss = torch.tensor(0.0, device=images.device)
         sigmas_for_losses = {}
-        for imgs_indx, explicid_imgs in enumerate(explicid_imgs_list):
+        for imgs_indx, (explicid_imgs,explicid_imgs_wo_norm)  in enumerate(zip(explicid_imgs_list,explicid_imgs_wo_norm_list)):
             # if do_pretraining_the_patchifyer:
             #     model_output = model(model_input)
             #     processing_loss = mean_flat((model_output - model_target) ** 2)
             #     return processing_loss, [torch.tensor(0.0, device=images.device)]*15
-            with torch.no_grad():
-                explicid_imgs_latents=patchifyer_model.patchify_the_latent(latent_raw_image)
-            explicd_return_dict = explicid(explicid_imgs, explicid_imgs_latents=explicid_imgs_latents)
+            # with torch.no_grad():
+            #     explicid_imgs_latents=patchifyer_model.patchify_the_latent(latent_raw_image)
+            explicd_return_dict = explicid(explicid_imgs, explicid_imgs_latents=None, imgs_wo_norm=None)
             patches = explicd_return_dict["patches"]
             cls_logits = explicd_return_dict["cls_logits"]
             cls_with_te_logits = explicd_return_dict["cls_with_te_logits"]
-            te_loss = explicd_return_dict["te_loss"]
+            te_loss = 0*explicd_return_dict["te_loss"]
             image_logits_dict = explicd_return_dict["image_logits_dict"]
             agg_critical_tokens = explicd_return_dict["agg_critical_visual_tokens_for_SiT"]
             agg_trivial_tokens = explicd_return_dict["agg_trivial_visual_tokens_for_SiT"]
@@ -340,7 +392,9 @@ class SILoss:
             critical_mask = explicd_return_dict["critical_mask"]
             trivial_mask = explicd_return_dict["trivial_mask"]
 
-            normalized_attention = attn_critical_weights / attn_critical_weights.max(dim=1, keepdim=True).values
+            #attn_critical_weights_int = attn_critical_weights[:,0,:].unsqueeze(1)
+            attn_critical_weights_int = attn_critical_weights
+            normalized_attention = attn_critical_weights_int / attn_critical_weights_int.max(dim=-1, keepdim=True).values
             summed_attention = normalized_attention.sum(dim=1)
             clipped_attention = torch.clamp(summed_attention, min=0.0, max=1.0)
             B, T, D = vit_l_output.shape  # B: batch size, T: num_patches (256), D: patch_dim (1024)
@@ -348,7 +402,14 @@ class SILoss:
             clipped_attention = clipped_attention.view(B, H, W)
             clipped_attention = clipped_attention.unsqueeze(1)
 
-            images = images*clipped_attention
+            if torch.isnan(te_loss):
+                te_loss = torch.tensor(0.0).to(device=images.device)
+
+            if self.noise_to_crit_map_only:
+                #print(f"clipped_attention shape: {clipped_attention.shape}")
+                #print(f"images shape: {images.shape}")
+                images = images*clipped_attention
+                #print(f"images shape after multiplication: {images.shape}")
 
 
             if use_actual_latent_of_the_images==0:
@@ -367,12 +428,48 @@ class SILoss:
                 attn_explicd_loss+=attn_explicd_loss_dict["black_crit_loss"]
                 #print(f"labels shape: {labels.shape}")
                 # Check if each element is in {2, 3, 4}
-                # mask = torch.isin(labels, torch.tensor([2, 3, 4],device=images.device))
-                # # Set the values to 1 if in {2, 3, 4}, else set to 0
-                # tensor_viable = mask.int().to(device=images.device).unsqueeze(1).unsqueeze(2)
-                # #print(f"tensor_viable shape: {tensor_viable.shape}")
+                mask = torch.isin(labels, torch.tensor([2, 3, 4],device=images.device))
+                # # Set the values to 1 if in {2, 3, 4}, else set to 0 
+                tensor_viable = mask.int().to(device=images.device).unsqueeze(1).unsqueeze(2)
+                # #print(f"tensor_viable shape: {tensor_viable.shape}") 
                 # #print(f"attn_explicd_loss_dict['color_loss'] shape: {attn_explicd_loss_dict["color_loss"].shape}")
-                # pppp = torch.mean(tensor_viable*attn_explicd_loss_dict["color_loss"])
+                #attn_explicd_loss+=torch.mean(tensor_viable*attn_explicd_loss_dict["color_loss"])
+
+                #attn_explicd_loss+=0.5*attn_explicd_loss_dict["smooth_loss"]*10e9
+                attn_explicd_loss+=attn_explicd_loss_dict["overlap_loss"]*10e3
+            elif self.task =="ISIC":
+                attn_explicd_loss+=attn_explicd_loss_dict["var_loss"]*10e7
+                attn_explicd_loss+=0.5*attn_explicd_loss_dict["smooth_loss"]*10e9
+                attn_explicd_loss+=attn_explicd_loss_dict["overlap_loss"]*10e3
+
+                # mask = torch.isin(labels, torch.tensor([5],device=images.device))
+                # tensor_viable = mask.int().to(device=images.device).unsqueeze(1).unsqueeze(2)
+                # attn_explicd_loss+=0*torch.mean(tensor_viable*attn_explicd_loss_dict["color_loss"])
+
+                attn_explicd_loss+=torch.mean(attn_explicd_loss_dict["color_loss"])
+                
+                #lesion_labels = F.one_hot(labels, num_classes=len(self.concept_label_map)).unsqueeze(-1)
+                #M = attn_explicd_loss_dict['masks'] * lesion_labels  # Element-wise selection (B, 7, 256)
+                #M_combined = M.sum(dim=1)  # Reduce to (B, 256) by summing over active classes
+                #attn_explicd_loss+= F.mse_loss(attn_explicd_loss_dict["crit_dot"][:, 0], M_combined)  # Ensure 1st token matches lesion-relevant patches
+                #attn_explicd_loss+= F.mse_loss(normalized_attention[:, 0, :], M_combined)  # Ensure 1st token matches lesion-relevant patches
+                #attn_explicd_loss+=10*attn_explicd_loss_dict["var_loss_other"]
+                #attn_explicd_loss*=10
+                #attn_explicd_loss*=0
+
+                attention_maps_norm = F.normalize(attn_critical_weights, p=2, dim=-1)
+                
+                # Compute the pairwise cosine similarity between all attention maps
+                cosine_sim = torch.bmm(attention_maps_norm, attention_maps_norm.transpose(1, 2))
+                
+                # Create a mask to ignore the diagonal (self-similarity), since we don't want the map to compare to itself
+                mask = torch.eye(attn_critical_weights.size(1), device=images.device).unsqueeze(0)  # Shape (B, N_c, N_c)
+                
+                # Apply the mask (we'll set diagonal values to -1 so they are ignored in the loss calculation)
+                cosine_sim = cosine_sim.masked_fill(mask == 1, -1)
+
+                # Now, calculate the loss as the negative average cosine similarity between all pairs
+                #attn_explicd_loss = 10*(1 - cosine_sim.mean())
             if explicd_only==0:
                 ##################  Option use trivial tokens too
                 agg_visual_tokens = torch.cat((agg_critical_tokens, agg_trivial_tokens), dim=1)
@@ -401,18 +498,21 @@ class SILoss:
                 elif self.task =="ISIC_SOFT":
                     concept_label = [self.concept_label_map[label] for label in labels]
                     concept_label_smooth_dict = {
-                        'asymmetry': torch.tensor([inner_list[0] for inner_list in concept_label]).cuda(),
-                        'border': torch.tensor([inner_list[1] for inner_list in concept_label]).cuda(),
-                        'color': torch.tensor([inner_list[2] for inner_list in concept_label]).cuda(),
-                        'surface texture': torch.tensor([inner_list[3] for inner_list in concept_label]).cuda(),
-                        'vascular patterns': torch.tensor([inner_list[4] for inner_list in concept_label]).cuda(),
-                        'elevation': torch.tensor([inner_list[5] for inner_list in concept_label]).cuda()
+                        'color': torch.tensor([inner_list[0] for inner_list in concept_label]).cuda(),
+                        'shape': torch.tensor([inner_list[1] for inner_list in concept_label]).cuda(),
+                        'border': torch.tensor([inner_list[2] for inner_list in concept_label]).cuda(),
+                        'dermoscopic patterns': torch.tensor([inner_list[3] for inner_list in concept_label]).cuda(),
+                        'texture': torch.tensor([inner_list[4] for inner_list in concept_label]).cuda(),
+                        'symmetry': torch.tensor([inner_list[5] for inner_list in concept_label]).cuda(),
+                        'elevation': torch.tensor([inner_list[6] for inner_list in concept_label]).cuda()
                     }
+
 
             loss_cls = self.cls_criterion(cls_logits, labels)
             #print(f"cls_logits shape: {cls_logits.shape}")
             #print(f"cls_with_te_logits shape: {cls_with_te_logits.shape}")
-            #loss_cls_with_te = self.cls_criterion(cls_with_te_logits, labels)
+            if use_te_loss:
+                loss_cls_with_te = self.cls_criterion(cls_with_te_logits, labels)
             doing_cnn_critical=False
             doing_cnn_trivial=False
             cnn_critical_loss_cls, cnn_trivial_loss_cls, cnn_logits_similarity_loss = [torch.tensor(0.0, device=images.device)]*3
@@ -436,20 +536,23 @@ class SILoss:
                 #print("hard concept hardness is used")
                 for key in explicid.concept_token_dict.keys():
                     ###################################### Option simple CE
-                    #image_concept_loss = F.cross_entropy(image_logits_dict[key], concept_label[:, idx])
+                    image_concept_loss = F.cross_entropy(image_logits_dict[key], concept_label[:, idx])
                     ###################################### Option weighted CE
-                    image_concept_loss = F.cross_entropy(image_logits_dict[key], concept_label[:, idx], weight=torch.FloatTensor(CONCEPT_CE_WEIGHTS[self.task][key]).cuda())
+                    #image_concept_loss = F.cross_entropy(image_logits_dict[key], concept_label[:, idx], weight=torch.FloatTensor(CONCEPT_CE_WEIGHTS[self.task][key]).cuda())
                     ######################################
                     loss_concepts += image_concept_loss
                     idx += 1
             elif self.concept_hardness=="soft_equal":
                 for key in explicid.concept_token_dict.keys():
-                    predicted_probs = F.softmax(image_logits_dict[key], dim=1)
-                    num_classes = image_logits_dict[key].shape[1]
-                    one_hot_labels = torch.zeros((image_logits_dict[key].shape[0], num_classes), device=images.device)  # Initialize tensor of zeros
-                    one_hot_labels.scatter_(1, concept_label[:, idx].unsqueeze(1), 1)  # Create one-hot encoding
-                    soft_labels = label_smoothing(one_hot_labels, epsilon=0.1)
-                    image_concept_loss = F.kl_div(torch.log(predicted_probs), soft_labels, reduction='batchmean')
+                    if key=="color" or key=="symmetry":
+                        image_concept_loss = F.cross_entropy(image_logits_dict[key], concept_label[:, idx])
+                    else:
+                        predicted_probs = F.softmax(image_logits_dict[key], dim=1)
+                        num_classes = image_logits_dict[key].shape[1]
+                        one_hot_labels = torch.zeros((image_logits_dict[key].shape[0], num_classes), device=images.device)  # Initialize tensor of zeros
+                        one_hot_labels.scatter_(1, concept_label[:, idx].unsqueeze(1), 1)  # Create one-hot encoding
+                        soft_labels = label_smoothing(one_hot_labels, epsilon=0.1)
+                        image_concept_loss = F.kl_div(torch.log(predicted_probs), soft_labels, reduction='batchmean')
 
                     ###############   Option use CE
                     #log_probs = F.log_softmax(image_logits_dict[key], dim=1)  # Compute log probabilities
@@ -464,6 +567,7 @@ class SILoss:
             elif self.concept_hardness=="soft_smarter":
                 for key in explicid.concept_token_dict.keys():
                     predicted_probs = F.log_softmax(image_logits_dict[key], dim=1)  # Log probabilities for KL Divergence
+                    loss_concepts += F.kl_div(predicted_probs,  concept_label_smooth_dict[key], reduction='batchmean')
                     # print(image_logits_dict[key])
                     # print()
                     # print(concept_label_smooth_dict[key])
@@ -472,11 +576,14 @@ class SILoss:
                     #print("=====")
                     #print(F.kl_div(predicted_probs,  concept_label_smooth_dict[key], reduction='none').mean(dim=-1))
                     #print(torch.FloatTensor(CE_WEIGHTS[self.task]).cuda()[labels])
-                    loss_concepts += (F.kl_div(predicted_probs,  concept_label_smooth_dict[key], reduction='none').mean(dim=-1)*torch.FloatTensor(CE_WEIGHTS[self.task]).cuda()[labels]).mean()*100  # Reduction is batchmean for proper scaling
+                    #loss_concepts += (F.kl_div(predicted_probs,  concept_label_smooth_dict[key], reduction='none').mean(dim=-1)*torch.FloatTensor(CE_WEIGHTS[self.task]).cuda()[labels]).mean()*100  # Reduction is batchmean for proper scaling
                     idx += 1
             if epoch>=self.cls_loss_epoch:
                 #################################### Option use loss_cls and loss_concepts
-                explicid_loss += loss_cls + loss_concepts / idx
+                if use_te_loss:
+                    explicid_loss += loss_cls_with_te + loss_concepts / idx
+                else:
+                    explicid_loss += loss_cls + loss_concepts / idx
                 #################################### Option use loss_cls only
                 #explicid_loss += loss_cls
                 #print(explicid_loss)
@@ -484,6 +591,7 @@ class SILoss:
                 explicid_loss += loss_cls + logits_similarity_loss+ loss_concepts / idx 
             else:
                 explicid_loss += loss_concepts
+                loss_cls_with_te*=0
 
             # if epoch>2:
             #     attn_explicd_loss+=overlap_loss/100
@@ -511,7 +619,10 @@ class SILoss:
                     #processing_loss = mean_flat((model_input_pure_processed - model_target) ** 2)
                     processing_loss  = torch.tensor(0.0, device=images.device)
                     if denoise_patches==0:
-                        denoising_loss = mean_flat((model_output - model_target) ** 2)
+                        if self.noise_to_crit_map_only:
+                            denoising_loss = mean_flat( ((model_output - model_target)*clipped_attention) ** 2)
+                        else:
+                            denoising_loss = mean_flat((model_output - model_target) ** 2)
                     elif denoise_patches==1:
                         denoising_loss = mean_flat((patches_output - patches) ** 2)
                     proj_loss_current = torch.tensor(0.0, device=images.device)

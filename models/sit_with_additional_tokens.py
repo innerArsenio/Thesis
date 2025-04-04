@@ -19,7 +19,7 @@ NUM_OF_CRITERIA = {
     'ISIC': 7,
     'ISIC_MINE': 6,
     'ISIC_MINIMAL': 7,
-    'ISIC_SOFT': 6,
+    'ISIC_SOFT': 7,
 
     'IDRID': 5,
     'IDRID_EDEMA': 6,
@@ -380,7 +380,7 @@ class SiTBlock(nn.Module):
     """
     A SiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, task=None, trivial_ratio=0.5, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, task=None, trivial_ratio=0.5, noise_to_crit_map_only=False, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
 
@@ -394,6 +394,7 @@ class SiTBlock(nn.Module):
         self.cross_attn_vit_output_to_latent = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_heads, batch_first=True)
         self.task = task
         self.num_vis_tokens = NUM_OF_CRITERIA[self.task]
+        self.noise_to_crit_map_only = noise_to_crit_map_only
         
         if "fused_attn" in block_kwargs.keys():
             self.attn.fused_attn = block_kwargs["fused_attn"]
@@ -461,24 +462,6 @@ class SiTBlock(nn.Module):
 
 
     def forward(self, x, longer_visual_tokens, critical_mask, attn_critical_weights, attn_trivial_weights, vit_l_output, y, use_actual_latent_of_the_images):
-        # shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-        #     self.adaLN_modulation(y).chunk(6, dim=-1)
-        # )
-
-        # x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        # T = x.shape[1] - self.num_vis_tokens
-        # latent_tokens = x[:, :T, :]
-        # visual_tokens_crit = x[:, T:T+self.num_vis_tokens, :]
-        # #visual_tokens_trivial = x[:, T+self.num_vis_tokens:, :]
-
-        # latent_tokens = latent_tokens + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm1(latent_tokens), shift_mlp, scale_mlp))
-        # visual_tokens_crit = visual_tokens_crit + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(visual_tokens_crit), shift_mlp, scale_mlp))
-        # #visual_tokens_trivial = visual_tokens_trivial + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm3(visual_tokens_trivial), shift_mlp, scale_mlp))
-
-        # x = torch.cat([latent_tokens, visual_tokens_crit], dim=1)
-        # #x = torch.cat([latent_tokens, visual_tokens_crit, visual_tokens_trivial], dim=1)
-        # return x
-        ###########################################
 
         B = x.shape[0]
         latent_tokens = x
@@ -491,19 +474,31 @@ class SiTBlock(nn.Module):
 
 
         visual_tokens_crit = self.proj_tokens(self.norm_crit(self.ffn_crit(visual_tokens_crit)))
-        visual_tokens_trivial = self.proj_tokens(self.norm_trivial(self.ffn_trivial(visual_tokens_trivial)))
+
+        if not self.noise_to_crit_map_only:
+            visual_tokens_trivial = self.proj_tokens(self.norm_trivial(self.ffn_trivial(visual_tokens_trivial)))
 
         visual_tokens_crit =  modulate(self.norm2(visual_tokens_crit), shift_crit, scale_crit)
-        visual_tokens_trivial =  modulate(self.norm3(visual_tokens_trivial), shift_triv, scale_triv)
+
+        if not self.noise_to_crit_map_only:
+            visual_tokens_trivial =  modulate(self.norm3(visual_tokens_trivial), shift_triv, scale_triv)
 
         attn_critical_weights = attn_critical_weights/torch.max(attn_critical_weights, dim=-1, keepdim=True).values
-        attn_trivial_weights = attn_trivial_weights/torch.max(attn_trivial_weights, dim=-1, keepdim=True).values
+
+        if not self.noise_to_crit_map_only:
+            attn_trivial_weights = attn_trivial_weights/torch.max(attn_trivial_weights, dim=-1, keepdim=True).values
 
         params_critical = torch.stack(self.params[:self.num_vis_tokens]).view(1, self.num_vis_tokens, 1).to(device=x.device)  # Shape (1, 7, 1)
-        params_trivial = torch.stack(self.params[self.num_vis_tokens:]).view(1, int(self.num_vis_tokens*self.trivial_ratio), 1).to(device=x.device)   # Shape (1, 7, 1)
+
+        if not self.noise_to_crit_map_only:
+            params_trivial = torch.stack(self.params[self.num_vis_tokens:]).view(1, int(self.num_vis_tokens*self.trivial_ratio), 1).to(device=x.device)   # Shape (1, 7, 1)
     
-        critical_contributions = (visual_tokens_crit.unsqueeze(2) * attn_critical_weights.unsqueeze(-1) * params_critical.unsqueeze(-1)).mean(dim=1)
-        trivial_contributions = (visual_tokens_trivial.unsqueeze(2) * attn_trivial_weights.unsqueeze(-1) * params_trivial.unsqueeze(-1)).mean(dim=1)
+        critical_contributions_all = (visual_tokens_crit.unsqueeze(2) * attn_critical_weights.unsqueeze(-1) * params_critical.unsqueeze(-1))
+        #critical_contributions_all[:, 1:, :] = 0
+        critical_contributions = critical_contributions_all.mean(dim=1)
+
+        if not self.noise_to_crit_map_only:
+            trivial_contributions = (visual_tokens_trivial.unsqueeze(2) * attn_trivial_weights.unsqueeze(-1) * params_trivial.unsqueeze(-1)).mean(dim=1)
 
         # shift_latent = self.latent_shift.repeat(B, 1)
         # scale_latent = self.latent_scale.repeat(B, 1)
@@ -515,7 +510,10 @@ class SiTBlock(nn.Module):
         # scale_triv = self.triv_scale.repeat(B, 1)
 
         #latent_tokens = shift_latent.unsqueeze(1)*latent_tokens + latent_shift_msa.unsqueeze(1) + critical_contributions + trivial_contributions
-        latent_tokens =  modulate(self.norm1(latent_tokens), shift_latent, scale_latent) +  critical_contributions + trivial_contributions
+        if not self.noise_to_crit_map_only:
+            latent_tokens =  modulate(self.norm1(latent_tokens), shift_latent, scale_latent) +  critical_contributions + trivial_contributions
+        else:
+            latent_tokens = modulate(self.norm1(latent_tokens), shift_latent, scale_latent) +  critical_contributions
         #latent_tokens = modulate(self.norm1(latent_tokens), shift_latent, scale_latent) + modulate(self.norm2(critical_contributions), shift_crit, scale_crit) + modulate(self.norm3(trivial_contributions), shift_triv, scale_triv) 
         x=latent_tokens
         return x
@@ -566,6 +564,7 @@ class SiT(nn.Module):
         denoise_patches=0,
         use_actual_latent_of_the_images=1,
         trivial_ratio=0.5,
+        noise_to_crit_map_only=False,
         **block_kwargs # fused_attn
     ):
         super().__init__()
@@ -583,6 +582,7 @@ class SiT(nn.Module):
         self.denoise_patches = denoise_patches
         self.use_actual_latent_of_the_images = use_actual_latent_of_the_images
         self.trivial_ratio = trivial_ratio
+        self.noise_to_crit_map_only = noise_to_crit_map_only
 
         self.x_embedder = PatchEmbed(
             input_size, patch_size, in_channels, hidden_size, bias=True
@@ -600,7 +600,7 @@ class SiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, task=self.task, trivial_ratio = self.trivial_ratio, **block_kwargs) for _ in range(depth)
+            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, task=self.task, trivial_ratio = self.trivial_ratio, noise_to_crit_map_only=self.noise_to_crit_map_only, **block_kwargs) for _ in range(depth)
         ])
         self.projectors = nn.ModuleList([
             build_mlp(hidden_size, projector_dim, z_dim) for z_dim in z_dims
@@ -622,10 +622,6 @@ class SiT(nn.Module):
         self.sit_attn_sigma = torch.nn.Parameter(torch.ones(1))
         self.cross_attn_between_patches = nn.MultiheadAttention(embed_dim=768, num_heads=16, batch_first=True)
         self.cross_attn_in_patches = nn.MultiheadAttention(embed_dim=768, num_heads=16, batch_first=True)
-        self.patchifyer_model = SiT_Patch_and_Unpatchifier(input_size=input_size, num_classes=num_classes, use_cfg = use_cfg, z_dims = z_dims, encoder_depth=encoder_depth, task = task,**block_kwargs)
-        self.patchifyer_model.load_state_dict(torch.load("/home/arsen.abzhanov/Downloads/BioMedia/Thesis/REPA/checkpoints_fr/ISIC/SiT/patchifyer_model.pt")["patchifyer_model"])
-        for param in self.patchifyer_model.parameters():
-            param.requires_grad = False
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -996,7 +992,7 @@ def SiT_L_8(**kwargs):
     return SiT(depth=24, hidden_size=1024, decoder_hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
 
 def SiT_B_2(**kwargs):
-    return SiT(depth=6, hidden_size=768, decoder_hidden_size=768, patch_size=1, num_heads=12, **kwargs)
+    return SiT(depth=9, hidden_size=768, decoder_hidden_size=768, patch_size=1, num_heads=12, **kwargs)
 
 def SiT_B_2_patches(**kwargs):
     return SiT(depth=12, hidden_size=588, decoder_hidden_size=588, patch_size=2, num_heads=12, **kwargs)
