@@ -22,7 +22,9 @@ NUM_OF_CRITERIA = {
     'ISIC_SOFT': 7,
 
     'IDRID': 5,
+    'IDRID_SOFT': 7,
     'IDRID_EDEMA': 6,
+    'IDRID_EDEMA_SOFT': 4,
 
     'BUSI': 6,
     'BUSI_SOFT': 6
@@ -689,7 +691,7 @@ class SiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
     
-    def forward(self, x, x_pure, x_target,t, y, 
+    def forward(self, x,t, y, 
                 concept_label, 
                 image_embeddings, cls_logits, return_logvar=False,  con_on_explicd_pred=True,
                 attn_critical_weights=None, 
@@ -699,7 +701,6 @@ class SiT(nn.Module):
                 explicid_imgs_noisy_input=None,
                 critical_mask = None, 
                 trivial_mask = None,
-                patchifyer_model=None,
                 highlight_the_critical_mask=False,
                 patches = None):
         """
@@ -708,7 +709,6 @@ class SiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-        x_pure = patchifyer_model.patchify_the_latent(x_pure)
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t_embed = self.t_embedder(t)                   # (N, D)
         # y = self.y_embedder(y, self.training)    # (N, D)
@@ -742,12 +742,7 @@ class SiT(nn.Module):
         x = self.final_layer(x)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
 
-        if highlight_the_critical_mask:
-            # fix thi
-            x_critical_removed = x_pure*(torch.ones_like(x_pure)-critical_mask.view(N, T, 1)) + 0.001*torch.rand_like(x_pure)*critical_mask.view(N, T, 1)
-            x_critical_removed = patchifyer_model.unpatchify_the_latent(x_critical_removed)
 
-        x_pure=patchifyer_model.unpatchify_the_latent(x_pure)
         
         
 
@@ -760,9 +755,9 @@ class SiT(nn.Module):
         }
 
         if highlight_the_critical_mask:
-            return patches, x, x_pure, x_critical_removed
+            return patches, x
         else:
-            return patches, x, x_pure, zs, attn_map_loss_sit_total, sigmas_for_losses
+            return patches, x, zs, attn_map_loss_sit_total, sigmas_for_losses
 
 ########################################################################################
 ########################################################################################
@@ -992,7 +987,7 @@ def SiT_L_8(**kwargs):
     return SiT(depth=24, hidden_size=1024, decoder_hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
 
 def SiT_B_2(**kwargs):
-    return SiT(depth=9, hidden_size=768, decoder_hidden_size=768, patch_size=1, num_heads=12, **kwargs)
+    return SiT(depth=7, hidden_size=768, decoder_hidden_size=768, patch_size=1, num_heads=12, **kwargs)
 
 def SiT_B_2_patches(**kwargs):
     return SiT(depth=12, hidden_size=588, decoder_hidden_size=588, patch_size=2, num_heads=12, **kwargs)

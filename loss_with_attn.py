@@ -147,6 +147,53 @@ CONCEPT_LABEL_MAP_IDRID = [
     [3, 3, 3, 1, 3], 
 ]
 
+CONCEPT_LABEL_MAP_IDRID_SOFT = [
+    # No apparent DR
+    [[1.0, 0.0, 0.0, 0.0, 0.0],  # Hemorrhages
+     [1.0, 0.0, 0.0, 0.0, 0.0],  # Microaneurysms
+     [1.0, 0.0, 0.0, 0.0, 0.0],  # Exudates
+     [1.0, 0.0, 0.0],            # Neovascularization (3 values)
+     [1.0, 0.0, 0.0],            # Venous Beading (3 values)
+     [1.0, 0.0, 0.0, 0.0],       # Cotton Wool Spots (4 values)
+     [1.0, 0.0, 0.0, 0.0, 0.0]], # Macular Edema
+    
+    # Mild Non-Proliferative DR
+    [[0.1, 0.9, 0.0, 0.0, 0.0],  # Hemorrhages
+     [0.1, 0.9, 0.0, 0.0, 0.0],  # Microaneurysms
+     [0.8, 0.2, 0.0, 0.0, 0.0],  # Exudates
+     [1.0, 0.0, 0.0],            # Neovascularization
+     [1.0, 0.0, 0.0],            # Venous Beading
+     [1.0, 0.0, 0.0, 0.0],       # Cotton Wool Spots
+     [0.8, 0.2, 0.0, 0.0, 0.0]], # Macular Edema
+
+    # Moderate Non-Proliferative DR
+    [[0.0, 0.2, 0.8, 0.0, 0.0],  # Hemorrhages
+     [0.0, 0.2, 0.8, 0.0, 0.0],  # Microaneurysms
+     [0.0, 0.3, 0.7, 0.0, 0.0],  # Exudates
+     [1.0, 0.0, 0.0],            # Neovascularization
+     [0.7, 0.3, 0.0],            # Venous Beading
+     [0.8, 0.2, 0.0, 0.0],       # Cotton Wool Spots
+     [0.0, 0.2, 0.8, 0.0, 0.0]], # Macular Edema
+
+    # Severe Non-Proliferative DR
+    [[0.0, 0.0, 0.3, 0.7, 0.0],  # Hemorrhages
+     [0.0, 0.0, 0.3, 0.7, 0.0],  # Microaneurysms
+     [0.0, 0.0, 0.5, 0.5, 0.0],  # Exudates
+     [0.0, 1.0, 0.0],            # Neovascularization
+     [0.0, 0.2, 0.8],            # Venous Beading
+     [0.0, 0.4, 0.6, 0.0],       # Cotton Wool Spots
+     [0.0, 0.0, 0.2, 0.8, 0.0]], # Macular Edema
+
+    # Proliferative DR
+    [[0.0, 0.0, 0.0, 0.3, 0.7],  # Hemorrhages
+     [0.0, 0.0, 0.0, 0.3, 0.7],  # Microaneurysms
+     [0.0, 0.0, 0.0, 0.4, 0.6],  # Exudates
+     [0.0, 0.2, 0.8],            # Neovascularization
+     [0.0, 0.3, 0.7],            # Venous Beading
+     [0.0, 0.0, 0.3, 0.7],       # Cotton Wool Spots
+     [0.0, 0.0, 0.0, 0.2, 0.8]]  # Macular Edema
+]
+
 CONCEPT_LABEL_MAP_IDRID_EDEMA = [
     # No Edema
     [0, 0, 0, 0, 0, 0], 
@@ -156,15 +203,45 @@ CONCEPT_LABEL_MAP_IDRID_EDEMA = [
     [2, 1, 1, 2, 1, 2], 
 ]
 
+CONCEPT_LABEL_MAP_IDRID_EDEMA_SOFT = [
+    # No apparent risk of DME
+    [
+        [1.0, 0.0, 0.0],     # hard exudates: none
+        [1.0, 0.0, 0.0],     # distance to fovea: far
+        [1.0, 0.0, 0.0],     # edema extent: none
+        [0.9, 0.1, 0.0]      # microaneurysms/hemorrhages: absent
+    ],
+
+    # Mild risk of DME
+    [
+        [0.2, 0.7, 0.1],     # hard exudates: few scattered
+        [0.1, 0.8, 0.1],     # distance to fovea: close
+        [0.1, 0.8, 0.1],     # edema extent: focal
+        [0.1, 0.7, 0.2]      # microaneurysms/hemorrhages: few
+    ],
+
+    # Severe risk of DME
+    [
+        [0.0, 0.2, 0.8],     # hard exudates: dense near macula
+        [0.0, 0.2, 0.8],     # distance to fovea: involving fovea
+        [0.0, 0.1, 0.9],     # edema extent: diffuse
+        [0.0, 0.3, 0.7]      # microaneurysms/hemorrhages: many
+    ]
+]
+
 CONCEPT_LABEL_MAP_DICT = {
     'ISIC': CONCEPT_LABEL_MAP_ISIC,
     'ISIC_MINE': CONCEPT_LABEL_MAP_ISIC_MINE,
     'ISIC_MINIMAL': CONCEPT_LABEL_MAP_ISIC_MINIMAL,
     'ISIC_SOFT':CONCEPT_LABEL_MAP_ISIC_SOFT_SMOOTH,
+
     'IDRID': CONCEPT_LABEL_MAP_IDRID,
+    'IDRID_SOFT': CONCEPT_LABEL_MAP_IDRID_SOFT,
+    'IDRID_EDEMA': CONCEPT_LABEL_MAP_IDRID_EDEMA,
+    'IDRID_EDEMA_SOFT': CONCEPT_LABEL_MAP_IDRID_EDEMA_SOFT,
+
     'BUSI': CONCEPT_LABEL_MAP_BUSI,
     'BUSI_SOFT': CONCEPT_LABEL_MAP_BUSI_SOFT_SMOOTH,
-    'IDRID_EDEMA': CONCEPT_LABEL_MAP_IDRID_EDEMA
 }
 
 
@@ -177,7 +254,9 @@ CE_WEIGHTS = {
     'ISIC_SOFT': [ 0.134, 0.084, 0.039, 0.389, 0.039, 0.0065, 0.305],  # train weights
 
     'IDRID': [ 0.076, 0.506, 0.074, 0.137, 0.207],
+    'IDRID_SOFT': [ 0.076, 0.506, 0.074, 0.137, 0.207],
     'IDRID_EDEMA': [0.1606, 0.6935, 0.1458],
+    'IDRID_EDEMA_SOFT': [0.1606, 0.6935, 0.1458],
 
     'BUSI': [ 0.157, 0.327, 0.516],
     'BUSI_SOFT': [ 0.157, 0.327, 0.516]
@@ -324,7 +403,7 @@ class SILoss:
 
         return alpha_t, sigma_t, d_alpha_t, d_sigma_t
 
-    def __call__(self, model, images, latent_raw_image, model_kwargs=None, zs=None, labels=None, explicid=None, explicid_imgs_list= None, epoch=None,  explicd_only=0, do_sit=False, do_pretraining_the_patchifyer=False, patchifyer_model=None, denoise_patches=0, use_actual_latent_of_the_images=0, explicid_imgs_wo_norm_list=None):
+    def __call__(self, model, images, latent_raw_image, model_kwargs=None, zs=None, labels=None, explicid=None, explicid_imgs_list= None, epoch=None,  explicd_only=0, do_sit=False, do_pretraining_the_patchifyer=False, denoise_patches=0, use_actual_latent_of_the_images=0, explicid_imgs_wo_norm_list=None):
         if model_kwargs == None:
             model_kwargs = {}
         # sample timesteps
@@ -424,7 +503,7 @@ class SILoss:
             else:
                 raise NotImplementedError() # TODO: add x or eps prediction
 
-            if self.task =="IDRID":
+            if self.task =="IDRID" or self.task =="IDRID_SOFT" or self.task =="IDRID_EDEMA" or self.task =="IDRID_EDEMA_SOFT":
                 attn_explicd_loss+=attn_explicd_loss_dict["black_crit_loss"]
                 #print(f"labels shape: {labels.shape}")
                 # Check if each element is in {2, 3, 4}
@@ -436,7 +515,18 @@ class SILoss:
                 #attn_explicd_loss+=torch.mean(tensor_viable*attn_explicd_loss_dict["color_loss"])
 
                 #attn_explicd_loss+=0.5*attn_explicd_loss_dict["smooth_loss"]*10e9
-                attn_explicd_loss+=attn_explicd_loss_dict["overlap_loss"]*10e3
+                #attn_explicd_loss+=attn_explicd_loss_dict["overlap_loss"]
+                
+                # attn_explicd_loss+=attn_explicd_loss_dict["tv_loss"]
+                # attn_explicd_loss+=attn_explicd_loss_dict["laplacian_smoothness_loss"]
+
+                # attn_explicd_loss+=attn_explicd_loss_dict["contrast_loss"]
+                # attn_explicd_loss+=attn_explicd_loss_dict["dot_loss"]
+                # attn_explicd_loss+=attn_explicd_loss_dict["dist_loss"]
+                #attn_explicd_loss+=attn_explicd_loss_dict["orthog_loss"]
+                #attn_explicd_loss+=attn_explicd_loss_dict["kl_loss"]
+                #attn_explicd_loss+=attn_explicd_loss_dict["inv_loss"]
+                #attn_explicd_loss+=attn_explicd_loss_dict["entropy"]
             elif self.task =="ISIC":
                 attn_explicd_loss+=attn_explicd_loss_dict["var_loss"]*10e7
                 attn_explicd_loss+=0.5*attn_explicd_loss_dict["smooth_loss"]*10e9
@@ -470,6 +560,13 @@ class SILoss:
 
                 # Now, calculate the loss as the negative average cosine similarity between all pairs
                 #attn_explicd_loss = 10*(1 - cosine_sim.mean())
+            elif self.task=="ISIC_SOFT":
+                attn_explicd_loss+=attn_explicd_loss_dict["tv_loss"]
+                attn_explicd_loss+=attn_explicd_loss_dict["laplacian_smoothness_loss"]
+
+                attn_explicd_loss+=attn_explicd_loss_dict["contrast_loss"]
+                attn_explicd_loss+=attn_explicd_loss_dict["dot_loss"]
+                attn_explicd_loss+=attn_explicd_loss_dict["dist_loss"]
             if explicd_only==0:
                 ##################  Option use trivial tokens too
                 agg_visual_tokens = torch.cat((agg_critical_tokens, agg_trivial_tokens), dim=1)
@@ -505,6 +602,25 @@ class SILoss:
                         'texture': torch.tensor([inner_list[4] for inner_list in concept_label]).cuda(),
                         'symmetry': torch.tensor([inner_list[5] for inner_list in concept_label]).cuda(),
                         'elevation': torch.tensor([inner_list[6] for inner_list in concept_label]).cuda()
+                    }
+                elif self.task =="IDRID_SOFT":
+                    concept_label = [self.concept_label_map[label] for label in labels]
+                    concept_label_smooth_dict = {
+                        'hemorrhages': torch.tensor([inner_list[0] for inner_list in concept_label]).cuda(),
+                        'microaneurysms': torch.tensor([inner_list[1] for inner_list in concept_label]).cuda(),
+                        'exudates': torch.tensor([inner_list[2] for inner_list in concept_label]).cuda(),
+                        'neovascularization': torch.tensor([inner_list[3] for inner_list in concept_label]).cuda(),
+                        'venous beading': torch.tensor([inner_list[4] for inner_list in concept_label]).cuda(),
+                        'cotton wool spots': torch.tensor([inner_list[5] for inner_list in concept_label]).cuda(),
+                        'macular edema': torch.tensor([inner_list[6] for inner_list in concept_label]).cuda()
+                    }
+                elif self.task =="IDRID_EDEMA_SOFT":
+                    concept_label = [self.concept_label_map[label] for label in labels]
+                    concept_label_smooth_dict = {
+                        'hard exudates near macula': torch.tensor([inner_list[0] for inner_list in concept_label]).cuda(),
+                        'distance to fovea': torch.tensor([inner_list[1] for inner_list in concept_label]).cuda(),
+                        'macular edema extent (approx)': torch.tensor([inner_list[2] for inner_list in concept_label]).cuda(),
+                        'microaneurysms/hemorrhages near macula': torch.tensor([inner_list[3] for inner_list in concept_label]).cuda()
                     }
 
 
@@ -601,7 +717,7 @@ class SILoss:
             #     #print("logits_similarity_loss ", logits_similarity_loss)
             #     cnn_loss_cls*=0
             if explicd_only==0 and do_sit:
-                patches_output,model_output, model_input_pure_processed, zs_tilde, attn_sit_loss, sigmas_for_losses  = model(model_input, images, None,time_input.flatten(), **model_kwargs, 
+                patches_output,model_output, zs_tilde, attn_sit_loss, sigmas_for_losses  = model(model_input,time_input.flatten(), **model_kwargs, 
                                                                         concept_label=None, 
                                                                         image_embeddings=agg_visual_tokens,
                                                                         cls_logits=None,
@@ -612,7 +728,6 @@ class SILoss:
                                                                         longer_visual_tokens=longer_visual_tokens,
                                                                         critical_mask = critical_mask, 
                                                                         trivial_mask = trivial_mask,
-                                                                        patchifyer_model=patchifyer_model,
                                                                         patches = patches)
                 
                 if imgs_indx==0:
@@ -648,7 +763,8 @@ class SILoss:
             "sigmas_for_losses":sigmas_for_losses,
             "cnn_loss":cnn_loss,
             "overlap_loss":overlap_loss,
-        }      
+        }
+        
         if  explicd_only==0:
             loss_return_dict["processing_loss"]=processing_loss
             loss_return_dict["denoising_loss"]=denoising_loss

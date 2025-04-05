@@ -77,7 +77,6 @@ def euler_sampler(
         vit_l_output=None,
         critical_mask=None, 
         trivial_mask=None,
-        patchifyer_model=None,
         highlight_the_critical_mask=False,
         use_actual_latent_of_the_images=1
         ):
@@ -132,8 +131,8 @@ def euler_sampler(
             #text_embed=torch.randn(256, 512).to(device)
             #img_embed=torch.randn(256, 512).to(device)
 
-            patches_output, d_cur, d_cur_pure, d_cur_critical_removed = model(
-                model_input.to(dtype=_dtype), latents, None, time_input.to(dtype=_dtype), **kwargs,  # if need be will fill in model_pure and model_target
+            patches_output, d_cur = model(
+                model_input.to(dtype=_dtype), time_input.to(dtype=_dtype), **kwargs,  # if need be will fill in model_pure and model_target
                 concept_label=concept_label_input, 
                 image_embeddings=imgs_tokens_input,
                 cls_logits=cls_logits_input,
@@ -143,12 +142,11 @@ def euler_sampler(
                 vit_l_output=vit_l_output,
                 critical_mask= critical_mask, 
                 trivial_mask = trivial_mask,
-                patchifyer_model=patchifyer_model,
                 highlight_the_critical_mask=highlight_the_critical_mask
                 )
             
             if use_actual_latent_of_the_images==1:
-                return patches_output, d_cur.to(torch.float32), d_cur_pure.to(torch.float32), d_cur_critical_removed.to(torch.float32)
+                return patches_output, d_cur.to(torch.float32)
             #.to(torch.float64)
             #patches_output = patches_output.to(torch.float64)
             # d_cur = d_cur.to(torch.float64)
@@ -193,7 +191,7 @@ def euler_sampler(
                 x_next = x_cur + (t_next - t_cur) * (0.5 * d_cur + 0.5 * d_prime)
                 
     #return x_next
-    return patches_output, x_next.to(torch.float32), d_cur_pure.to(torch.float32), d_cur_critical_removed.to(torch.float32)
+    return patches_output, x_next.to(torch.float32)
 
 
 def euler_maruyama_sampler(

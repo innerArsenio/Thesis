@@ -67,6 +67,23 @@ explicid_idrid_dict = {
     'macular edema': ['none', 'none or present in focal areas', 'present in focal areas','diffuse'],
 }
 
+explicid_idrid_soft_dict = {
+    'hemorrhages': ['no hemorrhages', 'few microaneurysms', 'multiple dot and blot hemorrhages', 'large hemorrhages in all quadrants', 'widespread hemorrhages'],
+    'microaneurysms': ['no microaneurysms', 'few microaneurysms', 'multiple scattered microaneurysms', 'numerous microaneurysms in all quadrants', 'many microaneurysms, often near neovascularization'],
+    'exudates': ['no exudates', 'small hard exudates', 'moderate-sized exudates', 'large exudate patches', 'extensive exudates around macula'],
+    'neovascularization': ['no neovascularization', 'neovascularization on optic disc or elsewhere','neovascularization extensive with risk of hemorrhage'],
+    'venous beading': ['no venous beading', 'venous beading present in some quadrants','widespread and severe venous beading'],
+    'cotton wool spots': ['no cotton wool spots', 'few cotton wool spots','multiple cotton wool spots', 'widespread cotton wool spots'],
+    'macular edema': ['no macular edema', 'mild thickening of macular edema','moderate thickening of macular edema','severe thickening of macular edema with distortion ','severe thickening of macular edema with retinal detachment'],
+}
+
+explicid_idrid_edema_soft_dict = {
+    'hard exudates near macula': ['no hard exudates near macula', 'few scattered hard exudates near macula', 'dense hard exudates near macula near macula'],
+    'distance to fovea': ['retinal lesions are far from fovea', 'retinal lesions are close to fovea', 'retinal lesions are involving fovea'],
+    'macular edema extent (approx)': ['no macular edema', 'focal (clustered) macular edema', 'diffuse (spread) macular edema'],
+    'microaneurysms/hemorrhages near macula': ['no microaneurysms/hemorrhages near macula', 'few microaneurysms/hemorrhages near macula', 'many microaneurysms/hemorrhages near macula']
+}
+
 explicid_idrid_edema_dict = {
     'hard exudates': ['none','none or bright lipid deposits in the retina','bright lipid deposits in the retina'],
     'retinal thickening': ['none', 'swelling near the macula'],

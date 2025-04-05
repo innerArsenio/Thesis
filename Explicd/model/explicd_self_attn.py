@@ -38,7 +38,9 @@ NUM_OF_CRITERIA = {
     'ISIC_SOFT': 7,
 
     'IDRID': 5,
+    'IDRID_SOFT':7,
     'IDRID_EDEMA': 6,
+    'IDRID_EDEMA_SOFT':4,
 
     'BUSI': 6,
     'BUSI_SOFT': 6
@@ -51,7 +53,9 @@ NUM_OF_SIMILARITIES = {
     'ISIC_SOFT': 34,
 
     'IDRID': 18,
+    'IDRID_SOFT': 30,
     'IDRID_EDEMA': 15,
+    'IDRID_EDEMA_SOFT': 12,
     
     'BUSI': 17,
     'BUSI_SOFT': 18
@@ -60,8 +64,10 @@ NUM_OF_SIMILARITIES = {
 def get_prefix(task: str, key: str) -> str:
     if task== "ISIC" or task == "ISIC_MINE" or task == "ISIC_MINIMAL" or task == "ISIC_SOFT":
         return f"this is a dermoscopic image, the {key} of the lesion is "
-    elif task == "IDRID" or task=='IDRID_EDEMA':
+    elif task == "IDRID" or task=='IDRID_EDEMA' or task == "IDRID_SOFT":
         return f"this is a fundus image, the {key} of the eye is "
+    elif task == "IDRID_SOFT" or task == "IDRID_EDEMA_SOFT":
+        return f"this is a fundus image, there are "
     elif task == "BUSI" or task == "BUSI_SOFT":
         return f"this is an ultrasound image of human breasts, the {key} of the tissue is "
     else:
@@ -481,6 +487,8 @@ def retinal_loss_function(attention_map, crit_dot, triv_dot, hsv_patches, lambda
     # 1) Critical-Trivial Overlap Loss (Minimize dot product similarity)
     L_overlap = torch.sum(torch.matmul(crit_dot, triv_dot.permute(0, 2, 1))) / (crit_dot.shape[0] * crit_dot.shape[1] * triv_dot.shape[1])  # Normalize by token count
     attn_loss_dict["overlap_loss"] = L_overlap
+
+    return attn_loss_dict
     if L_overlap<-800:
         L_overlap*=0
     # 2) Color-Based Activation Loss
@@ -691,6 +699,121 @@ def rgb_to_hsv_torch(rgb_tensor):
     #print(f"hsv tensor {hsv_tensor[0,:,:,:]}")
     
     return hsv_tensor
+
+
+def attn_chat_gpt_crit_smooth_loss(attn_map, merge_patches=True, merge_factor=2):
+    """
+    attn_map: (B, N_tokens, N_patches) e.g., (B, 7, 256)
+    Assumes square grid: 256 -> 16x16
+    """
+    # attention_maps: Tensor of shape (B, N_c, T) - original attention maps
+    B, N_c, T = attn_map.shape
+    
+    # Assuming T is a square (H * W), so reshaping to (B, N_c, H, W)
+    H = W = int(T**0.5)  # Assuming T is a perfect square
+    #attention_maps = attn_map.view(B, N_c, H, W)
+
+    if merge_patches:
+        # Downsample using average pooling (2x2 blocks → 1)
+        attn_grid_merged = F.avg_pool2d(attn_map.view(B, N_c, H, W), kernel_size=merge_factor)
+        # Flatten back
+        attn_map = attn_grid_merged.flatten(2)  # (B, N, new_T)
+        _, _, T = attn_map.shape
+        H = W = int(T**0.5)  # Assuming T is a perfect square
+
+    attn_map_tot_var = attn_map.view(B, N_c, H, W)  # (B, 7, 16, 16)
+
+    tv_loss = (
+        torch.mean(torch.abs(attn_map_tot_var[:, :, :, :-1] - attn_map_tot_var[:, :, :, 1:])) +
+        torch.mean(torch.abs(attn_map_tot_var[:, :, :-1, :] - attn_map_tot_var[:, :, 1:, :]))
+    )*10e4
+
+    #print(f"tv loss {tv_loss}")
+
+    laplacian_kernel = torch.tensor([[[[0, 1, 0],
+                                   [1, -4, 1],
+                                   [0, 1, 0]]]], dtype=torch.float32).to(attn_map.device)
+    
+    attn_map_b_lap = attn_map.view(B * N_c, 1, H, W)  # merge batch and tokens
+    laplacian = F.conv2d(attn_map_b_lap, laplacian_kernel, padding=1)
+    laplacian_smoothness_loss = torch.mean(torch.abs(laplacian))*10e3*0.5
+    #print(f"laplacian smoothness loss {laplacian_smoothness_loss}")
+
+    eps = 1e-8
+    entropy = - (attn_map * (attn_map + eps).log()).sum(dim=-1)  # (B, T)
+    #print(f"entropy {entropy.mean()*0.1}")
+
+    return tv_loss, laplacian_smoothness_loss, entropy.mean()*0.1
+
+def attn_chat_gpt_crit_different_maps(critical_attn, trivial_attn, merge_patches=True, merge_factor=2):
+    """
+    critical_attn, trivial_attn: (B, T, P) where T = 7, P = 256
+    """
+    B, N_c, T = critical_attn.shape
+    _, N_t, _ = trivial_attn.shape
+    temperature=0.1
+
+    if merge_patches:
+        H = W = int(T**0.5)  # Assuming T is a perfect square
+        # Downsample using average pooling (2x2 blocks → 1)
+        critical_attn_merged = F.avg_pool2d(critical_attn.view(B, N_c, H, W), kernel_size=merge_factor)
+        # Flatten back
+        critical_attn = critical_attn_merged.flatten(2)  # (B, N, new_T)
+        _, _, T = critical_attn.shape
+
+        trivial_attn_merged = F.avg_pool2d(trivial_attn.view(B, N_t, H, W), kernel_size=merge_factor)
+        # Flatten back
+        trivial_attn = trivial_attn_merged.flatten(2)  # (B, N, new_T)
+
+    # Flatten across batch
+    crit_emb = critical_attn.view(B * N_c, T)  # (B*T_crit, P)
+    triv_emb = trivial_attn.view(B * N_t, T)   # (B*T_triv, P)
+
+    # Normalize embeddings
+    crit_emb = F.normalize(crit_emb, dim=-1)
+    triv_emb = F.normalize(triv_emb, dim=-1)
+
+    # Compute similarity matrix (cosine similarity)
+    sim_matrix = torch.mm(crit_emb, triv_emb.T)  # (B*T_crit, B*T_triv)
+
+    # Contrastive loss (NT-Xent)
+    logits = sim_matrix / temperature  # Scale similarity
+    labels = torch.arange(len(crit_emb)).to(crit_emb.device) % len(triv_emb)  # Matching pairs
+
+    contrast_loss = F.cross_entropy(logits, labels)  # High similarity → lower loss
+    ##############################
+    crit_flat = critical_attn.view(B, -1)
+    triv_flat = trivial_attn.view(B, -1)
+    dot_product = (crit_flat * triv_flat).sum(-1)  # Sum across patches
+    orthog_loss = dot_product.mean()*10e2  # Encourage dot product ≈ 0
+    ###############################
+    crit = F.softmax(critical_attn, dim=-1)
+    triv = F.softmax(trivial_attn, dim=-1)
+    kl1 = F.kl_div(triv.log(), crit, reduction='batchmean')
+    kl2 = F.kl_div(crit.log(), triv, reduction='batchmean')
+    kl_loss = -(kl1 + kl2)*0  # Encourage separation
+    ###############################
+    crit = F.softmax(critical_attn, dim=-1)
+    triv = F.softmax(trivial_attn, dim=-1)
+    inv_loss = (crit * triv).sum(-1).mean()*10e3  # Encourage dissimilarity
+
+    #print(f"contrast loss {contrast_loss}")
+
+    crit = F.normalize(crit, dim=-1)
+    triv = F.normalize(triv, dim=-1)
+    dot_loss = (crit.unsqueeze(2) * triv.unsqueeze(1)).sum(-1).mean()
+    #print(f"dot loss {dot_loss}")
+
+    # crit: (B*N_c, T), triv: (B*N_t, T)
+    dist = 1 - F.cosine_similarity(crit, triv)
+    dist_loss = torch.clamp(0.5 - dist, min=0).mean()
+    #print(f"dist loss {dist_loss}")
+
+
+    #print(f"orthog loss {orthog_loss}")
+    #print(f"kl loss {kl_loss}")
+    #print(f"inv loss {inv_loss}")
+    return contrast_loss, orthog_loss, kl_loss, inv_loss, dot_loss, dist_loss
 
 class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):  
     def __init__(self, concept_list, model_name='biomedclip', config=None):
@@ -1032,8 +1155,9 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
             agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial(trivial_visual_tokens, vit_l_output_hsv, vit_l_output)
         elif self.new_explicd==0:
             agg_critical_visual_tokens, attn_critical_weights = self.cross_attn_critical(critical_visual_tokens, vit_l_output, vit_l_output)
-            #agg_critical_visual_tokens, attn_critical_weights = self.cross_attn(agg_critical_visual_tokens, vit_l_output_hsv, vit_l_output)
+            #agg_critical_visual_tokens, attn_critical_weights = self.cross_attn_critical_smaller(agg_critical_visual_tokens, vit_l_output_hsv, vit_l_output)
             agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial(trivial_visual_tokens, vit_l_output, vit_l_output)
+            #agg_trivial_visual_tokens, attn_trivial_weights = self.cross_attn_trivial_smaller(agg_trivial_visual_tokens, vit_l_output, vit_l_output)
         
         d_products = torch.matmul(critical_visual_tokens, vit_l_output_hsv.permute(0, 2, 1))/(D**0.5)
         loss_fn = SpatialAwarePatchLoss_mine_spatial()
@@ -1043,16 +1167,20 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         triv_dot = torch.matmul(trivial_visual_tokens, vit_l_output_hsv.permute(0, 2, 1))/(D**0.5)  # (n_t, 256)
 
         attn_explicd_loss_dict = {}
-        if self.config.dataset == 'IDRID':
+        if self.config.dataset == 'IDRID' or self.config.dataset == 'IDRID_SOFT' or self.config.dataset == 'IDRID_EDEMA' or self.config.dataset == 'IDRID_EDEMA_SOFT':
             attn_explicd_loss_dict=retinal_loss_function(attn_critical_weights, crit_dot, triv_dot, hsv_patches.view(B, 3, T))
         elif self.config.dataset == 'ISIC':
             attn_explicd_loss_dict = loss_fn(hsv_patches, d_products, attn_trivial_weights)
             attn_explicd_loss_dict["var_loss"]=attention_variance_loss(attn_critical_weights)
             attn_explicd_loss_dict["var_loss_other"], attn_explicd_loss_dict["masks"], attn_explicd_loss_dict["crit_dot"]=skin_lesion_loss_function(attn_critical_weights, crit_dot, triv_dot, hsv_patches.view(B, 3, T))
         
-        attn_explicd_loss_dict["smooth_loss"]=smoothness_loss(attn_critical_weights)
-        attn_explicd_loss_dict["overlap_loss"]=total_non_overlap_loss(attn_critical_weights, attn_trivial_weights)
+            attn_explicd_loss_dict["smooth_loss"]=smoothness_loss(attn_critical_weights)
+            attn_explicd_loss_dict["overlap_loss"]=total_non_overlap_loss(attn_critical_weights, attn_trivial_weights)
 
+        
+        attn_explicd_loss_dict["tv_loss"], attn_explicd_loss_dict["laplacian_smoothness_loss"],attn_explicd_loss_dict["entropy"] = attn_chat_gpt_crit_smooth_loss(attn_critical_weights)
+        attn_explicd_loss_dict["contrast_loss"], attn_explicd_loss_dict["orthog_loss"],attn_explicd_loss_dict["kl_loss"],attn_explicd_loss_dict["inv_loss"], attn_explicd_loss_dict["dot_loss"],attn_explicd_loss_dict["dist_loss"] = attn_chat_gpt_crit_different_maps(attn_critical_weights, attn_trivial_weights)
+        
         #attn_explicd_loss += 10*gpt4_0_second_attention_loss_mine(attn_critical_weights, attn_trivial_weights)[0]
         #loss_fn = SpatialAwarePatchLoss_mine()
         

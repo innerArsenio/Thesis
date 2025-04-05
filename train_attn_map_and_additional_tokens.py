@@ -45,8 +45,8 @@ from torchvision import transforms
 from Explicd.dataset.isic_dataset import SkinDataset
 from Explicd.model import (
                            ExpLICD_ViT_L_Classic_with_Spatial_Bias)
-from Explicd.concept_dataset import (explicid_isic_dict, explicid_isic_dict_mine, explicid_idrid_dict, explicid_idrid_edema_dict, explicid_busi_dict, explicid_busi_soft_smooth_dict, 
-                                     explicid_isic_minimal_dict, explicid_isic_binary_dict)
+from Explicd.concept_dataset import (explicid_isic_dict, explicid_isic_dict_mine, explicid_idrid_dict, explicid_idrid_soft_dict, explicid_idrid_edema_dict, explicid_idrid_edema_soft_dict, 
+                                     explicid_busi_dict, explicid_busi_soft_smooth_dict, explicid_isic_minimal_dict, explicid_isic_binary_dict)
 import Explicd.utils as utils
 from sklearn.metrics import f1_score
 import random
@@ -114,6 +114,53 @@ CONCEPT_LABEL_MAP_IDRID = [
     [3, 3, 3, 1, 3], 
 ]
 
+CONCEPT_LABEL_MAP_IDRID_SOFT = [
+    # No apparent DR
+    [[1.0, 0.0, 0.0, 0.0, 0.0],  # Hemorrhages
+     [1.0, 0.0, 0.0, 0.0, 0.0],  # Microaneurysms
+     [1.0, 0.0, 0.0, 0.0, 0.0],  # Exudates
+     [1.0, 0.0, 0.0],            # Neovascularization (3 values)
+     [1.0, 0.0, 0.0],            # Venous Beading (3 values)
+     [1.0, 0.0, 0.0, 0.0],       # Cotton Wool Spots (4 values)
+     [1.0, 0.0, 0.0, 0.0, 0.0]], # Macular Edema
+    
+    # Mild Non-Proliferative DR
+    [[0.1, 0.9, 0.0, 0.0, 0.0],  # Hemorrhages
+     [0.1, 0.9, 0.0, 0.0, 0.0],  # Microaneurysms
+     [0.8, 0.2, 0.0, 0.0, 0.0],  # Exudates
+     [1.0, 0.0, 0.0],            # Neovascularization
+     [1.0, 0.0, 0.0],            # Venous Beading
+     [1.0, 0.0, 0.0, 0.0],       # Cotton Wool Spots
+     [0.8, 0.2, 0.0, 0.0, 0.0]], # Macular Edema
+
+    # Moderate Non-Proliferative DR
+    [[0.0, 0.2, 0.8, 0.0, 0.0],  # Hemorrhages
+     [0.0, 0.2, 0.8, 0.0, 0.0],  # Microaneurysms
+     [0.0, 0.3, 0.7, 0.0, 0.0],  # Exudates
+     [1.0, 0.0, 0.0],            # Neovascularization
+     [0.7, 0.3, 0.0],            # Venous Beading
+     [0.8, 0.2, 0.0, 0.0],       # Cotton Wool Spots
+     [0.0, 0.2, 0.8, 0.0, 0.0]], # Macular Edema
+
+    # Severe Non-Proliferative DR
+    [[0.0, 0.0, 0.3, 0.7, 0.0],  # Hemorrhages
+     [0.0, 0.0, 0.3, 0.7, 0.0],  # Microaneurysms
+     [0.0, 0.0, 0.5, 0.5, 0.0],  # Exudates
+     [0.0, 1.0, 0.0],            # Neovascularization
+     [0.0, 0.2, 0.8],            # Venous Beading
+     [0.0, 0.4, 0.6, 0.0],       # Cotton Wool Spots
+     [0.0, 0.0, 0.2, 0.8, 0.0]], # Macular Edema
+
+    # Proliferative DR
+    [[0.0, 0.0, 0.0, 0.3, 0.7],  # Hemorrhages
+     [0.0, 0.0, 0.0, 0.3, 0.7],  # Microaneurysms
+     [0.0, 0.0, 0.0, 0.4, 0.6],  # Exudates
+     [0.0, 0.2, 0.8],            # Neovascularization
+     [0.0, 0.3, 0.7],            # Venous Beading
+     [0.0, 0.0, 0.3, 0.7],       # Cotton Wool Spots
+     [0.0, 0.0, 0.0, 0.2, 0.8]]  # Macular Edema
+]
+
 CONCEPT_LABEL_MAP_IDRID_EDEMA = [
     # No Edema
     [0, 0, 0, 0, 0, 0], 
@@ -121,6 +168,32 @@ CONCEPT_LABEL_MAP_IDRID_EDEMA = [
     [1, 1, 1, 1, 0, 1],
     # Severe Edema
     [2, 1, 1, 2, 1, 2], 
+]
+
+CONCEPT_LABEL_MAP_IDRID_EDEMA_SOFT = [
+    # No apparent risk of DME
+    [
+        [1.0, 0.0, 0.0],     # hard exudates: none
+        [1.0, 0.0, 0.0],     # distance to fovea: far
+        [1.0, 0.0, 0.0],     # edema extent: none
+        [0.9, 0.1, 0.0]      # microaneurysms/hemorrhages: absent
+    ],
+
+    # Mild risk of DME
+    [
+        [0.2, 0.7, 0.1],     # hard exudates: few scattered
+        [0.1, 0.8, 0.1],     # distance to fovea: close
+        [0.1, 0.8, 0.1],     # edema extent: focal
+        [0.1, 0.7, 0.2]      # microaneurysms/hemorrhages: few
+    ],
+
+    # Severe risk of DME
+    [
+        [0.0, 0.2, 0.8],     # hard exudates: dense near macula
+        [0.0, 0.2, 0.8],     # distance to fovea: involving fovea
+        [0.0, 0.1, 0.9],     # edema extent: diffuse
+        [0.0, 0.3, 0.7]      # microaneurysms/hemorrhages: many
+    ]
 ]
 
 
@@ -167,7 +240,9 @@ CONCEPT_LABEL_MAP_DICT = {
     'ISIC_SOFT':CONCEPT_LABEL_MAP_ISIC_SOFT_SMOOTH,
 
     'IDRID': CONCEPT_LABEL_MAP_IDRID,
+    'IDRID_SOFT': CONCEPT_LABEL_MAP_IDRID_SOFT,
     'IDRID_EDEMA': CONCEPT_LABEL_MAP_IDRID_EDEMA,
+    'IDRID_EDEMA_SOFT': CONCEPT_LABEL_MAP_IDRID_EDEMA_SOFT,
 
     'BUSI': CONCEPT_LABEL_MAP_BUSI,
     'BUSI_SOFT': CONCEPT_LABEL_MAP_BUSI_SOFT_SMOOTH
@@ -181,13 +256,15 @@ NUM_OF_CRITERIA = {
     'ISIC_SOFT': 6,
 
     'IDRID': 5,
+    'IDRID_SOFT': 7,
     'IDRID_EDEMA': 6,
+    'IDRID_EDEMA_SOFT': 4,
 
     'BUSI': 6,
     'BUSI_SOFT': 6
 }
 
-LIST_OF_TASKS = ['ISIC', 'ISIC_MINE', 'ISIC_MINIMAL', 'ISIC_SOFT', 'IDRID', 'IDRID_EDEMA', 'BUSI', 'BUSI_SOFT']
+LIST_OF_TASKS = ['ISIC', 'ISIC_MINE', 'ISIC_MINIMAL', 'ISIC_SOFT', 'IDRID', 'IDRID_SOFT', 'IDRID_EDEMA', 'IDRID_EDEMA_SOFT', 'BUSI', 'BUSI_SOFT']
 
 #TASK='IDRID_EDEMA'
 
@@ -198,7 +275,9 @@ NUM_OF_CLASSES= {
     'ISIC_SOFT':7,
 
     'IDRID': 5,
+    'IDRID_SOFT':5,
     'IDRID_EDEMA':3,
+    'IDRID_EDEMA_SOFT':3,
 
     'BUSI': 3,
     'BUSI_SOFT':3
@@ -211,7 +290,9 @@ CONCEPTS= {
     'ISIC_MINIMAL':explicid_isic_minimal_dict,
 
     'IDRID': explicid_idrid_dict,
+    'IDRID_SOFT': explicid_idrid_soft_dict,
     'IDRID_EDEMA': explicid_idrid_edema_dict,
+    'IDRID_EDEMA_SOFT': explicid_idrid_edema_soft_dict,
 
     'BUSI': explicid_busi_dict,
     'BUSI_SOFT': explicid_busi_soft_smooth_dict
@@ -355,13 +436,13 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0, a
             att_map_expanded = att_map.unsqueeze(1)  # Shape: (B, 1, H, W)
             #print(att_map_expanded[0,0,:,:])
 
-            # Find the max value along the H and W dimensions (axis 2 and 3)
-            # This will give us a tensor of shape (B, 1, 1, 1)
-            max_vals, _ = torch.max(att_map_expanded, dim=2, keepdim=True)  # max across H
-            max_vals, _ = torch.max(max_vals, dim=3, keepdim=True)  # max across W
+            # # Find the max value along the H and W dimensions (axis 2 and 3)
+            # # This will give us a tensor of shape (B, 1, 1, 1)
+            # max_vals, _ = torch.max(att_map_expanded, dim=2, keepdim=True)  # max across H
+            # max_vals, _ = torch.max(max_vals, dim=3, keepdim=True)  # max across W
 
-            # Normalize the original tensor by the max value
-            att_map_expanded = att_map_expanded / max_vals
+            # # Normalize the original tensor by the max value
+            # att_map_expanded = att_map_expanded / max_vals
             
             # Apply the attention map to the image channels
             imgs_with_attention_token =  att_map_expanded * 255
@@ -376,7 +457,7 @@ def validation(explicd, model, dataloader, exp_val_transforms, explicd_only=0, a
                         f"imgs_for_explicid token {1} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[1])),
                         f"imgs_for_explicid token {2} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[2])),
                         f"imgs_for_explicid token {3} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[3])),
-                        f"imgs_for_explicid token {4} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[4])),
+                        #f"imgs_for_explicid token {4} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[4])),
                         #f"imgs_for_explicid token {5} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[5])),
                         #f"imgs_for_explicid token {6} highlighted": wandb.Image(array2grid(imgs_with_attention_token_list[6]))
                             })
@@ -673,15 +754,15 @@ def main(args):
     #explicid.cnn = PatchSelectorCNNConscise()
     #explicid.load_state_dict(torch.load("checkoints_fr_val_score_based/ISIC/Explicd_only/Explicd_additional_tokens_for_sit_starter_refined_further_maybe.pt")["explicid"])
 
-    patchifyer_model = Patch_and_Unpatchifier(input_size=latent_size,
-            num_classes=NUM_OF_CLASSES[TASK],
-            use_cfg = (args.cfg_prob > 0),
-            z_dims = z_dims,
-            encoder_depth=args.encoder_depth,
-            task = TASK,
-            **block_kwargs)
-    patchifyer_model = patchifyer_model.to(device)
-    patchifyer_model.load_state_dict(torch.load("checkpoints_fr/ISIC/SiT/patchifyer_model.pt")["patchifyer_model"])
+    # patchifyer_model = Patch_and_Unpatchifier(input_size=latent_size,
+    #         num_classes=NUM_OF_CLASSES[TASK],
+    #         use_cfg = (args.cfg_prob > 0),
+    #         z_dims = z_dims,
+    #         encoder_depth=args.encoder_depth,
+    #         task = TASK,
+    #         **block_kwargs)
+    # patchifyer_model = patchifyer_model.to(device)
+    # patchifyer_model.load_state_dict(torch.load("checkpoints_fr/ISIC/SiT/patchifyer_model.pt")["patchifyer_model"])
 
     explicid_train_transforms = copy.deepcopy(conf.preprocess)
     explicid_train_transforms.transforms.pop(0)
@@ -747,9 +828,9 @@ def main(args):
         torch.backends.cudnn.allow_tf32 = True
 
     if args.explicd_only==0:
-        optimizer = schedulefree.AdamWScheduleFree(list(explicid.parameters()) + list(model.parameters()) + list(patchifyer_model.parameters()), lr=args.learning_rate, warmup_steps=5000 , weight_decay=0.1)
+        optimizer = schedulefree.AdamWScheduleFree(list(explicid.parameters()) + list(model.parameters()), lr=args.learning_rate, warmup_steps=5000 , weight_decay=0.1)
     else:
-        optimizer = schedulefree.AdamWScheduleFree(list(explicid.parameters()) + list(patchifyer_model.parameters()), lr=args.learning_rate, warmup_steps=5000 , weight_decay=0.1)
+        optimizer = schedulefree.AdamWScheduleFree(list(explicid.parameters()), lr=args.learning_rate, warmup_steps=5000 , weight_decay=0.1)
 
     dual_transform = transforms.Compose([
     DualRandomVerticalFlip(),  # Ensure both images get flipped or not
@@ -791,11 +872,11 @@ def main(args):
             train_dataset = CustomDataset(args.data_dir, transform= dual_transform, mode='train')
             val_dataset = CustomDataset(args.data_dir, transform= dual_val_transform, mode='val')
             test_dataset = CustomDataset(args.data_dir,transform= None, mode='test')
-    elif TASK=='IDRID':
+    elif TASK=='IDRID' or TASK=="IDRID_SOFT":
         train_dataset = CustomDataset(args.data_dir, transform= dual_transform, mode='idrid_train')
         val_dataset = CustomDataset(args.data_dir, transform= dual_val_transform, mode='idrid_val')
         test_dataset = CustomDataset(args.data_dir,transform= None, mode='idrid_test')
-    elif TASK=='IDRID_EDEMA':
+    elif TASK=='IDRID_EDEMA' or TASK=="IDRID_EDEMA_SOFT":
         train_dataset = CustomDataset(args.data_dir, transform= dual_transform, mode='idrid_edema_train')
         val_dataset = CustomDataset(args.data_dir, transform= dual_val_transform, mode='idrid_edema_val')
         test_dataset = CustomDataset(args.data_dir,transform= None, mode='idrid_edema_test')
@@ -843,7 +924,7 @@ def main(args):
 
     explicid.train()
     optimizer.train()
-    patchifyer_model.eval()
+    #patchifyer_model.eval()
 
     # resume:
     global_step = 0
@@ -877,8 +958,8 @@ def main(args):
             model = accelerator.prepare(model)
         
 
-    optimizer, train_dataloader, val_dataloader, test_dataloader, explicid, patchifyer_model = accelerator.prepare(
-       optimizer, train_dataloader, val_dataloader, test_dataloader, explicid, patchifyer_model
+    optimizer, train_dataloader, val_dataloader, test_dataloader, explicid = accelerator.prepare(
+       optimizer, train_dataloader, val_dataloader, test_dataloader, explicid
     )
 
     if accelerator.is_main_process:
@@ -947,7 +1028,11 @@ def main(args):
         print("this is wrong. you have to chose either denoise patches or use actual latent of the images")
         exit()
     
-    if args.concept_hardness=="soft_smarter" and (args.task!="ISIC_SOFT" and args.task!="BUSI_SOFT"):
+    if args.concept_hardness=="soft_smarter" and (args.task!="ISIC_SOFT" and args.task!="BUSI_SOFT" and args.task!="IDRID_SOFT" and args.task!="IDRID_EDEMA_SOFT"):
+        print("this is wrong. SOFT must go with smarter")
+        exit()
+
+    if args.concept_hardness!="soft_smarter" and (args.task=="ISIC_SOFT" or args.task=="BUSI_SOFT" or args.task=="IDRID_SOFT" or args.task=="IDRID_EDEMA_SOFT"):
         print("this is wrong. SOFT must go with smarter")
         exit()
     #torch.autograd.set_detect_anomaly(True)  # Enable anomaly detection
@@ -1139,7 +1224,7 @@ def main(args):
                         zs.append(z)
                 #exp_test_BMAC, exp_test_acc, _, _ , sit_BMAC, sit_acc= validation(explicid, model, test_dataloader, exp_val_transforms)
             if args.explicd_only==0:
-                with accelerator.accumulate(model, explicid, patchifyer_model):
+                with accelerator.accumulate(model, explicid):
                     imgs_for_explicid=prepare__imgs_for_explicid(raw_image, explicid_train_transforms).to(device)
                     #imgs_for_explicid_wo_norm=prepare__imgs_for_explicid(raw_image, explicid_train_without_normalization_transforms).to(device)
                     imgs_for_explicid_wo_norm = None
@@ -1155,7 +1240,7 @@ def main(args):
                     # processing_loss, loss, proj_loss, explicid_loss, loss_cls, logits_similarity_loss, _, _, _, _, _, _, attn_explicd_loss, attn_sit_loss, _, cnn_loss_cls= loss_fn(model, latent, latent, model_kwargs, zs=zs, 
                     #                                                     labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch,  explicd_only=0, do_sit=True, do_pretraining_the_patchifyer=False, patchifyer_model=patchifyer_model)
                     loss_return_dict = loss_fn(model, x, latent, model_kwargs, zs=zs, labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, 
-                                               epoch=epoch,  explicd_only=0, do_sit=True, do_pretraining_the_patchifyer=False, patchifyer_model=patchifyer_model, 
+                                               epoch=epoch,  explicd_only=0, do_sit=True, do_pretraining_the_patchifyer=False, 
                                                denoise_patches=args.denoise_patches, use_actual_latent_of_the_images=args.use_actual_latent, explicid_imgs_wo_norm_list=list_of_images_wo_norm,)
                     
                     processing_loss = loss_return_dict["processing_loss"]
@@ -1232,7 +1317,7 @@ def main(args):
                     if accelerator.sync_gradients:
                         update_ema(ema, model) # change ema function
             else:
-                with accelerator.accumulate(explicid, patchifyer_model):
+                with accelerator.accumulate(explicid):
                     imgs_for_explicid=prepare__imgs_for_explicid(raw_image, explicid_train_transforms).to(device)
                     imgs_for_explicid_wo_norm = None
                     model_kwargs = dict(y=labels)
@@ -1246,7 +1331,7 @@ def main(args):
 
                     # _, _, _, explicid_loss, _, logits_similarity_loss, _, _, _, _, attn_explicd_loss, _, _, cnn_loss_cls = loss_fn(None, latent, latent, model_kwargs, zs=zs, 
                     #                                                     labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch, explicd_only=1, do_sit=False, do_pretraining_the_patchifyer=False, patchifyer_model=patchifyer_model)
-                    loss_return_dict = loss_fn(None, latent, latent, model_kwargs, zs=zs, labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch, explicd_only=1, do_sit=False, do_pretraining_the_patchifyer=False, patchifyer_model=patchifyer_model, explicid_imgs_wo_norm_list=list_of_images_wo_norm)
+                    loss_return_dict = loss_fn(None, latent, latent, model_kwargs, zs=zs, labels=labels, explicid=explicid, explicid_imgs_list=list_of_images, epoch=epoch, explicd_only=1, do_sit=False, do_pretraining_the_patchifyer=False, explicid_imgs_wo_norm_list=list_of_images_wo_norm)
                     explicid_loss = loss_return_dict["explicid_loss"]
                     logits_similarity_loss = loss_return_dict["logits_similarity_loss"]
                     attn_explicd_loss = args.attn_coeff*loss_return_dict["attn_explicd_loss"]
@@ -1363,7 +1448,7 @@ def main(args):
                         else:
                             longer_visual_tokens_tampered=longer_visual_tokens
                             longer_visual_tokens_tampered[:,i-1,:]=0
-                        patches_output, samples_tampered, _, samples_critical_removed = euler_sampler(
+                        patches_output, samples_tampered = euler_sampler(
                             model, 
                             xT, 
                             torch.stack(labels_for_sampling, dim=0).to(device),
@@ -1381,7 +1466,7 @@ def main(args):
                             vit_l_output=vit_l_output,
                             critical_mask=critical_mask, 
                             trivial_mask=trivial_mask,
-                            patchifyer_model=patchifyer_model,
+                            #patchifyer_model=patchifyer_model,
                             highlight_the_critical_mask=True,
                             use_actual_latent_of_the_images=args.use_actual_latent
                         )
@@ -1638,11 +1723,12 @@ def main(args):
                             "steps": global_step,
                         }
                     if DO_MUDDLE_CHECK:
-                        checkpoint_path = f"{checkpoint_dir_val_score_based}/SiT/Muddled/SiT_with_explicd_hilimsya_muddled.pt"
+                        checkpoint_path = f"{checkpoint_dir_val_score_based}/SiT/Muddled/SiT_with_explicd_muddled.pt"
                     else:
-                        checkpoint_path = f"{checkpoint_dir_val_score_based}/SiT/SiT_with_explicd_hilimsya.pt"
-                    if args.resume_step == 0 and SAVING_BASED_ON_SCORE:
-                        torch.save(checkpoint_val, checkpoint_path)
+                        checkpoint_path = f"{checkpoint_dir_val_score_based}/SiT/SiT_with_explicd.pt"
+                    if SAVING_BASED_ON_SCORE:
+                        torch.save(checkpoint, checkpoint_path)
+                        print(f"Saved checkpoint to {checkpoint_path}")
                     ####################################################################
                     if max_exp_val_f1>0.94:
                         val_score_deserves_sampling=True
@@ -1749,7 +1835,7 @@ def parse_args(input_args=None):
     parser.add_argument("--use-actual-latent", type=int, default=1)
 
     # task
-    parser.add_argument("--task", type=str, choices=['ISIC', 'ISIC_MINE', 'ISIC_MINIMAL', 'ISIC_SOFT', 'IDRID', 'IDRID_EDEMA', 'BUSI', 'BUSI_SOFT'])
+    parser.add_argument("--task", type=str, choices=['ISIC', 'ISIC_MINE', 'ISIC_MINIMAL', 'ISIC_SOFT', 'IDRID', 'IDRID_SOFT', 'IDRID_EDEMA', 'IDRID_EDEMA_SOFT', 'BUSI', 'BUSI_SOFT'])
 
     # concept hardness
     parser.add_argument("--concept-hardness", type=str,  choices=["hard","soft_equal","soft_smarter"])
