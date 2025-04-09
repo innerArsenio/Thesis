@@ -485,10 +485,12 @@ class SiTBlock(nn.Module):
         if not self.noise_to_crit_map_only:
             visual_tokens_trivial =  modulate(self.norm3(visual_tokens_trivial), shift_triv, scale_triv)
 
-        attn_critical_weights = attn_critical_weights/torch.max(attn_critical_weights, dim=-1, keepdim=True).values
+        #attn_critical_weights = attn_critical_weights/torch.max(attn_critical_weights, dim=-1, keepdim=True).values
+        attn_critical_weights = attn_critical_weights*1000
 
         if not self.noise_to_crit_map_only:
-            attn_trivial_weights = attn_trivial_weights/torch.max(attn_trivial_weights, dim=-1, keepdim=True).values
+            #attn_trivial_weights = attn_trivial_weights/torch.max(attn_trivial_weights, dim=-1, keepdim=True).values
+            attn_trivial_weights = attn_trivial_weights*1000
 
         params_critical = torch.stack(self.params[:self.num_vis_tokens]).view(1, self.num_vis_tokens, 1).to(device=x.device)  # Shape (1, 7, 1)
 

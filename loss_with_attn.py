@@ -504,7 +504,29 @@ class SILoss:
                 raise NotImplementedError() # TODO: add x or eps prediction
 
             if self.task =="IDRID" or self.task =="IDRID_SOFT" or self.task =="IDRID_EDEMA" or self.task =="IDRID_EDEMA_SOFT":
-                attn_explicd_loss+=attn_explicd_loss_dict["black_crit_loss"]
+
+                # Create a mask where tensor1 is 0, and use it to zero out tensor2
+                mask = labels.unsqueeze(1).unsqueeze(2)  # Shape (B, 1, 1), broadcasting will work
+                attn_critical_weights = attn_critical_weights * mask  # Zero out tensor2 where tensor1 is 0
+
+                #attn_explicd_loss+=attn_explicd_loss_dict["black_crit_loss"]
+                attn_explicd_loss+=attn_explicd_loss_dict["orthog_loss"]
+                print(f"attn_explicd_loss_dict['orthog_loss'] {attn_explicd_loss_dict['orthog_loss']}")
+
+                # if attn_explicd_loss_dict["orthog_loss"]>3.5:
+                #     attn_explicd_loss_dict["mutual_exclusivity_loss"]=0*attn_explicd_loss_dict["mutual_exclusivity_loss"]
+
+                
+                # mask_not_zero = labels != 0
+
+                # if mask_not_zero.any():
+                #     attn_explicd_loss +=attn_explicd_loss_dict["mutual_exclusivity_loss"][mask_not_zero].mean()
+                
+                # attn_explicd_loss+=attn_explicd_loss_dict["high_attention_penalty"]
+                # print(f"attn_explicd_loss_dict['high_attention_penalty'] {attn_explicd_loss_dict['high_attention_penalty']}")
+
+                #attn_explicd_loss+=attn_explicd_loss_dict["mutual_exclusivity_loss"]
+                #print(f"attn_explicd_loss_dict['mutual_exclusivity_loss'] {attn_explicd_loss_dict['mutual_exclusivity_loss']}")
                 #print(f"labels shape: {labels.shape}")
                 # Check if each element is in {2, 3, 4}
                 mask = torch.isin(labels, torch.tensor([2, 3, 4],device=images.device))
@@ -561,12 +583,73 @@ class SILoss:
                 # Now, calculate the loss as the negative average cosine similarity between all pairs
                 #attn_explicd_loss = 10*(1 - cosine_sim.mean())
             elif self.task=="ISIC_SOFT":
-                attn_explicd_loss+=attn_explicd_loss_dict["tv_loss"]
-                attn_explicd_loss+=attn_explicd_loss_dict["laplacian_smoothness_loss"]
+                attn_explicd_loss+=attn_explicd_loss_dict["orthog_loss"]
+                print(f"attn_explicd_loss_dict['orthog_loss'] {attn_explicd_loss_dict['orthog_loss']}")
+                # attn_explicd_loss+=attn_explicd_loss_dict["inv_loss"]
+                # print(f"attn_explicd_loss_dict['inv_loss'] {attn_explicd_loss_dict['inv_loss']}")
 
-                attn_explicd_loss+=attn_explicd_loss_dict["contrast_loss"]
-                attn_explicd_loss+=attn_explicd_loss_dict["dot_loss"]
-                attn_explicd_loss+=attn_explicd_loss_dict["dist_loss"]
+
+                # attn_explicd_loss+=attn_explicd_loss_dict["contrast_loss"]
+                # print(f"attn_explicd_loss_dict['contrast_loss'] {attn_explicd_loss_dict['contrast_loss']}")
+
+
+                if attn_explicd_loss_dict["orthog_loss"]>1.5:
+                    attn_explicd_loss_dict["tv_loss"]=0*attn_explicd_loss_dict["tv_loss"]
+                    #attn_explicd_loss_dict["color_loss"] = 0*attn_explicd_loss_dict["color_loss"]
+                    attn_explicd_loss_dict["var_loss"] = attn_explicd_loss_dict["var_loss"]
+                    attn_explicd_loss_dict["var_loss_other"] = 0*attn_explicd_loss_dict["var_loss_other"]
+                    attn_explicd_loss_dict["similarity_loss"] = 0*attn_explicd_loss_dict["similarity_loss"]
+                    attn_explicd_loss_dict["zero_and_three_loss"] = 0*attn_explicd_loss_dict["zero_and_three_loss"]
+                    attn_explicd_loss_dict["mse_loss"] = 0*attn_explicd_loss_dict["mse_loss"]
+                    #attn_explicd_loss_dict["anchor_alignment_loss"] = 0*attn_explicd_loss_dict["anchor_alignment_loss"]
+                # attn_explicd_loss+=attn_explicd_loss_dict["tv_loss"]
+                # print(f"attn_explicd_loss_dict['tv_loss'] {attn_explicd_loss_dict['tv_loss']}")
+                    
+
+                # attn_explicd_loss+=attn_explicd_loss_dict["similarity_loss"]
+                # print(f"attn_explicd_loss_dict['similarity_loss'] {attn_explicd_loss_dict['similarity_loss']}")
+
+
+                # attn_explicd_loss+=attn_explicd_loss_dict["var_loss"]*10e32
+                # print(f"attn_explicd_loss_dict['var_loss'] {attn_explicd_loss_dict['var_loss']*10e32}")
+
+                attn_explicd_loss+=attn_explicd_loss_dict["mse_loss"]*10e17
+                print(f"attn_explicd_loss_dict['mse_loss'] {attn_explicd_loss_dict['mse_loss']}")
+
+                # attn_explicd_loss+=attn_explicd_loss_dict["anchor_alignment_loss"]
+                # print(f"attn_explicd_loss_dict['anchor_alignment_loss'] {attn_explicd_loss_dict['anchor_alignment_loss']}")
+                    
+                # if attn_explicd_loss_dict["similarity_loss"]==0.0 or attn_explicd_loss_dict["similarity_loss"]>0.75:
+                #     attn_explicd_loss_dict["var_loss_other"] = 0*attn_explicd_loss_dict["var_loss_other"]
+
+                # attn_explicd_loss+=attn_explicd_loss_dict["var_loss_other"]*10e2
+                # print(f"attn_explicd_loss_dict['var_loss_other'] {attn_explicd_loss_dict['var_loss_other']*10e2}")
+
+                # attn_explicd_loss+=attn_explicd_loss_dict["zero_and_three_loss"]*10e10
+                # print(f"attn_explicd_loss_dict['zero_and_three_loss'] {attn_explicd_loss_dict['zero_and_three_loss']}")
+
+
+                # attn_explicd_loss+=torch.mean(attn_explicd_loss_dict["color_loss"])
+                # print(f"attn_explicd_loss_dict['color_loss'] {torch.mean(attn_explicd_loss_dict['color_loss'])}")
+                # attn_explicd_loss+=attn_explicd_loss_dict["laplacian_smoothness_loss"]
+                # print(f"attn_explicd_loss_dict['laplacian_smoothness_loss'] {attn_explicd_loss_dict['laplacian_smoothness_loss']}")
+                # attn_explicd_loss+=attn_explicd_loss_dict["entropy"]
+                # print(f"attn_explicd_loss_dict['entropy'] {attn_explicd_loss_dict['entropy']}")
+                
+                
+                # # #attn_explicd_loss+=attn_explicd_loss_dict["contrast_loss"]
+                # attn_explicd_loss+=attn_explicd_loss_dict["dot_loss"]
+                # print(f"attn_explicd_loss_dict['dot_loss'] {attn_explicd_loss_dict['dot_loss']}")
+                # attn_explicd_loss+=attn_explicd_loss_dict["dist_loss"]
+                # print(f"attn_explicd_loss_dict['dist_loss'] {attn_explicd_loss_dict['dist_loss']}")
+
+            elif self.task=="BUSI":
+                # Create a mask where tensor1 is 0, and use it to zero out tensor2
+                mask = labels.unsqueeze(1).unsqueeze(2)  # Shape (B, 1, 1), broadcasting will work
+                attn_critical_weights = attn_critical_weights.clone()  # Create a copy of the tensor
+                attn_critical_weights[:,[3,4],:] = attn_critical_weights[:,[3,4],:] * mask  # Zero out tensor2 where tensor1 is 0
+                attn_explicd_loss+=attn_explicd_loss_dict["orthog_loss"]
+                print(f"attn_explicd_loss_dict['orthog_loss'] {attn_explicd_loss_dict['orthog_loss']}")
             if explicd_only==0:
                 ##################  Option use trivial tokens too
                 agg_visual_tokens = torch.cat((agg_critical_tokens, agg_trivial_tokens), dim=1)
@@ -625,6 +708,9 @@ class SILoss:
 
 
             loss_cls = self.cls_criterion(cls_logits, labels)
+
+            if attn_explicd_loss>14:
+                loss_cls*=0
             #print(f"cls_logits shape: {cls_logits.shape}")
             #print(f"cls_with_te_logits shape: {cls_with_te_logits.shape}")
             if use_te_loss:

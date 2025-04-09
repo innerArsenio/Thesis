@@ -469,7 +469,7 @@ def retinal_loss_function(attention_map, crit_dot, triv_dot, hsv_patches, lambda
         threshold=1e-3
         
         # Identify black patches (both S and V are below the threshold)
-        black_patch_mask = (saturation < threshold) & (value < threshold)  # Shape (B, 256)
+        black_patch_mask = (hue < -1.68) & (saturation < -1.68) & (value < -1.4)  # Shape (B, 256)
         
         # Now, we want to penalize high attention values where the patch is black
         # Expand black_patch_mask to shape (B, N, 256) to match the attention map's shape
@@ -567,8 +567,38 @@ def skin_lesion_loss_function(attention_map, crit_dot, triv_dot, hsv_patches, la
     ], dim=1)  # (B, num_classes, 256)
 
     # 3) **Critical Token Similarity Loss**
-    L_sim = torch.mean(torch.abs(crit_dot[:,1:,:] - crit_dot[:,0,:].unsqueeze(1)))  # L1 loss for similarity
+    L_sim = torch.mean(torch.abs(crit_dot[:,[1,2,4,5,6],:] - crit_dot[:,0,:].detach().unsqueeze(1)))  # L1 loss for similarity
     return L_sim, masks, crit_dot  # Return mask losses separately if you need to select them later
+
+def attention_map_zero_and_three_loss(attention_maps):
+    """
+    attention_maps: Tensor of shape (B, N_c, T)
+    - B: batch size
+    - N_c: number of tokens (number of maps)
+    - T: number of patches
+    
+    This function computes a loss that detaches the attention maps at indices 0 and 3,
+    and encourages the other attention maps to be similar to them using a similarity loss.
+    """
+    # Get the maps at indices 0 and 3 (detached)
+    detached_maps = attention_maps[:, [0, 3], :]  # Shape: (B, 2, T)
+    
+    # Detach the attention maps at indices 0 and 3 (no gradient)
+    detached_maps = detached_maps.detach()
+
+    # Get the other maps (exclude indices 0 and 3)
+    remaining_maps = attention_maps[:, [i for i in range(attention_maps.shape[1]) if i not in [0, 3]], :]  # Shape: (B, N_c-2, T)
+    
+    # Calculate the similarity loss (e.g., MSE loss)
+    # We want to make the remaining maps similar to the detached maps at indices 0 and 3
+    
+    # For simplicity, we will use the mean of the maps at indices 0 and 3
+    target_map = detached_maps.mean(dim=1)  # Shape: (B, T) -> Taking the mean of maps at indices 0 and 3
+    
+    # Compute the MSE loss between the remaining maps and the target map
+    mse_loss = F.mse_loss(remaining_maps, target_map.unsqueeze(1).expand(-1, remaining_maps.shape[1], -1))  # Expand to match dimensions
+    
+    return mse_loss
 
 def smoothness_loss(attention_maps):
     """
@@ -782,10 +812,12 @@ def attn_chat_gpt_crit_different_maps(critical_attn, trivial_attn, merge_patches
 
     contrast_loss = F.cross_entropy(logits, labels)  # High similarity → lower loss
     ##############################
-    crit_flat = critical_attn.view(B, -1)
-    triv_flat = trivial_attn.view(B, -1)
-    dot_product = (crit_flat * triv_flat).sum(-1)  # Sum across patches
-    orthog_loss = dot_product.mean()*10e2  # Encourage dot product ≈ 0
+    #crit_flat = critical_attn.view(B, -1)
+    #triv_flat = trivial_attn.view(B, -1)
+    #dot_product = (crit_flat * triv_flat).sum(-1)  # Sum across patches
+    #orthog_loss = dot_product.mean()*10e2  # Encourage dot product ≈ 0
+    pairwise_mul = critical_attn.unsqueeze(2) * trivial_attn.unsqueeze(1)  # (B, N_c, N_t, T)
+    orthog_loss = pairwise_mul.sum(-1).mean()*10e2  # (B, N_c, N_t) → scalar
     ###############################
     crit = F.softmax(critical_attn, dim=-1)
     triv = F.softmax(trivial_attn, dim=-1)
@@ -814,6 +846,118 @@ def attn_chat_gpt_crit_different_maps(critical_attn, trivial_attn, merge_patches
     #print(f"kl loss {kl_loss}")
     #print(f"inv loss {inv_loss}")
     return contrast_loss, orthog_loss, kl_loss, inv_loss, dot_loss, dist_loss
+
+def vectorized_similarity_loss(attn_maps):
+    """
+    attn_maps: Tensor of shape (B, N_c, T), assumed L2 normalized
+    """
+    attn_maps = F.normalize(attn_maps, p=2, dim=-1)
+    _, N_c, _ = attn_maps.shape
+
+    # (B, N_c, T) @ (B, T, N_c) → (B, N_c, N_c) pairwise similarities
+    sim_matrix = torch.bmm(attn_maps, attn_maps.transpose(1, 2))  # cosine sim
+
+    # Remove self-similarity (diagonal)
+    mask = torch.eye(N_c, device=attn_maps.device).bool()
+    sim_matrix.masked_fill_(mask[None, :, :], 0.0)
+
+    # Average pairwise 1 - sim across upper triangle
+    num_pairs = N_c * (N_c - 1)
+    sim_loss = (1 - sim_matrix).sum(dim=(1, 2)) / num_pairs  # (B,)
+    return sim_loss.mean()
+
+def anchor_alignment_loss(attn_maps):
+    """
+    attn_maps: (B, N_c, T), L2 normalized
+    Token 0 is anchor — others align to it, but it's frozen.
+    """
+    anchor = attn_maps[:, 0:1, :].detach()  # (B, 1, T)
+    others = attn_maps[:, 1:, :]            # (B, N_c-1, T)
+
+    # Use valid einsum notation: 'bat, bct -> bc' where a=1 (anchor), c=N_c-1
+    sim = torch.einsum('bat,bct->bc', anchor, others)  # (B, N_c-1)
+    loss = (1 - sim).mean()
+    return loss
+
+def mutual_exclusivity_loss(attn_maps):
+    """
+    attn_maps: (B, C, N) - attention values for C concepts on N patches
+
+    Returns: scalar loss that discourages multiple concepts attending to same patch
+    """
+    B, C, N = attn_maps.shape
+
+    # Normalize attention maps over concepts (so each patch's attention across concepts sums to 1)
+    attn_soft = F.softmax(attn_maps, dim=1)  # (B, C, N)
+
+    # For each patch, we want softmax over C to be close to one-hot
+    # Use entropy over concepts at each patch
+    entropy = -torch.sum(attn_soft * torch.log(attn_soft + 1e-8), dim=1)  # (B, N)
+
+    # Max entropy would be log(C), so we normalize
+    entropy = entropy / torch.log(torch.tensor(C, dtype= attn_maps.dtype, device=attn_maps.device))
+
+    return entropy.mean(dim=1)  # (B,)
+
+def high_attention_penalty(attn_map, max_tokens=2):
+    """
+    Loss function to enforce that at most `max_tokens` tokens have high attention in each patch.
+    
+    Parameters:
+    - attn_map: Tensor of shape (B, N_c, T) representing attention maps.
+    - max_tokens: Maximum number of tokens that should have high attention in each patch.
+    
+    Returns:
+    - loss: A scalar value representing the penalty for violating the condition.
+    """
+    B, N_c, T = attn_map.shape
+    
+    # Reshape the attention map to (B * T, N_c) so we can work with each patch (in terms of its tokens)
+    attn_map_flattened = attn_map.view(B * T, N_c)
+    
+    # For each patch, find the top-k tokens with the highest attention
+    top_k_values, top_k_indices = torch.topk(attn_map_flattened, max_tokens, dim=-1, largest=True)
+    
+    # Compute the total number of tokens in each patch that exceed the max_tokens threshold
+    # Count how many values in each patch exceed the top-k values
+    num_high_tokens = torch.sum(attn_map_flattened > top_k_values[:, -1].unsqueeze(1), dim=-1)
+    
+    # Penalize if there are more than `max_tokens` high tokens in a patch
+    penalty = torch.sum(torch.relu(num_high_tokens - max_tokens))
+    
+    # Return the total penalty as the loss
+    return penalty
+
+def mse_loss_between_maps(attn_map):
+    """
+    Compute the MSE loss between all pairs of attention maps in the batch without using for loops.
+    
+    Parameters:
+    - attn_map: Tensor of shape (B, N_c, T) representing the attention maps.
+    
+    Returns:
+    - loss: Scalar value representing the MSE loss between attention maps in the batch.
+    """
+    B, N_c, T = attn_map.shape
+    
+    # Reshape the attention map to (B, N_c * T) for easy pairwise comparison
+    attn_map_flattened = attn_map.view(B, -1)  # Shape: (B, N_c * T)
+    
+    # Compute pairwise MSE loss using broadcasting
+    # Calculate the squared difference between each pair of attention maps
+    diff = attn_map_flattened.unsqueeze(0) - attn_map_flattened.unsqueeze(1)  # Shape: (B, B, N_c * T)
+    
+    # Calculate the squared error
+    squared_diff = diff ** 2
+    
+    # Compute the mean squared error over each pair of maps
+    mse_loss = squared_diff.mean(dim=-1)  # Shape: (B, B) -> MSE between each pair
+    
+    # Exclude the diagonal (self comparisons) by masking
+    mask = torch.eye(B, device=attn_map.device).bool()
+    mse_loss = mse_loss[~mask].mean()  # Flatten the loss and take the average
+    
+    return mse_loss
 
 class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):  
     def __init__(self, concept_list, model_name='biomedclip', config=None):
@@ -1082,12 +1226,13 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
         if self.new_explicd==1:
             self.visual_features_hsv.clear()
         
-        if imgs_wo_norm is not None:
-            imgs_in_hsv = rgb_to_hsv_torch(imgs_wo_norm)
-        else:
-            imgs_in_hsv = imgs
-        hsv_patches = imgs_in_hsv.unfold(2, 14, 14).unfold(3, 14, 14)  # (B, 3, 16, 16, 14, 14)
-        hsv_patches = hsv_patches.mean(dim=(-1, -2))  # (B, 3, 16, 16)
+        # if imgs_wo_norm is not None:
+        #     imgs_in_hsv = rgb_to_hsv_torch(imgs_wo_norm)
+        # else:
+        #     imgs_in_hsv = imgs
+        imgs_in_hsv = imgs
+        img_patches = imgs_in_hsv.unfold(2, 14, 14).unfold(3, 14, 14)  # (B, 3, 16, 16, 14, 14)
+        img_patches = img_patches.mean(dim=(-1, -2))  # (B, 3, 16, 16)
         if self.new_explicd==1:
             _ = self.model_visual_ViT_L_hsv(imgs_in_hsv)
         patches = image_to_patches(imgs, patch_size=14)
@@ -1168,19 +1313,26 @@ class ExpLICD_ViT_L_Classic_with_Spatial_Bias(nn.Module):
 
         attn_explicd_loss_dict = {}
         if self.config.dataset == 'IDRID' or self.config.dataset == 'IDRID_SOFT' or self.config.dataset == 'IDRID_EDEMA' or self.config.dataset == 'IDRID_EDEMA_SOFT':
-            attn_explicd_loss_dict=retinal_loss_function(attn_critical_weights, crit_dot, triv_dot, hsv_patches.view(B, 3, T))
-        elif self.config.dataset == 'ISIC':
-            attn_explicd_loss_dict = loss_fn(hsv_patches, d_products, attn_trivial_weights)
+            attn_explicd_loss_dict=retinal_loss_function(attn_critical_weights, crit_dot, triv_dot, img_patches.view(B, 3, T))
+            attn_explicd_loss_dict["color_loss"]=loss_fn(img_patches, d_products, attn_trivial_weights)["color_loss"]
+        elif self.config.dataset == 'ISIC' or self.config.dataset == 'ISIC_SOFT':
+            attn_explicd_loss_dict = loss_fn(img_patches, d_products, attn_trivial_weights)
             attn_explicd_loss_dict["var_loss"]=attention_variance_loss(attn_critical_weights)
-            attn_explicd_loss_dict["var_loss_other"], attn_explicd_loss_dict["masks"], attn_explicd_loss_dict["crit_dot"]=skin_lesion_loss_function(attn_critical_weights, crit_dot, triv_dot, hsv_patches.view(B, 3, T))
+            attn_explicd_loss_dict["var_loss_other"], attn_explicd_loss_dict["masks"], attn_explicd_loss_dict["crit_dot"]=skin_lesion_loss_function(attn_critical_weights, crit_dot, triv_dot, img_patches.view(B, 3, T))
         
             attn_explicd_loss_dict["smooth_loss"]=smoothness_loss(attn_critical_weights)
             attn_explicd_loss_dict["overlap_loss"]=total_non_overlap_loss(attn_critical_weights, attn_trivial_weights)
 
         
-        attn_explicd_loss_dict["tv_loss"], attn_explicd_loss_dict["laplacian_smoothness_loss"],attn_explicd_loss_dict["entropy"] = attn_chat_gpt_crit_smooth_loss(attn_critical_weights)
-        attn_explicd_loss_dict["contrast_loss"], attn_explicd_loss_dict["orthog_loss"],attn_explicd_loss_dict["kl_loss"],attn_explicd_loss_dict["inv_loss"], attn_explicd_loss_dict["dot_loss"],attn_explicd_loss_dict["dist_loss"] = attn_chat_gpt_crit_different_maps(attn_critical_weights, attn_trivial_weights)
-        
+        attn_explicd_loss_dict["tv_loss"], attn_explicd_loss_dict["laplacian_smoothness_loss"],attn_explicd_loss_dict["entropy"] = attn_chat_gpt_crit_smooth_loss(attn_critical_weights,  merge_patches=False)
+        attn_explicd_loss_dict["contrast_loss"], attn_explicd_loss_dict["orthog_loss"],attn_explicd_loss_dict["kl_loss"],attn_explicd_loss_dict["inv_loss"], attn_explicd_loss_dict["dot_loss"],attn_explicd_loss_dict["dist_loss"] = attn_chat_gpt_crit_different_maps(attn_critical_weights, attn_trivial_weights, merge_patches=False)
+        #attn_explicd_loss_dict["similarity_loss"] = vectorized_similarity_loss(attn_critical_weights)
+        attn_explicd_loss_dict["similarity_loss"] = vectorized_similarity_loss(crit_dot)
+        attn_explicd_loss_dict["anchor_alignment_loss"] = anchor_alignment_loss(attn_critical_weights)
+        attn_explicd_loss_dict["zero_and_three_loss"] = attention_map_zero_and_three_loss(attn_critical_weights)
+        attn_explicd_loss_dict["mutual_exclusivity_loss"] = mutual_exclusivity_loss(attn_critical_weights)
+        attn_explicd_loss_dict["high_attention_penalty"] = high_attention_penalty(attn_critical_weights, max_tokens=2)
+        attn_explicd_loss_dict["mse_loss"] = mse_loss_between_maps(attn_critical_weights)
         #attn_explicd_loss += 10*gpt4_0_second_attention_loss_mine(attn_critical_weights, attn_trivial_weights)[0]
         #loss_fn = SpatialAwarePatchLoss_mine()
         

@@ -662,6 +662,9 @@ def main(args):
     ADD_GAUSSIAN_NOISE = args.add_gaussian
     FREEZE_WHEN_CLS_EPOCH = args.freeze_when_cls_epoch
 
+    if DO_MUDDLE_CHECK and args.task not in ['ISIC', 'ISIC_MINE', 'ISIC_MINIMAL', 'ISIC_SOFT']:
+        raise ValueError(f"Task {args.task} does not support muddle check")
+
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         save_dir = os.path.join(args.output_dir, args.exp_name)
@@ -934,6 +937,7 @@ def main(args):
         if args.explicd_only==0:
             checkpoint_resume_locations=f"{checkpoint_dir_step_based}/SiT/{ckpt_name}"
             checkpoint_resume_locations= "checkpoints_fr/ISIC/SiT/hilimsya.pt"
+            checkpoint_resume_locations="checkoints_fr_val_score_based/ISIC_SOFT/SiT/Muddled/SiT_with_explicd_muddled.pt"
         else:
             checkpoint_resume_locations=f"{checkpoint_dir_step_based}/Explicd_only/{ckpt_name}"
         print(f'loading checkpointed from {checkpoint_resume_locations}')
@@ -1701,6 +1705,10 @@ def main(args):
                             print('Explicd Muddled Balanced Acc', f'{expl_scores["BMAC"]:.3f}')
                             curve_of_f1.append(expl_scores["f1"])
                             curve_of_BMAC.append(expl_scores["BMAC"])
+                            if expl_scores["f1"]<0.55:
+                                print("Breaking")
+                                print('Curve of f1', curve_of_f1)
+                                break
                         print('Curve of f1', curve_of_f1)
                         print('Curve of BMAC', curve_of_BMAC)
 
